@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dapi
+      POSTGRES_USER: dapi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dapi -d dapi"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dapi:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${DAPI_BIND:-127.0.0.1:18083}:8080"
+    environment:
+      DAPI_DATABASE_HOST: postgres
+      DAPI_DATABASE_PORT: "5432"
+      DAPI_DATABASE_NAME: dapi
+      DAPI_DATABASE_USER: dapi
+      DAPI_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      DAPI_DATABASE_SSLMODE: disable
+      DAPI_MASTER_KEY: ${DAPI_MASTER_KEY:?set DAPI_MASTER_KEY in .env}
+      DAPI_ADMIN_USERNAME: ${DAPI_ADMIN_USERNAME:-admin}
+      DAPI_ADMIN_PASSWORD: ${DAPI_ADMIN_PASSWORD:?set DAPI_ADMIN_PASSWORD in .env}
+      DAPI_SESSION_TTL: ${DAPI_SESSION_TTL:-24h}
+      DAPI_HEALTH_INTERVAL: ${DAPI_HEALTH_INTERVAL:-30s}
+      DAPI_BALANCE_INTERVAL: ${DAPI_BALANCE_INTERVAL:-10m}
+      DAPI_LOG_RETENTION: ${DAPI_LOG_RETENTION:-720h}
+      DAPI_TRUST_PROXY: ${DAPI_TRUST_PROXY:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      DAPI_DOMAIN: ${DAPI_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      dapi:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

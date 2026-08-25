@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible problem in D-API
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Do not include credentials, request bodies, or other sensitive data. Security vulnerabilities must be reported privately through GitHub Security Advisories.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and found no duplicate.
+          required: true
+        - label: This is a D-API defect, not a deployment or upstream-provider support request.
+          required: true
+        - label: This report contains no secrets or sensitive production data.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: D-API version
+      description: Release version or commit SHA.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, deployment method, and database version.
+      placeholder: Ubuntu 24.04, Docker Compose, PostgreSQL 17
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact API keys, passwords, URLs containing credentials, and personal data.
+      render: shell

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/gaoLfun/D-API/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.
+  - name: Support policy
+    url: https://github.com/gaoLfun/D-API/blob/main/SUPPORT.md
+    about: Check which requests are supported before opening an issue.
