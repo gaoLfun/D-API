@@ -1,6 +1,8 @@
 package store
 
 import (
+	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/gaoLfun/dapi/internal/core"
@@ -61,5 +63,30 @@ func TestNormalizeUsageBaseURL(t *testing.T) {
 		if got := normalizeUsageBaseURL(input); got != want {
 			t.Errorf("normalizeUsageBaseURL(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestDecodeLiteLLMPrices(t *testing.T) {
+	data, err := json.Marshal(map[string]any{
+		"gpt-test":           map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000002, "output_cost_per_token": 0.000004},
+		"claude-test":        map[string]any{"litellm_provider": "anthropic", "input_cost_per_token": 0.000003, "output_cost_per_token": 0.000015, "cache_read_input_token_cost": 0.0000003, "cache_creation_input_token_cost": 0.00000375},
+		"gemini/gemini-test": map[string]any{"litellm_provider": "gemini", "input_cost_per_token": 0.0000001, "output_cost_per_token": 0.0000004, "input_cost_per_token_cache_hit": 0.000000025},
+		"ignored":            map[string]any{"litellm_provider": "other", "input_cost_per_token": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prices, err := decodeLiteLLMPrices(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := prices["OpenAI"][0]; got.Model != "gpt-test" || got.InputUSDPerMillion != 2 || got.OutputUSDPerMillion != 4 {
+		t.Fatalf("OpenAI price = %#v", got)
+	}
+	if got := prices["Anthropic"][0]; math.Abs(got.CacheReadUSDPerMillion-0.3) > 1e-9 || math.Abs(got.CacheWriteUSDPerMillion-3.75) > 1e-9 {
+		t.Fatalf("Anthropic cache prices = %#v", got)
+	}
+	if got := prices["Google Gemini"][0]; got.Model != "gemini-test" || math.Abs(got.CacheReadUSDPerMillion-0.025) > 1e-9 {
+		t.Fatalf("Gemini price = %#v", got)
 	}
 }

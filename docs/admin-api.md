@@ -46,7 +46,7 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `GET/PUT` | `/api/admin/settings` | 路由最大尝试次数 |
 | `GET` | `/api/admin/pricing` | 价格档案和 USD/CNY 汇率 |
 | `POST/PUT/DELETE` | `/api/admin/pricing/profiles[/{id}]` | 管理价格档案 |
-| `POST` | `/api/admin/pricing/refresh` | 检查内置价格来源 |
+| `POST` | `/api/admin/pricing/refresh` | 同步 LiteLLM 价格 |
 
 ## 上游
 
@@ -108,10 +108,12 @@ Chat 或 Responses；Sub2API 先做源站 HEAD，再发送带算术 challenge �
 `GET /api/admin/pricing` 返回 `profiles` 和 `usd_cny_rate`（默认 7.2）。
 `POST /api/admin/pricing/profiles` 创建档案并返回 `201 {"id":123}`；更新和
 删除分别使用 `PUT`、`DELETE`。数据库首次迁移会内置 OpenAI、Anthropic 和
-Google Gemini 的价格快照，可按需修改或删除。
+Google Gemini 价格档案，自动从 LiteLLM 的结构化价格文件同步；手动价格档案
+可作为未覆盖模型的兜底。
 
-`POST /api/admin/pricing/refresh` 只对内置来源执行 HTTP HEAD 检查并更新
-`last_refreshed_at`，不会抓取或自动改写价格；自定义档案永远由管理员维护。
+`POST /api/admin/pricing/refresh` 下载 LiteLLM 价格并更新受管档案；下载或解析
+失败时保留现有价格，自定义档案永远由管理员维护。价格来源版本使用文件摘要
+记录，便于追踪变更。
 请求日志和用量统计会在上游已绑定档案、模型匹配且请求包含 Token 用量时计算
 `cost_usd`。找不到价格或 Token 缺失时成本为空，并通过覆盖率字段标示未知；
 该数值仅用于运营估算，不代表供应商账单，也不执行扣费。

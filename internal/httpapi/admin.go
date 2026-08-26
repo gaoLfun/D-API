@@ -1211,7 +1211,7 @@ func (s *Server) refreshPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "pricing.refresh", "pricing_profile", 0, nil)
-	writeJSON(w, http.StatusOK, map[string]any{"checked_at": time.Now().UTC(), "mode": "source-check"})
+	writeJSON(w, http.StatusOK, map[string]any{"checked_at": time.Now().UTC(), "mode": "litellm-sync"})
 }
 
 func (s *Server) deletePricingProfile(w http.ResponseWriter, r *http.Request) {

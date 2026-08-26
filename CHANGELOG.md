@@ -16,6 +16,9 @@ All notable changes to D-API will be documented in this file. The format is base
   request-log and usage filters.
 - Pricing profiles with built-in snapshots, per-upstream assignment, estimated
   USD cost, CNY display conversion, and cost coverage metrics.
+- Built-in pricing refresh from LiteLLM's structured model-price file, with
+  hashed source versions and atomic updates that preserve existing prices on
+  download or parse failures.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

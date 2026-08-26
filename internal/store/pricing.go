@@ -2,10 +2,15 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +19,27 @@ import (
 )
 
 var ErrInvalidPricing = errors.New("invalid pricing")
+
+const liteLLMPriceURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+
+var liteLLMProfiles = []struct {
+	Name     string
+	Provider string
+	Prefix   string
+}{
+	{Name: "OpenAI", Provider: "openai"},
+	{Name: "Anthropic", Provider: "anthropic"},
+	{Name: "Google Gemini", Provider: "gemini", Prefix: "gemini/"},
+}
+
+type liteLLMPrice struct {
+	Provider                    string   `json:"litellm_provider"`
+	InputCostPerToken           *float64 `json:"input_cost_per_token"`
+	OutputCostPerToken          *float64 `json:"output_cost_per_token"`
+	CacheReadInputTokenCost     *float64 `json:"cache_read_input_token_cost"`
+	CacheReadInputTokenCostAlt  *float64 `json:"input_cost_per_token_cache_hit"`
+	CacheCreationInputTokenCost *float64 `json:"cache_creation_input_token_cost"`
+}
 
 type PricingModelPrice struct {
 	ID                      int64      `json:"id,omitempty"`
@@ -110,20 +136,35 @@ func (s *Store) SavePricingProfile(ctx context.Context, profile PricingProfile) 
 		return 0, ErrInvalidPricing
 	}
 	now := time.Now().UTC()
-	models := make([]string, 0, len(profile.Prices))
 	for _, price := range profile.Prices {
 		model := strings.TrimSpace(price.Model)
 		if model == "" || len([]rune(model)) > 200 || price.InputUSDPerMillion < 0 || price.OutputUSDPerMillion < 0 || price.CacheReadUSDPerMillion < 0 || price.CacheWriteUSDPerMillion < 0 {
 			return 0, ErrInvalidPricing
 		}
-		models = append(models, model)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	id, err := savePricingProfileTx(ctx, tx, profile, now)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func savePricingProfileTx(ctx context.Context, tx *sql.Tx, profile PricingProfile, now time.Time) (int64, error) {
+	name := strings.TrimSpace(profile.Name)
+	models := make([]string, 0, len(profile.Prices))
+	for _, price := range profile.Prices {
+		models = append(models, strings.TrimSpace(price.Model))
+	}
 	var id int64
+	var err error
 	if profile.ID > 0 {
 		err = tx.QueryRowContext(ctx, `UPDATE pricing_profiles SET name=$1,provider=$2,source_url=$3,source_version=$4,updated_at=now() WHERE id=$5 RETURNING id`, name, strings.TrimSpace(profile.Provider), strings.TrimSpace(profile.SourceURL), strings.TrimSpace(profile.SourceVersion), profile.ID).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -161,9 +202,6 @@ func (s *Store) SavePricingProfile(ctx context.Context, profile PricingProfile) 
 			return 0, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
 	return id, nil
 }
 
@@ -196,31 +234,107 @@ func (s *Store) DeletePricingProfile(ctx context.Context, id int64) error {
 }
 
 func (s *Store) RefreshPricingProfiles(ctx context.Context) error {
-	// Only built-in sources are eligible for the scheduled/manual snapshot check.
-	// Custom profiles remain user-managed and are never contacted by this path.
-	sources := []string{
-		"https://openai.com/api/pricing/",
-		"https://www.anthropic.com/pricing#api",
-		"https://ai.google.dev/gemini-api/docs/pricing",
+	client := &http.Client{Timeout: 20 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, liteLLMPriceURL, nil)
+	if err != nil {
+		return err
 	}
-	client := &http.Client{Timeout: 8 * time.Second}
-	for _, source := range sources {
-		req, err := http.NewRequestWithContext(ctx, http.MethodHead, source, nil)
-		if err != nil {
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "D-API pricing sync")
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch LiteLLM pricing: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("fetch LiteLLM pricing: HTTP %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 32<<20))
+	if err != nil {
+		return fmt.Errorf("read LiteLLM pricing: %w", err)
+	}
+	prices, err := decodeLiteLLMPrices(body)
+	if err != nil {
+		return err
+	}
+	versionBytes := sha256.Sum256(body)
+	version := "litellm-" + hex.EncodeToString(versionBytes[:6])
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, spec := range liteLLMProfiles {
+		profilePrices := prices[spec.Name]
+		var profileID int64
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM pricing_profiles WHERE name=$1 AND source_url=$2`, spec.Name, liteLLMPriceURL).Scan(&profileID); errors.Is(err, sql.ErrNoRows) {
+			continue
+		} else if err != nil {
 			return err
 		}
-		response, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("check pricing source %s: %w", source, err)
+		if _, err := savePricingProfileTx(ctx, tx, PricingProfile{
+			ID: profileID, Name: spec.Name, Provider: spec.Provider, SourceURL: liteLLMPriceURL,
+			SourceVersion: version, Prices: profilePrices,
+		}, now); err != nil {
+			return err
 		}
-		response.Body.Close()
-		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			return fmt.Errorf("check pricing source %s: HTTP %d", source, response.StatusCode)
+		if _, err := tx.ExecContext(ctx, `UPDATE pricing_profiles SET last_refreshed_at=$2,updated_at=now() WHERE id=$1`, profileID, now); err != nil {
+			return err
 		}
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE pricing_profiles SET last_refreshed_at=now(),updated_at=now()
-		WHERE source_url IN ('https://openai.com/api/pricing/','https://www.anthropic.com/pricing#api','https://ai.google.dev/gemini-api/docs/pricing')`)
-	return err
+	return tx.Commit()
+}
+
+func decodeLiteLLMPrices(data []byte) (map[string][]PricingModelPrice, error) {
+	var entries map[string]liteLLMPrice
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("decode LiteLLM pricing: %w", err)
+	}
+	result := make(map[string][]PricingModelPrice, len(liteLLMProfiles))
+	for _, spec := range liteLLMProfiles {
+		models := make([]string, 0)
+		byModel := make(map[string]PricingModelPrice)
+		for name, entry := range entries {
+			if entry.Provider != spec.Provider || (entry.InputCostPerToken == nil && entry.OutputCostPerToken == nil) {
+				continue
+			}
+			model := strings.TrimPrefix(name, spec.Prefix)
+			if model == "" || len([]rune(model)) > 200 {
+				continue
+			}
+			values := []*float64{entry.InputCostPerToken, entry.OutputCostPerToken, entry.CacheReadInputTokenCost, entry.CacheReadInputTokenCostAlt, entry.CacheCreationInputTokenCost}
+			for _, value := range values {
+				if value != nil && *value < 0 {
+					return nil, fmt.Errorf("invalid LiteLLM price for %s", name)
+				}
+			}
+			cacheRead := entry.CacheReadInputTokenCost
+			if cacheRead == nil {
+				cacheRead = entry.CacheReadInputTokenCostAlt
+			}
+			price := PricingModelPrice{Model: model, InputUSDPerMillion: perMillion(entry.InputCostPerToken), OutputUSDPerMillion: perMillion(entry.OutputCostPerToken), CacheReadUSDPerMillion: perMillion(cacheRead), CacheWriteUSDPerMillion: perMillion(entry.CacheCreationInputTokenCost), Source: "LiteLLM"}
+			byModel[model] = price
+		}
+		for model := range byModel {
+			models = append(models, model)
+		}
+		sort.Strings(models)
+		for _, model := range models {
+			result[spec.Name] = append(result[spec.Name], byModel[model])
+		}
+		if len(result[spec.Name]) == 0 {
+			return nil, fmt.Errorf("LiteLLM pricing has no models for %s", spec.Provider)
+		}
+	}
+	return result, nil
+}
+
+func perMillion(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value * 1_000_000
 }
 
 func (s *Store) RequestCost(ctx context.Context, upstreamID int64, model string, usage core.Usage, at time.Time) (*float64, error) {

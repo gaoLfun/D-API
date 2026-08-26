@@ -84,9 +84,10 @@ but the committed stream cannot be replayed safely.
   consume upstream quota.
 - Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
   is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
-- The pricing refresh job checks built-in pricing source URLs once per day. It
-  only verifies that the sources respond; configured price snapshots remain in
-  PostgreSQL and custom profiles are never contacted.
+- The pricing refresh job downloads the structured LiteLLM model price file once
+  per day and updates the managed OpenAI, Anthropic, and Google Gemini profiles
+  atomically. Custom profiles remain user-managed and provide the fallback for
+  models not covered by LiteLLM.
 - Alert rules are evaluated once per minute and can deliver email or webhook
   notifications.
 - Request logs older than the configured retention are removed once per day.

@@ -285,10 +285,16 @@ INSERT INTO settings(key,value) VALUES('usd_cny_rate','7.2'::jsonb) ON CONFLICT(
 
 INSERT INTO pricing_profiles(name,provider,source_url,source_version)
 VALUES
-    ('OpenAI','OpenAI','https://openai.com/api/pricing/','snapshot-2026-01'),
-    ('Anthropic','Anthropic','https://www.anthropic.com/pricing#api','snapshot-2026-01'),
-    ('Google Gemini','Google','https://ai.google.dev/gemini-api/docs/pricing','snapshot-2026-01')
+    ('OpenAI','openai','https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json','litellm'),
+    ('Anthropic','anthropic','https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json','litellm'),
+    ('Google Gemini','gemini','https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json','litellm')
 ON CONFLICT(name) DO NOTHING;
+UPDATE pricing_profiles
+SET provider=CASE name WHEN 'OpenAI' THEN 'openai' WHEN 'Anthropic' THEN 'anthropic' WHEN 'Google Gemini' THEN 'gemini' ELSE provider END,
+    source_url='https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json',
+    source_version='litellm', updated_at=now()
+WHERE name IN ('OpenAI','Anthropic','Google Gemini')
+  AND source_url IN ('https://openai.com/api/pricing/','https://www.anthropic.com/pricing#api','https://ai.google.dev/gemini-api/docs/pricing');
 INSERT INTO pricing_model_prices(profile_id,model,input_usd_per_million,output_usd_per_million,cache_read_usd_per_million,cache_write_usd_per_million,source)
 SELECT p.id,v.model,v.input,v.output,v.cache_read,v.cache_write,'built-in snapshot'
 FROM pricing_profiles p
