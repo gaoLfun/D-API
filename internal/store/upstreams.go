@@ -41,15 +41,17 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 // ListRouteUpstreams applies cheap routing predicates in SQL before decrypting
 // credentials. Circuit state is included so the gateway does not pay the
 // decryption cost for entries it will immediately reject.
-func (s *Store) ListRouteUpstreams(ctx context.Context, protocol, model string) ([]core.Upstream, error) {
+func (s *Store) ListRouteUpstreams(ctx context.Context, groupID int64, protocol, model string) ([]core.Upstream, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+upstreamColumns+`
-		FROM upstreams
-		WHERE enabled
-		  AND $1 = ANY(protocols)
-		  AND (cardinality(models)=0 OR $2 = ANY(models) OR model_aliases ? $2)
-		  AND (circuit_open_until IS NULL OR circuit_open_until <= now())
-		ORDER BY priority,id`, protocol, model)
+		SELECT u.*
+		FROM (SELECT `+upstreamColumns+` FROM upstreams
+			WHERE enabled
+			  AND ($2='' OR $2 = ANY(protocols))
+			  AND ($3='' OR (cardinality(models)=0 OR $3 = ANY(models) OR model_aliases ? $3))
+			  AND (circuit_open_until IS NULL OR circuit_open_until <= now())) u
+		JOIN group_upstreams gu ON gu.upstream_id=u.id JOIN groups g ON g.id=gu.group_id
+		WHERE g.id=$1 AND g.enabled
+		ORDER BY u.priority,u.id`, groupID, protocol, model)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +142,12 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) erro
 }
 
 func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM upstreams WHERE id=$1`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM upstreams WHERE id=$1`, id)
 	if err != nil {
 		return err
 	}
@@ -148,7 +155,10 @@ func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
 	if count == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `UPDATE groups g SET enabled=false,updated_at=now() WHERE g.enabled AND NOT EXISTS (SELECT 1 FROM group_upstreams gu WHERE gu.group_id=g.id)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SaveModels(ctx context.Context, id int64, models []string) error {

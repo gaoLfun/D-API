@@ -18,8 +18,8 @@ var ErrAPIKeySecretUnavailable = errors.New("api key secret unavailable")
 
 func (s *Store) ListAPIKeys(ctx context.Context) ([]core.APIKey, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id,name,key_prefix,enabled,protocols,models,last_used_at,created_at
-		FROM api_keys ORDER BY id`)
+		SELECT k.id,k.name,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.enabled,false),k.key_prefix,k.enabled,k.protocols,k.models,k.last_used_at,k.created_at
+		FROM api_keys k LEFT JOIN groups g ON g.id=k.group_id ORDER BY k.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +27,7 @@ func (s *Store) ListAPIKeys(ctx context.Context) ([]core.APIKey, error) {
 	keys := make([]core.APIKey, 0)
 	for rows.Next() {
 		var key core.APIKey
-		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt); err != nil {
+		if err := rows.Scan(&key.ID, &key.Name, &key.GroupID, &key.GroupName, &key.GroupEnabled, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt); err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)
@@ -36,10 +36,22 @@ func (s *Store) ListAPIKeys(ctx context.Context) ([]core.APIKey, error) {
 }
 
 func (s *Store) InsertAPIKey(ctx context.Context, name, prefix string, hash []byte, protocols, models []string) (int64, error) {
-	return s.insertAPIKey(ctx, name, prefix, hash, nil, protocols, models)
+	return s.insertAPIKey(ctx, name, prefix, hash, nil, 0, protocols, models)
+}
+
+func (s *Store) InsertAPIKeyInGroup(ctx context.Context, name, prefix string, hash []byte, groupID int64, protocols, models []string) (int64, error) {
+	return s.insertAPIKey(ctx, name, prefix, hash, nil, groupID, protocols, models)
 }
 
 func (s *Store) InsertAPIKeyWithSecret(ctx context.Context, name, prefix string, hash []byte, secret string, protocols, models []string) (int64, error) {
+	return s.insertAPIKeyWithSecret(ctx, name, prefix, hash, secret, 0, protocols, models)
+}
+
+func (s *Store) InsertAPIKeyWithSecretInGroup(ctx context.Context, name, prefix string, hash []byte, secret string, groupID int64, protocols, models []string) (int64, error) {
+	return s.insertAPIKeyWithSecret(ctx, name, prefix, hash, secret, groupID, protocols, models)
+}
+
+func (s *Store) insertAPIKeyWithSecret(ctx context.Context, name, prefix string, hash []byte, secret string, groupID int64, protocols, models []string) (int64, error) {
 	if s.box == nil {
 		return 0, errors.New("secret encryption unavailable")
 	}
@@ -47,23 +59,23 @@ func (s *Store) InsertAPIKeyWithSecret(ctx context.Context, name, prefix string,
 	if err != nil {
 		return 0, fmt.Errorf("encrypt api key: %w", err)
 	}
-	return s.insertAPIKey(ctx, name, prefix, hash, encrypted, protocols, models)
+	return s.insertAPIKey(ctx, name, prefix, hash, encrypted, groupID, protocols, models)
 }
 
-func (s *Store) insertAPIKey(ctx context.Context, name, prefix string, hash, encrypted []byte, protocols, models []string) (int64, error) {
+func (s *Store) insertAPIKey(ctx context.Context, name, prefix string, hash, encrypted []byte, groupID int64, protocols, models []string) (int64, error) {
 	var id int64
 	if encrypted == nil {
 		err := s.db.QueryRowContext(ctx, `
-			INSERT INTO api_keys(name,key_prefix,key_hash,protocols,models)
-			VALUES($1,$2,$3,$4,$5) RETURNING id`,
-			name, prefix, hash, pq.Array(protocols), pq.Array(models),
+		INSERT INTO api_keys(name,key_prefix,key_hash,group_id,protocols,models)
+			VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+			name, prefix, hash, nullableID(groupID), pq.Array(protocols), pq.Array(models),
 		).Scan(&id)
 		return id, err
 	}
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO api_keys(name,key_prefix,key_hash,key_encrypted,protocols,models)
-		VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
-		name, prefix, hash, encrypted, pq.Array(protocols), pq.Array(models),
+		INSERT INTO api_keys(name,key_prefix,key_hash,key_encrypted,group_id,protocols,models)
+		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+		name, prefix, hash, encrypted, nullableID(groupID), pq.Array(protocols), pq.Array(models),
 	).Scan(&id)
 	return id, err
 }
@@ -90,10 +102,22 @@ func (s *Store) APIKeySecret(ctx context.Context, id int64) (string, error) {
 	return secret, nil
 }
 
+func (s *Store) APIKey(ctx context.Context, id int64) (core.APIKey, error) {
+	var key core.APIKey
+	err := s.db.QueryRowContext(ctx, `
+		SELECT k.id,k.name,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.enabled,false),k.key_prefix,k.enabled,k.protocols,k.models,k.last_used_at,k.created_at
+		FROM api_keys k LEFT JOIN groups g ON g.id=k.group_id WHERE k.id=$1`, id).Scan(
+		&key.ID, &key.Name, &key.GroupID, &key.GroupName, &key.GroupEnabled, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.APIKey{}, ErrNotFound
+	}
+	return key, err
+}
+
 func (s *Store) UpdateAPIKey(ctx context.Context, key core.APIKey) error {
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE api_keys SET name=$1,enabled=$2,protocols=$3,models=$4 WHERE id=$5`,
-		key.Name, key.Enabled, pq.Array(key.Protocols), pq.Array(key.Models), key.ID,
+		UPDATE api_keys SET name=$1,group_id=$2,enabled=$3,protocols=$4,models=$5 WHERE id=$6`,
+		key.Name, nullableID(key.GroupID), key.Enabled, pq.Array(key.Protocols), pq.Array(key.Models), key.ID,
 	)
 	if err != nil {
 		return err
@@ -120,10 +144,11 @@ func (s *Store) DeleteAPIKey(ctx context.Context, id int64) error {
 func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (core.APIKey, error) {
 	var key core.APIKey
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id,name,key_prefix,enabled,protocols,models,last_used_at,created_at
-		FROM api_keys WHERE key_hash=$1 AND enabled=true`,
+		SELECT k.id,k.name,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.enabled,false),k.key_prefix,k.enabled,k.protocols,k.models,k.last_used_at,k.created_at
+		FROM api_keys k LEFT JOIN groups g ON g.id=k.group_id
+		WHERE k.key_hash=$1 AND k.enabled=true`,
 		auth.HashToken(raw),
-	).Scan(&key.ID, &key.Name, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt)
+	).Scan(&key.ID, &key.Name, &key.GroupID, &key.GroupName, &key.GroupEnabled, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.APIKey{}, ErrNotFound
 	}
@@ -141,7 +166,7 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (core.APIKey
 }
 
 func (s *Store) AvailableModels(ctx context.Context, key core.APIKey) ([]string, error) {
-	upstreams, err := s.ListUpstreams(ctx)
+	upstreams, err := s.ListRouteUpstreams(ctx, key.GroupID, "", "")
 	if err != nil {
 		return nil, err
 	}

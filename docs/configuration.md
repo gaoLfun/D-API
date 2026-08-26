@@ -119,6 +119,8 @@ The following values are stored in PostgreSQL rather than environment variables:
 
 - Upstream URLs, credentials, priorities, protocols, models, aliases, timeouts,
   failure thresholds, cooldowns, and enabled state
+- Upstream groups, their enabled state and members, and the group assigned to
+  each client key
 - Client API keys and their protocol/model restrictions
 - Maximum upstream attempts per request (1 to 5, default 3)
 - Notification channels and alert rules

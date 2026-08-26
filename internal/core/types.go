@@ -55,14 +55,28 @@ func (u Upstream) UpstreamModel(model string) string {
 }
 
 type APIKey struct {
-	ID        int64      `json:"id"`
-	Name      string     `json:"name"`
-	Prefix    string     `json:"prefix"`
-	Enabled   bool       `json:"enabled"`
-	Protocols []string   `json:"protocols"`
-	Models    []string   `json:"models"`
-	LastUsed  *time.Time `json:"last_used_at,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
+	ID           int64      `json:"id"`
+	Name         string     `json:"name"`
+	GroupID      int64      `json:"group_id"`
+	GroupName    string     `json:"group_name,omitempty"`
+	GroupEnabled bool       `json:"group_enabled"`
+	Prefix       string     `json:"prefix"`
+	Enabled      bool       `json:"enabled"`
+	Protocols    []string   `json:"protocols"`
+	Models       []string   `json:"models"`
+	LastUsed     *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+}
+
+type Group struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Enabled     bool      `json:"enabled"`
+	UpstreamIDs []int64   `json:"upstream_ids"`
+	Upstreams   []string  `json:"upstreams,omitempty"`
+	KeyCount    int       `json:"key_count"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (k APIKey) Allows(protocol, model string) bool {
@@ -90,6 +104,7 @@ type Usage struct {
 type RequestLog struct {
 	RequestID  string    `json:"request_id"`
 	APIKeyID   int64     `json:"api_key_id"`
+	GroupID    *int64    `json:"group_id,omitempty"`
 	UpstreamID *int64    `json:"upstream_id,omitempty"`
 	Protocol   string    `json:"protocol"`
 	Model      string    `json:"model"`

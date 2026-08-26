@@ -16,11 +16,13 @@ type LogFilter struct {
 	StatusMin  int
 	StatusMax  int
 	UpstreamID int64
+	GroupID    int64
 }
 
 type RequestLogView struct {
 	core.RequestLog
 	APIKeyName   string `json:"api_key_name,omitempty"`
+	GroupName    string `json:"group_name,omitempty"`
 	UpstreamName string `json:"upstream_name,omitempty"`
 }
 
@@ -35,17 +37,17 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 	_, err = s.db.ExecContext(ctx, `
 		WITH inserted AS (
 			INSERT INTO request_logs(
-				request_id,api_key_id,upstream_id,protocol,model,status_code,duration_ms,ttfb_ms,ttft_ms,
+				request_id,api_key_id,group_id,upstream_id,protocol,model,status_code,duration_ms,ttfb_ms,ttft_ms,
 				attempts,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens,error_code,client_ip,created_at
-			) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-			RETURNING api_key_id,upstream_id,protocol,model,status_code,error_code,created_at,
+			) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+				RETURNING api_key_id,group_id,upstream_id,protocol,model,status_code,error_code,created_at,
 				input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens
 		)
 		INSERT INTO daily_usage(
-			day,api_key_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
+			day,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
 			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests
 		)
-		SELECT (created_at AT TIME ZONE 'UTC')::date,api_key_id,upstream_id,protocol,model,1,
+		SELECT (created_at AT TIME ZONE 'UTC')::date,api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
 			CASE WHEN status_code BETWEEN 200 AND 399 AND error_code='' THEN 1 ELSE 0 END,
 			COALESCE(input_tokens,0),COALESCE(output_tokens,0),COALESCE(cached_input_tokens,0),
 			COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
@@ -53,7 +55,7 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 			CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END
 		FROM inserted
 		WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
-		ON CONFLICT(day,api_key_id,upstream_id,protocol,model) DO UPDATE SET
+		ON CONFLICT(day,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
 			requests=daily_usage.requests+1,
 			successes=daily_usage.successes+EXCLUDED.successes,
 			input_tokens=daily_usage.input_tokens+EXCLUDED.input_tokens,
@@ -64,7 +66,7 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 			uncached_input_tokens=daily_usage.uncached_input_tokens+EXCLUDED.uncached_input_tokens,
 			usage_requests=daily_usage.usage_requests+EXCLUDED.usage_requests,
 			cache_hit_requests=daily_usage.cache_hit_requests+EXCLUDED.cache_hit_requests`,
-		entry.RequestID, nullableID(entry.APIKeyID), entry.UpstreamID, entry.Protocol, entry.Model,
+		entry.RequestID, nullableID(entry.APIKeyID), entry.GroupID, entry.UpstreamID, entry.Protocol, entry.Model,
 		entry.StatusCode, entry.DurationMS, entry.TTFBMS, entry.TTFTMS, attempts, entry.Usage.InputTokens, entry.Usage.OutputTokens,
 		entry.Usage.CachedInputTokens, entry.Usage.CacheCreationInputTokens, entry.Usage.UncachedInputTokens,
 		entry.ErrorCode, entry.ClientIP, entry.CreatedAt,
@@ -86,14 +88,14 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 		filter.Offset = 100000
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT l.request_id,COALESCE(l.api_key_id,0),l.upstream_id,l.protocol,l.model,l.status_code,l.duration_ms,l.ttfb_ms,l.ttft_ms,
+		SELECT l.request_id,COALESCE(l.api_key_id,0),l.group_id,l.upstream_id,l.protocol,l.model,l.status_code,l.duration_ms,l.ttfb_ms,l.ttft_ms,
 			l.attempts,l.input_tokens,l.output_tokens,l.cached_input_tokens,l.cache_creation_input_tokens,l.uncached_input_tokens,l.error_code,l.client_ip,l.created_at,
-			COALESCE(k.name,''),COALESCE(u.name,'')
+			COALESCE(k.name,''),COALESCE(g.name,''),COALESCE(u.name,'')
 		FROM request_logs l
-		LEFT JOIN api_keys k ON k.id=l.api_key_id LEFT JOIN upstreams u ON u.id=l.upstream_id
-		WHERE ($1=0 OR l.status_code >= $1) AND ($2=0 OR l.status_code <= $2) AND ($3=0 OR l.upstream_id=$3)
-		ORDER BY l.created_at DESC LIMIT $4 OFFSET $5`,
-		filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.Limit, filter.Offset,
+		LEFT JOIN api_keys k ON k.id=l.api_key_id LEFT JOIN groups g ON g.id=l.group_id LEFT JOIN upstreams u ON u.id=l.upstream_id
+		WHERE ($1=0 OR l.status_code >= $1) AND ($2=0 OR l.status_code <= $2) AND ($3=0 OR l.upstream_id=$3) AND ($4=0 OR l.group_id=$4)
+		ORDER BY l.created_at DESC LIMIT $5 OFFSET $6`,
+		filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.GroupID, filter.Limit, filter.Offset,
 	)
 	if err != nil {
 		return nil, err
@@ -104,10 +106,10 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 		var entry RequestLogView
 		var attempts []byte
 		if err := rows.Scan(
-			&entry.RequestID, &entry.APIKeyID, &entry.UpstreamID, &entry.Protocol, &entry.Model,
+			&entry.RequestID, &entry.APIKeyID, &entry.GroupID, &entry.UpstreamID, &entry.Protocol, &entry.Model,
 			&entry.StatusCode, &entry.DurationMS, &entry.TTFBMS, &entry.TTFTMS, &attempts, &entry.Usage.InputTokens,
 			&entry.Usage.OutputTokens, &entry.Usage.CachedInputTokens, &entry.Usage.CacheCreationInputTokens, &entry.Usage.UncachedInputTokens, &entry.ErrorCode,
-			&entry.ClientIP, &entry.CreatedAt, &entry.APIKeyName, &entry.UpstreamName,
+			&entry.ClientIP, &entry.CreatedAt, &entry.APIKeyName, &entry.GroupName, &entry.UpstreamName,
 		); err != nil {
 			return nil, err
 		}
@@ -123,6 +125,8 @@ type UsageRow struct {
 	Day                      time.Time `json:"day"`
 	APIKeyID                 int64     `json:"api_key_id"`
 	APIKeyName               string    `json:"api_key_name"`
+	GroupID                  int64     `json:"group_id"`
+	GroupName                string    `json:"group_name"`
 	UpstreamID               int64     `json:"upstream_id"`
 	UpstreamName             string    `json:"upstream_name"`
 	Protocol                 string    `json:"protocol"`
@@ -159,6 +163,7 @@ type UsageFilter struct {
 	TopN        int
 	UpstreamID  int64
 	APIKeyID    int64
+	GroupID     int64
 	Protocol    string
 	Model       string
 }
@@ -193,9 +198,9 @@ func (s *Store) UsageTotals(ctx context.Context, filter UsageFilter) (UsageTotal
 			COALESCE(sum(usage_requests),0)::bigint, COALESCE(sum(cache_hit_requests),0)::bigint
 		FROM daily_usage
 		WHERE day >= $1::date AND day <= $2::date
-		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4)
-		  AND ($5='' OR protocol=$5) AND ($6='' OR model=$6)`,
-		from, to, filter.UpstreamID, filter.APIKeyID, filter.Protocol, filter.Model).Scan(
+		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4) AND ($5=0 OR group_id=$5)
+		  AND ($6='' OR protocol=$6) AND ($7='' OR model=$7)`,
+		from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model).Scan(
 		&totals.Requests, &totals.Successes, &totals.InputTokens, &totals.OutputTokens,
 		&totals.CachedInputTokens, &cacheWrite, &cacheWriteKnown, &totals.UncachedInputTokens,
 		&totals.UsageRequests, &totals.CacheHitRequests)
@@ -213,9 +218,9 @@ func (s *Store) UsageTotals(ctx context.Context, filter UsageFilter) (UsageTotal
 		FROM request_logs
 		WHERE created_at >= ($1::date AT TIME ZONE 'UTC') AND created_at < (($2::date + interval '1 day') AT TIME ZONE 'UTC')
 		  AND api_key_id IS NOT NULL AND upstream_id IS NOT NULL
-		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4)
-		  AND ($5='' OR protocol=$5) AND ($6='' OR model=$6)`,
-		from, to, filter.UpstreamID, filter.APIKeyID, filter.Protocol, filter.Model).Scan(&avg, &p95)
+		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4) AND ($5=0 OR group_id=$5)
+		  AND ($6='' OR protocol=$6) AND ($7='' OR model=$7)`,
+		from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model).Scan(&avg, &p95)
 	if err != nil {
 		return UsageTotals{}, err
 	}
@@ -240,15 +245,15 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 	dimension := normalizeDimension(filter.Dimension)
 	granularity := normalizeGranularity(filter.Granularity)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.day,d.api_key_id,COALESCE(k.name,''),d.upstream_id,COALESCE(u.name,''),d.protocol,d.model,
+		SELECT d.day,d.api_key_id,COALESCE(k.name,''),d.group_id,COALESCE(g.name,''),d.upstream_id,COALESCE(u.name,''),d.protocol,d.model,
 			d.requests,d.successes,d.input_tokens,d.output_tokens,d.cached_input_tokens,
 			d.cache_creation_input_tokens,d.cache_creation_usage_requests,d.uncached_input_tokens,d.usage_requests,d.cache_hit_requests
 		FROM daily_usage d
-		LEFT JOIN api_keys k ON k.id=d.api_key_id LEFT JOIN upstreams u ON u.id=d.upstream_id
+		LEFT JOIN api_keys k ON k.id=d.api_key_id LEFT JOIN groups g ON g.id=d.group_id LEFT JOIN upstreams u ON u.id=d.upstream_id
 		WHERE d.day >= $1::date AND d.day <= $2::date
-		  AND ($3=0 OR d.upstream_id=$3) AND ($4=0 OR d.api_key_id=$4)
-		  AND ($5='' OR d.protocol=$5) AND ($6='' OR d.model=$6)
-		ORDER BY d.day`, from, to, filter.UpstreamID, filter.APIKeyID, filter.Protocol, filter.Model)
+		  AND ($3=0 OR d.upstream_id=$3) AND ($4=0 OR d.api_key_id=$4) AND ($5=0 OR d.group_id=$5)
+		  AND ($6='' OR d.protocol=$6) AND ($7='' OR d.model=$7)
+		ORDER BY d.day`, from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +263,7 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 		var day time.Time
 		var row UsageRow
 		var cacheCreation, cacheCreationKnown int64
-		if err := rows.Scan(&day, &row.APIKeyID, &row.APIKeyName, &row.UpstreamID, &row.UpstreamName,
+		if err := rows.Scan(&day, &row.APIKeyID, &row.APIKeyName, &row.GroupID, &row.GroupName, &row.UpstreamID, &row.UpstreamName,
 			&row.Protocol, &row.Model, &row.Requests, &row.Successes, &row.InputTokens,
 			&row.OutputTokens, &row.CachedInputTokens, &cacheCreation, &cacheCreationKnown, &row.UncachedInputTokens,
 			&row.UsageRequests, &row.CacheHitRequests); err != nil {
@@ -273,7 +278,9 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 		if dimension == "upstream" {
 			row.APIKeyID, row.APIKeyName, row.Protocol, row.Model = 0, "", "", ""
 		} else if dimension == "api_key" {
-			row.UpstreamID, row.UpstreamName, row.Protocol, row.Model = 0, "", "", ""
+			row.GroupID, row.GroupName, row.UpstreamID, row.UpstreamName, row.Protocol, row.Model = 0, "", 0, "", "", ""
+		} else if dimension == "group" {
+			row.APIKeyID, row.APIKeyName, row.UpstreamID, row.UpstreamName, row.Protocol, row.Model = 0, "", 0, "", "", ""
 		} else if dimension == "protocol" {
 			row.APIKeyID, row.APIKeyName, row.UpstreamID, row.UpstreamName, row.Model = 0, "", 0, "", ""
 		} else if dimension == "model" {
@@ -288,11 +295,17 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 		if dimension == "api_key" && label == "" {
 			label = "未知"
 		}
+		if dimension == "group" && label == "" {
+			label = "历史未分组"
+		}
 		if dimension == "upstream" {
 			row.UpstreamName = label
 		}
 		if dimension == "api_key" {
 			row.APIKeyName = label
+		}
+		if dimension == "group" {
+			row.GroupName = label
 		}
 		if dimension == "protocol" {
 			row.Protocol = label
@@ -364,6 +377,9 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 					}
 					if dimension == "api_key" {
 						row.APIKeyName = "其他"
+					}
+					if dimension == "group" {
+						row.GroupName = "其他"
 					}
 					if dimension == "protocol" {
 						row.Protocol = "其他"
@@ -443,10 +459,10 @@ func (s *Store) usageDurations(ctx context.Context, filter UsageFilter, from, to
 		WHERE created_at >= ($1::date AT TIME ZONE 'UTC')
 		  AND created_at < (($2::date + interval '1 day') AT TIME ZONE 'UTC')
 		  AND api_key_id IS NOT NULL AND upstream_id IS NOT NULL
-		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4)
-		  AND ($5='' OR protocol=$5) AND ($6='' OR model=$6)
+		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4) AND ($5=0 OR group_id=$5)
+		  AND ($6='' OR protocol=$6) AND ($7='' OR model=$7)
 		GROUP BY 1,2`, bucketExpr, dimensionExpr)
-	rows, err := s.db.QueryContext(ctx, query, from, to, filter.UpstreamID, filter.APIKeyID, filter.Protocol, filter.Model)
+	rows, err := s.db.QueryContext(ctx, query, from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -482,6 +498,8 @@ func usageDimensionSQL(dimension string) string {
 		return "COALESCE(upstream_id,0)::text"
 	case "api_key":
 		return "COALESCE(api_key_id,0)::text"
+	case "group":
+		return "COALESCE(group_id,0)::text"
 	case "protocol":
 		return "protocol"
 	case "model":
@@ -525,7 +543,7 @@ func usageDateRange(filter UsageFilter) (time.Time, time.Time) {
 
 func normalizeDimension(value string) string {
 	switch value {
-	case "upstream", "api_key", "protocol", "model":
+	case "upstream", "api_key", "group", "protocol", "model":
 		return value
 	default:
 		return ""
@@ -560,6 +578,8 @@ func dimensionValue(row UsageRow, dimension string) (string, string) {
 		return fmt.Sprintf("%d", row.UpstreamID), row.UpstreamName
 	case "api_key":
 		return fmt.Sprintf("%d", row.APIKeyID), row.APIKeyName
+	case "group":
+		return fmt.Sprintf("%d", row.GroupID), row.GroupName
 	case "protocol":
 		return row.Protocol, row.Protocol
 	case "model":

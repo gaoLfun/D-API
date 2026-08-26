@@ -50,12 +50,28 @@ CREATE INDEX IF NOT EXISTS upstreams_protocols_idx ON upstreams USING GIN(protoc
 CREATE INDEX IF NOT EXISTS upstreams_models_idx ON upstreams USING GIN(models);
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS models_locked BOOLEAN NOT NULL DEFAULT FALSE;
 
+CREATE TABLE IF NOT EXISTS groups (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS group_upstreams (
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    upstream_id BIGINT NOT NULL REFERENCES upstreams(id) ON DELETE CASCADE,
+    PRIMARY KEY(group_id, upstream_id)
+);
+CREATE INDEX IF NOT EXISTS group_upstreams_upstream_idx ON group_upstreams(upstream_id);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     key_prefix TEXT NOT NULL,
     key_hash BYTEA NOT NULL UNIQUE,
     key_encrypted BYTEA,
+    group_id BIGINT REFERENCES groups(id) ON DELETE RESTRICT,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     protocols TEXT[] NOT NULL DEFAULT '{}',
     models TEXT[] NOT NULL DEFAULT '{}',
@@ -63,11 +79,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_encrypted BYTEA;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS group_id BIGINT REFERENCES groups(id) ON DELETE RESTRICT;
 
 CREATE TABLE IF NOT EXISTS request_logs (
     id BIGSERIAL PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE,
     api_key_id BIGINT REFERENCES api_keys(id) ON DELETE SET NULL,
+    group_id BIGINT,
     upstream_id BIGINT REFERENCES upstreams(id) ON DELETE SET NULL,
     protocol TEXT NOT NULL,
     model TEXT NOT NULL DEFAULT '',
@@ -89,13 +107,16 @@ ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS ttfb_ms BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS ttft_ms BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS uncached_input_tokens BIGINT;
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS group_id BIGINT;
 CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS request_logs_upstream_idx ON request_logs(upstream_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS request_logs_key_idx ON request_logs(api_key_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS request_logs_group_idx ON request_logs(group_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS daily_usage (
     day DATE NOT NULL,
     api_key_id BIGINT NOT NULL,
+    group_id BIGINT NOT NULL DEFAULT 0,
     upstream_id BIGINT NOT NULL,
     protocol TEXT NOT NULL,
     model TEXT NOT NULL,
@@ -109,8 +130,11 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     uncached_input_tokens BIGINT NOT NULL DEFAULT 0,
     usage_requests BIGINT NOT NULL DEFAULT 0,
     cache_hit_requests BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY(day, api_key_id, upstream_id, protocol, model)
+    PRIMARY KEY(day, api_key_id, group_id, upstream_id, protocol, model)
 );
+ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_pkey;
+ALTER TABLE daily_usage ADD PRIMARY KEY(day, api_key_id, group_id, upstream_id, protocol, model);
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_creation_usage_requests BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS uncached_input_tokens BIGINT NOT NULL DEFAULT 0;
@@ -200,3 +224,17 @@ CREATE TABLE IF NOT EXISTS settings (
     value JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- The first migration keeps existing clients on the current global route pool.
+INSERT INTO groups(name, enabled) VALUES('默认分组', TRUE) ON CONFLICT(name) DO NOTHING;
+INSERT INTO group_upstreams(group_id, upstream_id)
+SELECT g.id, u.id FROM groups g CROSS JOIN upstreams u
+WHERE g.name='默认分组'
+  AND NOT EXISTS (SELECT 1 FROM settings WHERE key='groups_migrated_v1')
+ON CONFLICT DO NOTHING;
+UPDATE groups SET enabled=false,updated_at=now()
+WHERE name='默认分组' AND NOT EXISTS (SELECT 1 FROM group_upstreams gu JOIN groups g ON g.id=gu.group_id WHERE g.name='默认分组');
+UPDATE api_keys SET group_id=(SELECT id FROM groups WHERE name='默认分组')
+WHERE group_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM settings WHERE key='groups_migrated_v1');
+INSERT INTO settings(key,value) VALUES('groups_migrated_v1','true') ON CONFLICT(key) DO NOTHING;

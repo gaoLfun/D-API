@@ -21,7 +21,7 @@ management API may still change before v1.0.
 - Model discovery, allowlists, and client-to-upstream model aliases
 - Upstream connectivity tests and best-effort balance discovery
 - Locally recorded request attempts and token usage
-- Client API keys with protocol and model restrictions
+- Group-scoped client API keys with protocol and model restrictions
 - Single-administrator web console with audit logs and login rate limiting
 - Email and webhook notifications with configurable alert rules
 - One Go service, one Vue frontend, PostgreSQL, and an optional Caddy proxy
@@ -62,8 +62,9 @@ Log in with `DAPI_ADMIN_USERNAME` and `DAPI_ADMIN_PASSWORD`, then:
 
 1. Add a NewAPI or Sub2API upstream and use **Fetch upstream models** before saving.
 2. Select models and run **Test model** for one or more entries. This sends a small real model request (Sub2API uses an arithmetic challenge) and may consume upstream quota.
-3. Select supported protocols and models. Lower priority numbers route first.
-4. Create a client API key. The list shows only its prefix; use the copy button or CCSwitch import. Keys created before encrypted copies were added must be recreated.
+3. Create a group and bind one or more upstreams; client requests stay within the key's group.
+4. Select supported protocols and models. Lower priority numbers route first.
+5. Create a client API key and select its group. The list shows only its prefix; use the copy button or CCSwitch import. Keys created before encrypted copies were added must be recreated.
 
 For production details, direct-IP HTTP access, upgrades, backups, and restores,
 see [Deployment](docs/deployment.md). For a scriptable administrator interface,
@@ -100,7 +101,7 @@ retry behavior, streaming limits, usage collection, and response headers.
 ## Architecture
 
 ```text
-Client -> Caddy (HTTPS) -> D-API -> priority-ordered upstreams
+Client -> Caddy (HTTPS) -> D-API -> priority-ordered upstreams in the key's group
                               |
                               +-> PostgreSQL
 ```

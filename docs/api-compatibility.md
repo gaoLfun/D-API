@@ -29,7 +29,11 @@ client credentials unless separately created as a client key.
 - `POST /v1/messages` also accepts `x-api-key: <DAPI_KEY>` and prefers it when
   both headers are present.
 - An enabled client key may restrict proxy capabilities and model names.
-- `/v1/models` applies the key's model restriction.
+- `/v1/models` applies the key's model restriction and only lists models from its group.
+
+Each client key is bound to one enabled group. Requests are routed only through
+that group's upstream members; there is no fallback to another group or to the
+global upstream pool.
 
 ## Request Handling
 
@@ -133,7 +137,8 @@ integer milliseconds, plus the upstream attempt chain. Anthropic Messages usage
 counts `input_tokens` and cache-creation tokens as uncached input; OpenAI-style
 usage treats cached input as a subset of total input. The usage report can split
 daily, weekly, or monthly totals by upstream, client key, protocol, or model,
-with Top-N/other aggregation and average/P95 latency.
+with Top-N/other aggregation and average/P95 latency. Group is also available as
+a usage dimension.
 
 Usage is best effort: missing fields remain unknown in administrator views. D-API
 does not calculate token counts, prices, or billable cost. It stores request

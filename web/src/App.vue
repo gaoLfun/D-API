@@ -14,7 +14,7 @@ import {
   modelsForPayload, parseModelList, setModelSelected, usesNewAPICredentials,
 } from './upstream-form'
 
-type View = 'dashboard' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels'
+type View = 'dashboard' | 'groups' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels'
 type Theme = 'auto' | 'light' | 'dark'
 type CCSwitchApp = 'claude' | 'codex' | 'gemini'
 type Json = Record<string, any>
@@ -55,6 +55,18 @@ interface ClientKey {
   models: string[]
   last_used_at?: string
   created_at: string
+  group_id: number
+  group_name?: string
+}
+
+interface Group {
+  id: number
+  name: string
+  enabled: boolean
+  upstream_ids: number[]
+  key_count: number
+  created_at: string
+  updated_at: string
 }
 
 interface RequestLog {
@@ -62,6 +74,7 @@ interface RequestLog {
   request_id: string
   upstream_id?: number
   upstream_name?: string
+  group_name?: string
   api_key_name?: string
   protocol: string
   model: string
@@ -117,6 +130,7 @@ interface ModelTestReport {
 
 const navItems = [
   { id: 'dashboard' as View, label: '总览', icon: LayoutDashboard },
+  { id: 'groups' as View, label: '分组', icon: Network },
   { id: 'upstreams' as View, label: '上游', icon: Server },
   { id: 'keys' as View, label: '客户端密钥', icon: KeyRound },
   { id: 'logs' as View, label: '请求日志', icon: ListFilter },
@@ -164,13 +178,14 @@ let toastTimer = 0
 
 const dashboard = ref<Json>({})
 const upstreams = ref<Upstream[]>([])
+const groups = ref<Group[]>([])
 const keys = ref<ClientKey[]>([])
 const logs = ref<RequestLog[]>([])
 const usage = ref<Json>({})
 const channels = ref<Channel[]>([])
 const alertRules = ref<AlertRule[]>([])
 const maxAttempts = ref(3)
-const logFilter = reactive({ status: '', upstream_id: '', limit: 50, offset: 0 })
+const logFilter = reactive({ status: '', upstream_id: '', group_id: '', limit: 50, offset: 0 })
 const expandedLog = ref<string | null>(null)
 const usageFilter = reactive({
   days: 30,
@@ -178,6 +193,7 @@ const usageFilter = reactive({
   dimension: 'upstream',
   topN: 5,
   upstream_id: '',
+  group_id: '',
   api_key_id: '',
   protocol: '',
   model: '',
@@ -204,7 +220,10 @@ const upstreamForm = reactive({
 })
 const keyModal = ref(false)
 const editingKey = ref<number | null>(null)
-const keyForm = reactive({ name: '', enabled: true, protocols: ['responses'] as string[], models: '' })
+const keyForm = reactive({ name: '', enabled: true, group_id: 0, protocols: ['responses'] as string[], models: '' })
+const groupModal = ref(false)
+const editingGroup = ref<number | null>(null)
+const groupForm = reactive({ name: '', enabled: true, upstream_ids: [] as number[] })
 const revealedKey = ref('')
 const ccswitchModal = ref(false)
 const ccswitchTarget = ref<ClientKey | null>(null)
@@ -590,15 +609,26 @@ async function loadCurrent() {
       dashboard.value = dash || {}
       upstreams.value = listOf<Upstream>(ups)
     } else if (view.value === 'upstreams') upstreams.value = listOf<Upstream>(await api.get('/api/admin/upstreams', { signal }))
-    else if (view.value === 'keys') keys.value = listOf<ClientKey>(await api.get('/api/admin/keys', { signal }))
-    else if (view.value === 'logs') {
-      const [, upstreamData] = await Promise.all([loadLogs(signal), api.get('/api/admin/upstreams', { signal })])
+    else if (view.value === 'groups') {
+      const [groupData, upstreamData] = await Promise.all([api.get('/api/admin/groups', { signal }), api.get('/api/admin/upstreams', { signal })])
+      groups.value = listOf<Group>(groupData)
       upstreams.value = listOf<Upstream>(upstreamData)
     }
+    else if (view.value === 'keys') {
+      const [keyData, groupData] = await Promise.all([api.get('/api/admin/keys', { signal }), api.get('/api/admin/groups', { signal })])
+      keys.value = listOf<ClientKey>(keyData)
+      groups.value = listOf<Group>(groupData)
+    }
+    else if (view.value === 'logs') {
+      const [, upstreamData, groupData] = await Promise.all([loadLogs(signal), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/groups', { signal })])
+      upstreams.value = listOf<Upstream>(upstreamData)
+      groups.value = listOf<Group>(groupData)
+    }
     else if (view.value === 'usage') {
-      const [, upstreamData, keyData] = await Promise.all([loadUsage(signal), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/keys', { signal })])
+      const [, upstreamData, keyData, groupData] = await Promise.all([loadUsage(signal), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/keys', { signal }), api.get('/api/admin/groups', { signal })])
       upstreams.value = listOf<Upstream>(upstreamData)
       keys.value = listOf<ClientKey>(keyData)
+      groups.value = listOf<Group>(groupData)
     }
     else {
       const [channelData, ruleData, settingsData, upstreamData] = await Promise.all([
@@ -627,6 +657,7 @@ async function loadLogs(signal?: AbortSignal) {
   const query = new URLSearchParams({ limit: String(logFilter.limit), offset: String(logFilter.offset) })
   if (logFilter.status) query.set('status', logFilter.status)
   if (logFilter.upstream_id) query.set('upstream_id', logFilter.upstream_id)
+  if (logFilter.group_id) query.set('group_id', logFilter.group_id)
   try {
     const result = await api.get<RequestLog[] | Json>(`/api/admin/logs?${query}`, { signal: requestSignal })
     if (!requestSignal.aborted && (!cycle || isCurrentPageLoad(cycle.sequence))) logs.value = listOf<RequestLog>(result)
@@ -650,7 +681,7 @@ async function loadUsage(signal?: AbortSignal) {
     dimension: usageFilter.dimension,
     top_n: String(usageFilter.topN),
   })
-  const filterKey = ({ upstream: 'upstream_id', api_key: 'api_key_id', protocol: 'protocol', model: 'model' } as Record<string, keyof typeof usageFilter>)[usageFilter.dimension]
+  const filterKey = ({ upstream: 'upstream_id', api_key: 'api_key_id', group: 'group_id', protocol: 'protocol', model: 'model' } as Record<string, keyof typeof usageFilter>)[usageFilter.dimension]
   if (filterKey && usageFilter[filterKey]) query.set(filterKey, String(usageFilter[filterKey]))
   try {
     const result = await api.get<Json>(`/api/admin/usage?${query}`, { signal: requestSignal })
@@ -944,15 +975,40 @@ function openChannel() {
 function openKey(item?: ClientKey) {
   editingKey.value = item?.id ?? null
   Object.assign(keyForm, item ? {
-    name: item.name, enabled: item.enabled, protocols: [...(item.protocols || [])], models: (item.models || []).join(', '),
-  } : { name: '', enabled: true, protocols: ['responses'], models: '' })
+    name: item.name, enabled: item.enabled, group_id: item.group_id || 0, protocols: [...(item.protocols || [])], models: (item.models || []).join(', '),
+  } : { name: '', enabled: true, group_id: groups.value.find((group) => group.enabled && group.upstream_ids.length)?.id || 0, protocols: ['responses'], models: '' })
   keyModal.value = true
+}
+
+function openGroup(item?: Group) {
+  editingGroup.value = item?.id ?? null
+  Object.assign(groupForm, item ? { name: item.name, enabled: item.enabled, upstream_ids: [...(item.upstream_ids || [])] } : { name: '', enabled: true, upstream_ids: [] })
+  groupModal.value = true
+}
+
+async function saveGroup() {
+  saving.value = true
+  try {
+    const payload = { name: groupForm.name, enabled: groupForm.enabled, upstream_ids: groupForm.upstream_ids }
+    if (editingGroup.value) await api.put(`/api/admin/groups/${editingGroup.value}`, payload)
+    else await api.post('/api/admin/groups', payload)
+    groupModal.value = false
+    notify(editingGroup.value ? '分组已更新' : '分组已创建')
+    await loadCurrent()
+  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
+}
+
+async function removeGroup(item: Group) {
+  if (item.key_count > 0) return notify('分组仍有绑定密钥，请先迁移密钥', true)
+  if (!(await requestConfirmation('删除分组', `“${item.name}”将被删除。`))) return
+  try { await api.delete(`/api/admin/groups/${item.id}`); notify('分组已删除'); await loadCurrent() }
+  catch (error) { notify(errorMessage(error), true) }
 }
 
 async function saveKey() {
   saving.value = true
   try {
-    const payload = { ...keyForm, models: keyForm.models.split(',').map((v) => v.trim()).filter(Boolean) }
+    const payload = { ...keyForm, group_id: Number(keyForm.group_id), models: keyForm.models.split(',').map((v) => v.trim()).filter(Boolean) }
     const result: Json = editingKey.value
       ? await api.put(`/api/admin/keys/${editingKey.value}`, payload)
       : await api.post('/api/admin/keys', payload)
@@ -961,7 +1017,7 @@ async function saveKey() {
       const rawKey = result.key || result.api_key || result.secret || ''
       createdKeyForImport.value = {
         id: Number(result.id || 0), name: keyForm.name, enabled: true,
-        protocols: [...keyForm.protocols], models: [...payload.models], created_at: new Date().toISOString(),
+        protocols: [...keyForm.protocols], models: [...payload.models], group_id: Number(keyForm.group_id), created_at: new Date().toISOString(),
       }
       revealedKey.value = rawKey
     }
@@ -1234,7 +1290,7 @@ function logTokenHitRate(item: RequestLog) {
 }
 
 function usageDimensionLabel(row: Json) {
-  return String(row.dimension_label || row.label || row.upstream_name || row.api_key_name || row.protocol || row.model || '总计')
+  return String(row.dimension_label || row.label || row.upstream_name || row.api_key_name || row.group_name || row.protocol || row.model || '总计')
 }
 
 function usageRowKey(row: Json, index: number) {
@@ -1386,6 +1442,23 @@ onBeforeUnmount(() => {
           </section>
         </section>
 
+        <section v-else-if="view === 'groups'" class="view-stack">
+          <div class="action-row"><p>{{ groups.length }} 个分组，密钥只会在所属分组内路由。</p><button class="primary" @click="openGroup()"><Plus :size="17" />创建分组</button></div>
+          <section class="panel table-panel"><div class="table-wrap"><table>
+            <thead><tr><th>名称</th><th>状态</th><th>上游</th><th>绑定密钥</th><th class="right">操作</th></tr></thead>
+            <tbody>
+              <tr v-for="item in groups" :key="item.id" :class="{ subdued: !item.enabled }">
+                <td><strong>{{ item.name }}</strong><small>创建于 {{ fmtDate(item.created_at) }}</small></td>
+                <td><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span></td>
+                <td>{{ item.upstream_ids?.map((id) => upstreams.find((upstream) => upstream.id === id)?.name || `#${id}`).join('、') || '无上游' }}</td>
+                <td>{{ item.key_count }} 个密钥</td>
+                <td class="right"><div class="row-actions"><button class="icon" title="编辑" @click="openGroup(item)"><Pencil :size="16" /></button><button class="icon danger" title="删除" :disabled="item.key_count > 0" @click="removeGroup(item)"><Trash2 :size="16" /></button></div></td>
+              </tr>
+              <tr v-if="!groups.length"><td colspan="5"><div class="empty"><Network :size="22" /><strong>还没有分组</strong><span>创建分组并绑定上游后，为客户端密钥选择路由范围。</span><button class="secondary" @click="openGroup()"><Plus :size="15" />创建分组</button></div></td></tr>
+            </tbody>
+          </table></div></section>
+        </section>
+
         <section v-else-if="view === 'upstreams'" class="view-stack">
           <div class="action-row"><p>{{ upstreams.length }} 个上游，数字越小优先级越高。</p><button class="primary" @click="openUpstream()"><Plus :size="17" />添加上游</button></div>
           <section class="panel table-panel"><div class="table-wrap"><table class="upstream-table">
@@ -1442,6 +1515,7 @@ onBeforeUnmount(() => {
               <th :aria-sort="ariaSort('keys', 'name')"><button class="sort-button" @click="toggleSort('keys', 'name')">名称<ArrowUpDown :size="12" /></button></th>
               <th>密钥前缀</th>
               <th :aria-sort="ariaSort('keys', 'enabled')"><button class="sort-button" @click="toggleSort('keys', 'enabled')">状态<ArrowUpDown :size="12" /></button></th>
+              <th>分组</th>
               <th>协议</th>
               <th :aria-sort="ariaSort('keys', 'models')"><button class="sort-button" @click="toggleSort('keys', 'models')">模型限制<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('keys', 'last_used_at')"><button class="sort-button" @click="toggleSort('keys', 'last_used_at')">最后使用<ArrowUpDown :size="12" /></button></th>
@@ -1453,13 +1527,14 @@ onBeforeUnmount(() => {
                 <td><strong>{{ item.name }}</strong><small>创建于 {{ fmtDate(item.created_at) }}</small></td>
                 <td><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></td>
                 <td><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span></td>
+                <td>{{ item.group_name || '历史未分组' }}</td>
                 <td><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span><span v-if="!item.protocols?.length" class="muted">全部</span></td>
                 <td>{{ item.models?.length ? `${item.models.length} 个模型` : '全部模型' }}</td><td class="muted">{{ fmtDate(item.last_used_at) }}</td>
                 <td class="menu-cell"><div class="row-actions"><button class="icon" title="复制密钥" aria-label="复制密钥" @click="copyClientKey(item)"><Copy :size="16" /></button><button class="icon" title="编辑" @click="openKey(item)"><Pencil :size="16" /></button><button class="icon" title="导入 CCSwitch" aria-label="导入 CCSwitch" @click="openCCSwitch(item)"><Upload :size="16" /></button><button class="icon mobile-row-toggle" title="展开详情" :aria-expanded="expandedMobileRow === `key-${item.id}`" @click="expandedMobileRow = expandedMobileRow === `key-${item.id}` ? '' : `key-${item.id}`"><ChevronRight :class="{ rotate: expandedMobileRow === `key-${item.id}` }" :size="17" /></button><button class="icon" title="更多操作" aria-haspopup="menu" :aria-expanded="openRowMenu === `key-${item.id}`" @click.stop="toggleRowMenu(`key-${item.id}`, $event)"><MoreHorizontal :size="17" /></button><Teleport to="body"><div v-if="openRowMenu === `key-${item.id}`" class="row-menu" role="menu" :style="{ top: `${rowMenuPosition.top}px`, left: `${rowMenuPosition.left}px` }" @click.stop @keydown="handleRowMenuKeydown"><button role="menuitem" @click="closeRowMenu(); copyClientKey(item)"><Copy :size="15" />复制密钥</button><button role="menuitem" @click="closeRowMenu(); openCCSwitch(item)"><Upload :size="15" />导入 CCSwitch</button><button class="danger" role="menuitem" @click="closeRowMenu(); removeKey(item)"><Trash2 :size="15" />删除密钥</button></div></Teleport></div></td>
               </tr>
-              <tr v-if="expandedMobileRow === `key-${item.id}`" class="mobile-detail-row"><td colspan="7"><dl><div><dt>密钥前缀</dt><dd><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型限制</dt><dd>{{ item.models?.length ? `${item.models.length} 个模型` : '全部模型' }}</dd></div><div><dt>最后使用</dt><dd>{{ fmtDate(item.last_used_at) }}</dd></div><div><dt>创建时间</dt><dd>{{ fmtDate(item.created_at) }}</dd></div></dl></td></tr>
+              <tr v-if="expandedMobileRow === `key-${item.id}`" class="mobile-detail-row"><td colspan="8"><dl><div><dt>分组</dt><dd>{{ item.group_name || '历史未分组' }}</dd></div><div><dt>密钥前缀</dt><dd><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型限制</dt><dd>{{ item.models?.length ? `${item.models.length} 个模型` : '全部模型' }}</dd></div><div><dt>最后使用</dt><dd>{{ fmtDate(item.last_used_at) }}</dd></div><div><dt>创建时间</dt><dd>{{ fmtDate(item.created_at) }}</dd></div></dl></td></tr>
               </template>
-              <tr v-if="!keys.length"><td colspan="7"><div class="empty"><KeyRound :size="22" /><strong>还没有客户端密钥</strong><span>为调用方创建独立密钥并限制协议与模型。</span><button class="secondary" @click="openKey()"><Plus :size="15" />创建密钥</button></div></td></tr>
+              <tr v-if="!keys.length"><td colspan="8"><div class="empty"><KeyRound :size="22" /><strong>还没有客户端密钥</strong><span>为调用方创建独立密钥并限制协议与模型。</span><button class="secondary" @click="openKey()"><Plus :size="15" />创建密钥</button></div></td></tr>
             </tbody>
           </table></div></section>
         </section>
@@ -1468,6 +1543,7 @@ onBeforeUnmount(() => {
           <form class="filterbar" @submit.prevent="logFilter.offset = 0; loadLogs()">
             <label><span>状态</span><select v-model="logFilter.status"><option value="">全部</option><option value="success">成功</option><option value="error">失败</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
             <label><span>上游</span><select v-model="logFilter.upstream_id"><option value="">全部</option><option v-for="item in upstreams" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
+            <label><span>分组</span><select v-model="logFilter.group_id"><option value="">全部</option><option v-for="item in groups" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
             <button class="secondary"><Search :size="16" />筛选</button>
           </form>
           <section class="panel table-panel"><div class="table-wrap"><table>
@@ -1482,7 +1558,7 @@ onBeforeUnmount(() => {
             <tbody>
               <template v-for="item in sortRows(logs, 'logs')" :key="item.request_id">
                 <tr class="clickable" tabindex="0" role="button" :aria-expanded="expandedLog === item.request_id" :aria-label="`展开请求 ${item.request_id} 详情`" @click="toggleLog(item.request_id)" @keydown.enter.prevent="toggleLog(item.request_id)" @keydown.space.prevent="toggleLog(item.request_id)">
-                  <td class="nowrap">{{ fmtDate(item.created_at) }}</td><td><span class="cell-copy"><code>{{ item.request_id.slice(0, 12) }}</code><button class="copy-button" title="复制完整请求 ID" @click.stop="copyValue(item.request_id, '请求 ID')"><Copy :size="12" /></button></span><small>{{ item.api_key_name || '未知客户端' }}</small></td>
+                  <td class="nowrap">{{ fmtDate(item.created_at) }}</td><td><span class="cell-copy"><code>{{ item.request_id.slice(0, 12) }}</code><button class="copy-button" title="复制完整请求 ID" @click.stop="copyValue(item.request_id, '请求 ID')"><Copy :size="12" /></button></span><small>{{ item.api_key_name || '未知客户端' }} · {{ item.group_name || '历史未分组' }}</small></td>
                   <td><strong>{{ item.protocol }}</strong><small>{{ item.model || '-' }}</small></td>
                   <td><span class="status" :class="item.status_code < 400 ? 'good' : 'bad'"><i></i>{{ item.status_code }}</span><small v-if="item.error_code">{{ item.error_code }}</small></td>
                   <td>{{ item.upstream_name || (item.upstream_id ? `#${item.upstream_id}` : '-') }}</td><td><strong>{{ fmtMetric(item.duration_ms, ' ms') }}</strong><small>TTFB {{ fmtMetric(item.ttfb_ms, ' ms') }} · TTFT {{ fmtMetric(item.ttft_ms, ' ms') }}</small></td>
@@ -1514,10 +1590,11 @@ onBeforeUnmount(() => {
           <form class="filterbar usage-filterbar" @submit.prevent="applyUsageFilters">
             <label><span>时间范围</span><select v-model.number="usageFilter.days"><option :value="7">近 7 天</option><option :value="30">近 30 天</option><option :value="90">近 90 天</option><option :value="365">近 1 年</option></select></label>
             <label><span>统计粒度</span><select v-model="usageFilter.granularity"><option value="day">按天</option><option value="week">按周</option><option value="month">按月</option></select></label>
-            <label><span>拆分维度</span><select v-model="usageFilter.dimension"><option value="upstream">上游</option><option value="api_key">客户端密钥</option><option value="protocol">协议</option><option value="model">模型</option></select></label>
+            <label><span>拆分维度</span><select v-model="usageFilter.dimension"><option value="upstream">上游</option><option value="api_key">客户端密钥</option><option value="group">分组</option><option value="protocol">协议</option><option value="model">模型</option></select></label>
             <label><span>Top N</span><select v-model.number="usageFilter.topN"><option :value="5">Top 5</option><option :value="10">Top 10</option><option :value="20">Top 20</option><option :value="50">Top 50</option></select></label>
             <label v-if="usageFilter.dimension === 'upstream'"><span>上游筛选</span><select v-model="usageFilter.upstream_id"><option value="">全部上游</option><option v-for="item in upstreams" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label>
             <label v-if="usageFilter.dimension === 'api_key'"><span>客户端筛选</span><select v-model="usageFilter.api_key_id"><option value="">全部客户端</option><option v-for="item in keys" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label>
+            <label v-if="usageFilter.dimension === 'group'"><span>分组筛选</span><select v-model="usageFilter.group_id"><option value="">全部分组</option><option v-for="item in groups" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label>
             <label v-if="usageFilter.dimension === 'protocol'"><span>协议筛选</span><select v-model="usageFilter.protocol"><option value="">全部协议</option><option v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label>
             <label v-if="usageFilter.dimension === 'model'"><span>模型筛选</span><input v-model.trim="usageFilter.model" placeholder="模型名称" /></label>
             <button class="secondary"><Search :size="16" />应用筛选</button>
@@ -1530,7 +1607,7 @@ onBeforeUnmount(() => {
             <article><span class="metric-icon green"><Check :size="19" /></span><div><small>Token 命中率</small><strong>{{ fmtPercent(usageTokenHitRate) }}</strong></div></article>
             <article><span class="metric-icon blue"><Gauge :size="19" /></span><div><small>平均 / P95 耗时</small><strong>{{ fmtMetric(usageAvgLatency, ' ms') }} <em>/ {{ fmtMetric(usageP95Latency, ' ms') }}</em></strong></div></article>
           </div>
-          <section class="panel usage-panel"><div class="panel-head usage-chart-head"><div><h2>使用趋势</h2><p>{{ usageFilter.granularity === 'day' ? '按天' : usageFilter.granularity === 'week' ? '按周' : '按月' }} · {{ usageDimensionLabel({ label: usageFilter.dimension === 'upstream' ? '上游' : usageFilter.dimension === 'api_key' ? '客户端密钥' : usageFilter.dimension === 'protocol' ? '协议' : '模型' }) }}</p></div><div class="segmented-control" role="group" aria-label="趋势指标"><button :aria-pressed="usageMetric === 'requests'" :class="{ active: usageMetric === 'requests' }" @click="usageMetric = 'requests'">请求</button><button :aria-pressed="usageMetric === 'tokens'" :class="{ active: usageMetric === 'tokens' }" @click="usageMetric = 'tokens'">Token</button><button :aria-pressed="usageMetric === 'cache'" :class="{ active: usageMetric === 'cache' }" @click="usageMetric = 'cache'">缓存</button><button :aria-pressed="usageMetric === 'latency'" :class="{ active: usageMetric === 'latency' }" @click="usageMetric = 'latency'">耗时</button></div></div>
+          <section class="panel usage-panel"><div class="panel-head usage-chart-head"><div><h2>使用趋势</h2><p>{{ usageFilter.granularity === 'day' ? '按天' : usageFilter.granularity === 'week' ? '按周' : '按月' }} · {{ usageDimensionLabel({ label: usageFilter.dimension === 'upstream' ? '上游' : usageFilter.dimension === 'api_key' ? '客户端密钥' : usageFilter.dimension === 'group' ? '分组' : usageFilter.dimension === 'protocol' ? '协议' : '模型' }) }}</p></div><div class="segmented-control" role="group" aria-label="趋势指标"><button :aria-pressed="usageMetric === 'requests'" :class="{ active: usageMetric === 'requests' }" @click="usageMetric = 'requests'">请求</button><button :aria-pressed="usageMetric === 'tokens'" :class="{ active: usageMetric === 'tokens' }" @click="usageMetric = 'tokens'">Token</button><button :aria-pressed="usageMetric === 'cache'" :class="{ active: usageMetric === 'cache' }" @click="usageMetric = 'cache'">缓存</button><button :aria-pressed="usageMetric === 'latency'" :class="{ active: usageMetric === 'latency' }" @click="usageMetric = 'latency'">耗时</button></div></div>
             <div v-if="usageRows.length" class="chart-frame"><UsageChart :rows="usageRows" :theme="resolvedTheme" :metric="usageMetric" :range-label="`近 ${usageFilter.days} 天`" /></div>
             <div v-else class="empty"><Gauge :size="22" /><strong>暂无用量数据</strong><span>产生请求后，这里会显示趋势与缓存命中情况。</span></div>
           </section>
@@ -1639,8 +1716,15 @@ onBeforeUnmount(() => {
     </section>
   </div>
 
+  <div v-if="groupModal" class="modal-backdrop" @mousedown.self="groupModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="group-title"><header><div><h2 id="group-title">{{ editingGroup ? '编辑分组' : '创建分组' }}</h2><p>选择该分组允许使用的上游</p></div><button class="icon" title="关闭" @click="groupModal = false"><X :size="19" /></button></header><form @submit.prevent="saveGroup"><div class="form-section"><div class="form-grid">
+    <label class="span-2">名称<input v-model.trim="groupForm.name" required autofocus placeholder="生产线路" /></label>
+    <fieldset class="span-2"><legend>上游成员</legend><div class="check-row"><label v-for="item in upstreams" :key="item.id"><input v-model="groupForm.upstream_ids" type="checkbox" :value="item.id" />{{ item.name }}</label><span v-if="!upstreams.length" class="muted">请先创建上游</span></div></fieldset>
+    <label class="switch span-2"><input v-model="groupForm.enabled" type="checkbox" /><span></span>启用分组</label>
+  </div></div><footer><button type="button" class="secondary" @click="groupModal = false">取消</button><button class="primary" :disabled="saving || !groupForm.upstream_ids.length">{{ editingGroup ? '保存修改' : '创建分组' }}</button></footer></form></section></div>
+
   <div v-if="keyModal" class="modal-backdrop" @mousedown.self="keyModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="key-title"><header><div><h2 id="key-title">{{ editingKey ? '编辑客户端密钥' : '创建客户端密钥' }}</h2><p>设置客户端访问范围</p></div><button class="icon" title="关闭" @click="keyModal = false"><X :size="19" /></button></header><form @submit.prevent="saveKey"><div class="form-section"><div class="form-grid">
     <label class="span-2">名称<input v-model.trim="keyForm.name" required autofocus placeholder="Claude Code 工作站" /></label>
+    <label class="span-2">分组<select v-model.number="keyForm.group_id" required><option :value="0" disabled>选择分组</option><option v-for="item in groups" :key="item.id" :value="item.id" :disabled="!item.enabled || !item.upstream_ids.length">{{ item.name }}{{ !item.enabled ? '（停用）' : '' }}</option></select></label>
     <fieldset class="span-2"><legend>允许协议</legend><div class="check-row"><label v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol"><input v-model="keyForm.protocols" type="checkbox" :value="protocol" />{{ protocol }}</label></div></fieldset>
     <label class="span-2">允许模型 <span>逗号分隔；留空表示全部</span><textarea v-model="keyForm.models" rows="3" placeholder="gpt-5, claude-sonnet"></textarea></label>
     <label class="switch span-2"><input v-model="keyForm.enabled" type="checkbox" /><span></span>启用密钥</label>

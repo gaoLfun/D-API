@@ -92,6 +92,10 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /api/admin/upstreams/{id}/check", s.admin(http.HandlerFunc(s.checkUpstream)))
 	mux.Handle("POST /api/admin/upstreams/{id}/balance", s.admin(http.HandlerFunc(s.balanceUpstream)))
 	mux.Handle("POST /api/admin/upstreams/{id}/models", s.admin(http.HandlerFunc(s.modelsUpstream)))
+	mux.Handle("GET /api/admin/groups", s.admin(http.HandlerFunc(s.listGroups)))
+	mux.Handle("POST /api/admin/groups", s.admin(http.HandlerFunc(s.createGroup)))
+	mux.Handle("PUT /api/admin/groups/{id}", s.admin(http.HandlerFunc(s.updateGroup)))
+	mux.Handle("DELETE /api/admin/groups/{id}", s.admin(http.HandlerFunc(s.deleteGroup)))
 	mux.Handle("GET /api/admin/keys", s.admin(http.HandlerFunc(s.listKeys)))
 	mux.Handle("POST /api/admin/keys", s.admin(http.HandlerFunc(s.createKey)))
 	mux.Handle("GET /api/admin/keys/{id}/secret", s.admin(http.HandlerFunc(s.keySecret)))
@@ -574,9 +578,124 @@ func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 
 type keyPayload struct {
 	Name      string   `json:"name"`
+	GroupID   int64    `json:"group_id"`
 	Enabled   *bool    `json:"enabled"`
 	Protocols []string `json:"protocols"`
 	Models    []string `json:"models"`
+}
+
+type groupPayload struct {
+	Name        string  `json:"name"`
+	Enabled     *bool   `json:"enabled"`
+	UpstreamIDs []int64 `json:"upstream_ids"`
+}
+
+func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.store.ListGroups(r.Context())
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+func validGroupPayload(input groupPayload, allowEmpty bool) bool {
+	name := strings.TrimSpace(input.Name)
+	if name == "" || len([]rune(name)) > 200 {
+		return false
+	}
+	if !allowEmpty && len(cleanGroupIDs(input.UpstreamIDs)) == 0 {
+		return false
+	}
+	return true
+}
+
+func cleanGroupIDs(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
+	var input groupPayload
+	if err := decodeJSON(w, r, &input); err != nil || !validGroupPayload(input, false) {
+		writeError(w, http.StatusBadRequest, "invalid_group", "分组名称或上游无效")
+		return
+	}
+	enabled := true
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	}
+	id, err := s.store.CreateGroup(r.Context(), core.Group{Name: strings.TrimSpace(input.Name), Enabled: enabled, UpstreamIDs: cleanGroupIDs(input.UpstreamIDs)})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "group.create", "group", id, map[string]any{"name": strings.TrimSpace(input.Name), "upstream_ids": cleanGroupIDs(input.UpstreamIDs)})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var input groupPayload
+	if err := decodeJSON(w, r, &input); err != nil || !validGroupPayload(input, true) {
+		writeError(w, http.StatusBadRequest, "invalid_group", "分组名称或上游无效")
+		return
+	}
+	existing, err := s.store.Group(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	enabled := existing.Enabled
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	}
+	updated := core.Group{ID: id, Name: strings.TrimSpace(input.Name), Enabled: enabled, UpstreamIDs: cleanGroupIDs(input.UpstreamIDs)}
+	if err := s.store.UpdateGroup(r.Context(), updated); err != nil {
+		if errors.Is(err, store.ErrGroupHasKeys) {
+			writeError(w, http.StatusConflict, "group_has_keys", "分组仍有绑定密钥，不能停用")
+			return
+		}
+		if errors.Is(err, store.ErrInvalidGroup) {
+			writeError(w, http.StatusBadRequest, "invalid_group", "启用分组必须绑定上游")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "group.update", "group", id, map[string]any{"name": updated.Name, "enabled": updated.Enabled, "before": existing.UpstreamIDs, "after": updated.UpstreamIDs})
+	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteGroup(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrGroupHasKeys) {
+			writeError(w, http.StatusConflict, "group_has_keys", "分组仍有绑定密钥，请先迁移密钥")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "group.delete", "group", id, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
@@ -589,17 +708,20 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_key", "名称或协议无效")
 		return
 	}
+	if !s.requireAvailableGroup(w, r, input.GroupID) {
+		return
+	}
 	raw, prefix, hash, err := auth.NewAPIKey()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "无法创建密钥")
 		return
 	}
-	id, err := s.store.InsertAPIKeyWithSecret(r.Context(), strings.TrimSpace(input.Name), prefix, hash, raw, input.Protocols, cleanStrings(input.Models))
+	id, err := s.store.InsertAPIKeyWithSecretInGroup(r.Context(), strings.TrimSpace(input.Name), prefix, hash, raw, input.GroupID, input.Protocols, cleanStrings(input.Models))
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	s.audit(r, "api_key.create", "api_key", id, map[string]any{"name": input.Name})
+	s.audit(r, "api_key.create", "api_key", id, map[string]any{"name": input.Name, "group_id": input.GroupID})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "key": raw, "prefix": prefix})
 }
 
@@ -640,17 +762,47 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_key", "名称或协议无效")
 		return
 	}
+	if !s.requireAvailableGroup(w, r, input.GroupID) {
+		return
+	}
 	enabled := true
 	if input.Enabled != nil {
 		enabled = *input.Enabled
 	}
-	err := s.store.UpdateAPIKey(r.Context(), core.APIKey{ID: id, Name: strings.TrimSpace(input.Name), Enabled: enabled, Protocols: input.Protocols, Models: cleanStrings(input.Models)})
+	existing, err := s.store.APIKey(r.Context(), id)
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	s.audit(r, "api_key.update", "api_key", id, map[string]any{"name": input.Name, "enabled": enabled})
+	err = s.store.UpdateAPIKey(r.Context(), core.APIKey{ID: id, GroupID: input.GroupID, Name: strings.TrimSpace(input.Name), Enabled: enabled, Protocols: input.Protocols, Models: cleanStrings(input.Models)})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "api_key.update", "api_key", id, map[string]any{"name": input.Name, "enabled": enabled, "before_group_id": existing.GroupID, "after_group_id": input.GroupID})
 	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+func (s *Server) requireAvailableGroup(w http.ResponseWriter, r *http.Request, id int64) bool {
+	if id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_group", "必须选择分组")
+		return false
+	}
+	err := s.store.GroupAvailable(r.Context(), id)
+	if err == nil {
+		return true
+	}
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "分组不存在")
+	case errors.Is(err, store.ErrGroupDisabled):
+		writeError(w, http.StatusBadRequest, "group_disabled", "分组已停用")
+	case errors.Is(err, store.ErrGroupEmpty):
+		writeError(w, http.StatusBadRequest, "group_empty", "分组没有上游")
+	default:
+		writeStoreError(w, err)
+	}
+	return false
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
@@ -670,6 +822,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	filter := store.LogFilter{
 		Limit: parseInt(r.URL.Query().Get("limit"), 50), Offset: parseInt(r.URL.Query().Get("offset"), 0),
 		UpstreamID: parseInt64(r.URL.Query().Get("upstream_id")),
+		GroupID:    parseInt64(r.URL.Query().Get("group_id")),
 	}
 	filter.StatusMin, filter.StatusMax = statusRange(r.URL.Query().Get("status"))
 	logs, err := s.store.ListRequestLogs(r.Context(), filter)
@@ -683,7 +836,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	dimension := strings.TrimSpace(query.Get("dimension"))
-	if dimension != "" && dimension != "upstream" && dimension != "api_key" && dimension != "protocol" && dimension != "model" {
+	if dimension != "" && dimension != "upstream" && dimension != "api_key" && dimension != "group" && dimension != "protocol" && dimension != "model" {
 		writeError(w, http.StatusBadRequest, "invalid_dimension", "维度无效")
 		return
 	}
@@ -699,6 +852,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		Days: parseInt(query.Get("days"), 30), Dimension: dimension, Granularity: granularity,
 		TopN: parseInt(query.Get("top_n"), 5), UpstreamID: parseInt64(query.Get("upstream_id")),
 		APIKeyID: parseInt64(query.Get("api_key_id")), Protocol: strings.TrimSpace(query.Get("protocol")), Model: strings.TrimSpace(query.Get("model")),
+		GroupID: parseInt64(query.Get("group_id")),
 	}
 	if rawDays := strings.TrimSpace(query.Get("days")); rawDays != "" {
 		days := parseInt(rawDays, 0)

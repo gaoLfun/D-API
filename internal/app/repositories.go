@@ -26,8 +26,8 @@ func (r GatewayRepository) Authenticate(ctx context.Context, raw string) (core.A
 	return key, err
 }
 
-func (r GatewayRepository) Candidates(ctx context.Context, protocol, model string) ([]core.Upstream, error) {
-	return r.Store.ListRouteUpstreams(ctx, protocol, model)
+func (r GatewayRepository) Candidates(ctx context.Context, groupID int64, protocol, model string) ([]core.Upstream, error) {
+	return r.Store.ListRouteUpstreams(ctx, groupID, protocol, model)
 }
 
 func (r GatewayRepository) AvailableModels(ctx context.Context, key core.APIKey) ([]string, error) {

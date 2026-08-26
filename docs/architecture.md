@@ -37,10 +37,11 @@ API keys. These authentication paths do not share credentials or permissions.
 
 1. D-API hashes the presented client API key and looks up an enabled key.
 2. It validates the key's protocol and model restrictions.
-3. It loads upstreams ordered by numeric priority, then excludes disabled,
-   circuit-open, protocol-incompatible, and model-incompatible entries.
-4. It tries up to the configured maximum attempts, which defaults to 3 and is
-   constrained to 1 through 5.
+3. It loads only the key's enabled group members, ordered by numeric priority,
+   then excludes disabled, circuit-open, protocol-incompatible, and
+   model-incompatible entries.
+4. It tries up to the configured maximum attempts within that group, which
+   defaults to 3 and is constrained to 1 through 5.
 5. For a model alias, only the request's top-level `model` value is rewritten.
 6. The response is returned with D-API request, upstream, and attempt headers.
 7. Request metadata, attempts, result, total/first-byte/first-token latency,

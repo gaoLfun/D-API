@@ -44,7 +44,7 @@ func (upstreamTimeout) Temporary() bool { return true }
 
 type Repository interface {
 	Authenticate(context.Context, string) (core.APIKey, error)
-	Candidates(context.Context, string, string) ([]core.Upstream, error)
+	Candidates(context.Context, int64, string, string) ([]core.Upstream, error)
 	AvailableModels(context.Context, core.APIKey) ([]string, error)
 	MaxAttempts(context.Context) (int, error)
 	RecordRequest(context.Context, core.RequestLog) error
@@ -215,6 +215,9 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 			RequestID: requestID, APIKeyID: key.ID, Protocol: protocol,
 			ClientIP: clientIP(r), CreatedAt: started, Attempts: []core.Attempt{},
 		}
+		if key.GroupID > 0 {
+			logEntry.GroupID = &key.GroupID
+		}
 		defer func() {
 			logEntry.DurationMS = time.Since(started).Milliseconds()
 			h.record(logEntry)
@@ -276,7 +279,7 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 		} else if maxAttempts > 5 {
 			maxAttempts = 5
 		}
-		candidates, err := h.repo.Candidates(r.Context(), protocol, payload.Model)
+		candidates, err := h.repo.Candidates(r.Context(), key.GroupID, protocol, payload.Model)
 		if err != nil {
 			logEntry.StatusCode = http.StatusInternalServerError
 			logEntry.ErrorCode = "internal_error"

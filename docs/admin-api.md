@@ -36,6 +36,7 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `POST` | `/api/admin/upstreams/{id}/check` | 运行健康检查 |
 | `POST` | `/api/admin/upstreams/{id}/balance` | 查询余额/用量 |
 | `POST` | `/api/admin/upstreams/{id}/models` | 获取并保存上游模型 |
+| `GET/POST/PUT/DELETE` | `/api/admin/groups[/{id}]` | 分组及其上游成员管理 |
 | `GET/POST/PUT/DELETE` | `/api/admin/keys[/{id}]` | 客户端密钥管理 |
 | `GET` | `/api/admin/keys/{id}/secret` | 从加密副本恢复可复制密钥 |
 | `GET` | `/api/admin/logs` | 分页请求日志 |
@@ -80,12 +81,41 @@ HTTP(S) URL 和指向回环、私网、链路本地、组播、CGNAT 或云元�
 模型测试会发送真实的最小请求，可能消耗上游额度。NewAPI 按模型选择
 Chat 或 Responses；Sub2API 先做源站 HEAD，再发送带算术 challenge 的模型请求。
 
+## 分组与路由范围
+
+分组把一个或多个上游组成独立的路由范围。客户端密钥必须绑定一个启用且至少
+包含一个上游的分组；网关只会在该分组成员中按上游优先级尝试，不会回退到其他
+分组或全局上游池。
+
+分组接口使用以下字段：`id`、`name`、`enabled`、`upstream_ids`、`key_count`、
+`created_at` 和 `updated_at`。创建示例：
+
+```json
+{"name":"生产线路","enabled":true,"upstream_ids":[1,2]}
+```
+
+- `GET /api/admin/groups` 返回分组列表。
+- `POST /api/admin/groups` 创建分组，名称不能为空，且至少绑定一个已存在的上游。
+- `PUT /api/admin/groups/{id}` 更新名称、启用状态和成员；停用的分组可以暂时没有成员，
+  启用时必须至少保留一个成员。
+- `DELETE /api/admin/groups/{id}` 删除分组并返回 `204`。仍有客户端密钥绑定时会返回
+  `409 group_has_keys`，必须先把密钥迁移到其他分组。
+
+分组停用或删除上游后，绑定的密钥不会自动迁移；密钥创建和更新会拒绝不可用的
+分组。首次启动的数据库迁移会创建“默认分组”，并把已有上游和密钥纳入其中；若
+列表仍有历史未分组密钥，需要通过更新接口补填 `group_id`，否则无法获得分组内的
+路由候选。
+
 ## 客户端密钥
+
+每个密钥必须绑定一个启用且至少包含一个上游的分组。创建和更新请求需传
+`group_id`；请求只会在该分组内选择上游。分组停用或无可用上游时沿用网关的
+现有错误语义。
 
 创建：
 
 ```json
-{"name":"本地开发","protocols":["responses"],"models":[]}
+{"name":"本地开发","group_id":1,"protocols":["responses"],"models":[]}
 ```
 
 成功响应中的 `key` 只应在可信终端短暂显示：
@@ -102,7 +132,7 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 ## 日志和用量
 
 `GET /api/admin/logs` 支持 `limit`（默认 50，最大 200）、`offset`、
-`status=success|error|5xx|429` 和 `upstream_id`。响应包含请求 ID、模型、
+`status=success|error|5xx|429`、`upstream_id` 和 `group_id`。响应包含请求 ID、模型、
 协议、状态、总耗时、TTFB、流式 TTFT、尝试链和可用 Token 字段；请求体和
 响应体不会存储。
 
@@ -113,9 +143,9 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 | `days` | 1-365，默认 30 |
 | `from`/`to` | UTC 日期 `YYYY-MM-DD`，范围最多 365 天 |
 | `granularity` | `day`、`week`、`month` |
-| `dimension` | `upstream`、`api_key`、`protocol`、`model` 或留空 |
+| `dimension` | `upstream`、`api_key`、`group`、`protocol`、`model` 或留空 |
 | `top_n` | 1-100，默认 5；其余聚合为“其他” |
-| `upstream_id`/`api_key_id`/`protocol`/`model` | 可选筛选条件 |
+| `upstream_id`/`api_key_id`/`group_id`/`protocol`/`model` | 可选筛选条件 |
 
 响应同时提供 `daily`、`items`、`totals` 和 `summary` 字段，包含请求、成功、
 输入/输出 Token、缓存读写、缓存命中率、平均耗时和 P95 耗时。缺少上游

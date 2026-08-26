@@ -16,15 +16,16 @@ import (
 )
 
 type fakeRepository struct {
-	mu          sync.Mutex
-	key         core.APIKey
-	authErr     error
-	candidates  []core.Upstream
-	models      []string
-	maxAttempts int
-	logs        []core.RequestLog
-	successes   []int64
-	failures    []int64
+	mu             sync.Mutex
+	key            core.APIKey
+	authErr        error
+	candidates     []core.Upstream
+	candidateGroup int64
+	models         []string
+	maxAttempts    int
+	logs           []core.RequestLog
+	successes      []int64
+	failures       []int64
 }
 
 func (f *fakeRepository) Authenticate(_ context.Context, token string) (core.APIKey, error) {
@@ -37,7 +38,8 @@ func (f *fakeRepository) Authenticate(_ context.Context, token string) (core.API
 	return f.key, nil
 }
 
-func (f *fakeRepository) Candidates(context.Context, string, string) ([]core.Upstream, error) {
+func (f *fakeRepository) Candidates(_ context.Context, groupID int64, _ string, _ string) ([]core.Upstream, error) {
+	f.candidateGroup = groupID
 	return append([]core.Upstream(nil), f.candidates...), nil
 }
 
@@ -98,7 +100,7 @@ func TestProxySwitchesAndRewritesModel(t *testing.T) {
 	defer succeeded.Close()
 
 	repo := &fakeRepository{
-		key: core.APIKey{ID: 9, Enabled: true, Protocols: []string{core.ProtocolChat}, Models: []string{"public-model"}},
+		key: core.APIKey{ID: 9, GroupID: 42, Enabled: true, Protocols: []string{core.ProtocolChat}, Models: []string{"public-model"}},
 		candidates: []core.Upstream{
 			{ID: 2, Name: "second", BaseURL: succeeded.URL + "/v1", APIKey: "upstream-secret", Enabled: true, Priority: 20, Protocols: []string{core.ProtocolChat}, ModelAliases: map[string]string{"public-model": "provider-model"}},
 			{ID: 1, Name: "first", BaseURL: failed.URL, APIKey: "bad", Enabled: true, Priority: 10, Protocols: []string{core.ProtocolChat}, Models: []string{"public-model"}},
@@ -126,6 +128,9 @@ func TestProxySwitchesAndRewritesModel(t *testing.T) {
 	}
 	if len(repo.logs) != 1 || len(repo.logs[0].Attempts) != 2 {
 		t.Fatalf("logs = %#v", repo.logs)
+	}
+	if repo.candidateGroup != 42 || repo.logs[0].GroupID == nil || *repo.logs[0].GroupID != 42 {
+		t.Fatalf("group routing metadata = %d, %#v", repo.candidateGroup, repo.logs[0].GroupID)
 	}
 	usage := repo.logs[0].Usage
 	if usage.InputTokens == nil || *usage.InputTokens != 11 || usage.OutputTokens == nil || *usage.OutputTokens != 7 || usage.CachedInputTokens == nil || *usage.CachedInputTokens != 3 {

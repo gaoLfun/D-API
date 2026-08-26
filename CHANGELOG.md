@@ -12,6 +12,8 @@ All notable changes to D-API will be documented in this file. The format is base
   one-click CCSwitch import with optional model discovery.
 - Request TTFB/streaming TTFT, input/output/cache-read/cache-write tokens, cache
   hit rates, multidimensional usage grouping, average/P95 latency, and charts.
+- Upstream groups with group-scoped client keys, group routing, and group-level
+  request-log and usage filters.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,
