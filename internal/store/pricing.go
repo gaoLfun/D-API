@@ -41,6 +41,17 @@ type liteLLMPrice struct {
 	CacheCreationInputTokenCost *float64 `json:"cache_creation_input_token_cost"`
 }
 
+type pricingCacheKey struct {
+	upstreamID int64
+	model      string
+}
+
+type pricingCacheEntry struct {
+	input, output, cacheRead, cacheWrite float64
+	found                                bool
+	expires                              time.Time
+}
+
 type PricingModelPrice struct {
 	ID                      int64      `json:"id,omitempty"`
 	Model                   string     `json:"model"`
@@ -61,6 +72,14 @@ type PricingProfile struct {
 	SourceVersion   string              `json:"source_version"`
 	LastRefreshedAt *time.Time          `json:"last_refreshed_at,omitempty"`
 	Prices          []PricingModelPrice `json:"prices"`
+}
+
+type PricingBackfillResult struct {
+	LogsUpdated   int64     `json:"logs_updated"`
+	DailyUpdated  int64     `json:"daily_updated"`
+	HourlyUpdated int64     `json:"hourly_updated"`
+	From          time.Time `json:"from"`
+	To            time.Time `json:"to"`
 }
 
 func (s *Store) USDCNYRate(ctx context.Context) (float64, error) {
@@ -154,6 +173,7 @@ func (s *Store) SavePricingProfile(ctx context.Context, profile PricingProfile) 
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.invalidatePricingCache()
 	return id, nil
 }
 
@@ -207,7 +227,13 @@ func savePricingProfileTx(ctx context.Context, tx *sql.Tx, profile PricingProfil
 
 func (s *Store) SetUpstreamPricingProfile(ctx context.Context, upstreamID, profileID int64) error {
 	if profileID == 0 {
-		_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET pricing_profile_id=NULL,updated_at=now() WHERE id=$1`, upstreamID)
+		result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET pricing_profile_id=NULL,updated_at=now() WHERE id=$1`, upstreamID)
+		if err == nil {
+			if count, _ := result.RowsAffected(); count == 0 {
+				return ErrNotFound
+			}
+			s.invalidatePricingCache()
+		}
 		return err
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET pricing_profile_id=$1,updated_at=now() WHERE id=$2`, profileID, upstreamID)
@@ -218,6 +244,7 @@ func (s *Store) SetUpstreamPricingProfile(ctx context.Context, upstreamID, profi
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidatePricingCache()
 	return nil
 }
 
@@ -230,6 +257,7 @@ func (s *Store) DeletePricingProfile(ctx context.Context, id int64) error {
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidatePricingCache()
 	return nil
 }
 
@@ -283,7 +311,11 @@ func (s *Store) RefreshPricingProfiles(ctx context.Context) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidatePricingCache()
+	return nil
 }
 
 func decodeLiteLLMPrices(data []byte) (map[string][]PricingModelPrice, error) {
@@ -337,6 +369,100 @@ func perMillion(value *float64) float64 {
 	return *value * 1_000_000
 }
 
+func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (PricingBackfillResult, error) {
+	if to.IsZero() {
+		now := time.Now().UTC()
+		to = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		to = time.Date(to.UTC().Year(), to.UTC().Month(), to.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	}
+	if from.IsZero() {
+		from = to.AddDate(0, 0, -364)
+	} else {
+		from = time.Date(from.UTC().Year(), from.UTC().Month(), from.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	}
+	if from.After(to) || to.Sub(from) > 364*24*time.Hour {
+		return PricingBackfillResult{}, ErrInvalidPricing
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PricingBackfillResult{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE pricing_backfill(
+		id BIGINT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, api_key_id BIGINT NOT NULL,
+		group_id BIGINT, upstream_id BIGINT NOT NULL, protocol TEXT NOT NULL, model TEXT NOT NULL,
+		cost_usd NUMERIC(20,8) NOT NULL
+	) ON COMMIT DROP`); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		WITH candidates AS (
+			SELECT l.id, l.created_at, l.api_key_id, l.group_id, l.upstream_id, l.protocol, l.model,
+				(
+					COALESCE(l.uncached_input_tokens, GREATEST(COALESCE(l.input_tokens,0)-COALESCE(l.cached_input_tokens,0),0)) * p.input_usd_per_million
+					+ COALESCE(l.cached_input_tokens,0) * p.cache_read_usd_per_million
+					+ COALESCE(l.cache_creation_input_tokens,0) * p.cache_write_usd_per_million
+					+ COALESCE(l.output_tokens,0) * p.output_usd_per_million
+				) / 1000000.0 AS cost_usd
+			FROM request_logs l
+			JOIN upstreams u ON u.id=l.upstream_id
+			JOIN LATERAL (
+				SELECT m.input_usd_per_million,m.output_usd_per_million,m.cache_read_usd_per_million,m.cache_write_usd_per_million
+				FROM pricing_model_prices m
+				WHERE m.profile_id=u.pricing_profile_id
+				  AND (m.model=l.model OR m.model=COALESCE(u.model_aliases ->> l.model,l.model))
+				  AND m.valid_from <= l.created_at AND (m.valid_to IS NULL OR m.valid_to > l.created_at)
+				ORDER BY CASE WHEN m.model=l.model THEN 0 ELSE 1 END,m.valid_from DESC LIMIT 1
+			) p ON TRUE
+			WHERE l.cost_usd IS NULL
+			  AND l.created_at >= $1::date AT TIME ZONE 'UTC'
+			  AND l.created_at < ($2::date + interval '1 day') AT TIME ZONE 'UTC'
+			  AND l.upstream_id IS NOT NULL AND l.api_key_id IS NOT NULL
+			  AND (l.input_tokens IS NOT NULL OR l.output_tokens IS NOT NULL OR l.cached_input_tokens IS NOT NULL OR l.cache_creation_input_tokens IS NOT NULL OR l.uncached_input_tokens IS NOT NULL)
+		), updated AS (
+			UPDATE request_logs l SET cost_usd=c.cost_usd FROM candidates c WHERE l.id=c.id AND l.cost_usd IS NULL
+			RETURNING l.id,l.created_at,l.api_key_id,l.group_id,l.upstream_id,l.protocol,l.model,l.cost_usd
+		)
+		INSERT INTO pricing_backfill SELECT id,created_at,api_key_id,group_id,upstream_id,protocol,model,cost_usd FROM updated`, from, to); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	var result PricingBackfillResult
+	result.From, result.To = from, to
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM pricing_backfill`).Scan(&result.LogsUpdated); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `
+		WITH aggregate AS (
+			SELECT (created_at AT TIME ZONE 'UTC')::date AS day,api_key_id,COALESCE(group_id,0) AS group_id,upstream_id,protocol,model,
+				sum(cost_usd) AS cost_usd,count(*) AS known
+			FROM pricing_backfill GROUP BY 1,2,3,4,5,6
+		), updated AS (
+			UPDATE daily_usage d SET cost_usd=d.cost_usd+a.cost_usd,cost_known_requests=d.cost_known_requests+a.known
+			FROM aggregate a WHERE d.day=a.day AND d.api_key_id=a.api_key_id AND d.group_id=a.group_id AND d.upstream_id=a.upstream_id AND d.protocol=a.protocol AND d.model=a.model
+			RETURNING d.day
+		) SELECT count(*) FROM updated`).Scan(&result.DailyUpdated); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `
+		WITH aggregate AS (
+			SELECT date_trunc('hour',created_at) AS hour,api_key_id,COALESCE(group_id,0) AS group_id,upstream_id,protocol,model,
+				sum(cost_usd) AS cost_usd,count(*) AS known
+			FROM pricing_backfill GROUP BY 1,2,3,4,5,6
+		), updated AS (
+			UPDATE hourly_usage h SET cost_usd=h.cost_usd+a.cost_usd,cost_known_requests=h.cost_known_requests+a.known
+			FROM aggregate a WHERE h.hour=a.hour AND h.api_key_id=a.api_key_id AND h.group_id=a.group_id AND h.upstream_id=a.upstream_id AND h.protocol=a.protocol AND h.model=a.model
+			RETURNING h.hour
+		) SELECT count(*) FROM updated`).Scan(&result.HourlyUpdated); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PricingBackfillResult{}, err
+	}
+	s.invalidatePricingCache()
+	return result, nil
+}
+
 func (s *Store) RequestCost(ctx context.Context, upstreamID int64, model string, usage core.Usage, at time.Time) (*float64, error) {
 	if upstreamID <= 0 || strings.TrimSpace(model) == "" {
 		return nil, nil
@@ -344,25 +470,59 @@ func (s *Store) RequestCost(ctx context.Context, upstreamID int64, model string,
 	if usage.InputTokens == nil && usage.OutputTokens == nil && usage.CachedInputTokens == nil && usage.CacheCreationInputTokens == nil && usage.UncachedInputTokens == nil {
 		return nil, nil
 	}
-	var input, output, cacheRead, cacheWrite float64
+	rate, err := s.pricingRate(ctx, upstreamID, model, at)
+	if err != nil || !rate.found {
+		return nil, err
+	}
+	total := calculateRequestCost(PricingModelPrice{
+		InputUSDPerMillion: rate.input, OutputUSDPerMillion: rate.output,
+		CacheReadUSDPerMillion: rate.cacheRead, CacheWriteUSDPerMillion: rate.cacheWrite,
+	}, usage)
+	return &total, nil
+}
+
+func (s *Store) pricingRate(ctx context.Context, upstreamID int64, model string, at time.Time) (pricingCacheEntry, error) {
+	key := pricingCacheKey{upstreamID: upstreamID, model: strings.TrimSpace(model)}
+	now := time.Now().UTC()
+	if at.After(now.Add(-2*time.Minute)) && at.Before(now.Add(2*time.Minute)) {
+		s.pricingMu.RLock()
+		cached, ok := s.pricingCache[key]
+		s.pricingMu.RUnlock()
+		if ok && cached.expires.After(now) {
+			return cached, nil
+		}
+	}
+	var rate pricingCacheEntry
 	err := s.db.QueryRowContext(ctx, `
 		SELECT m.input_usd_per_million,m.output_usd_per_million,m.cache_read_usd_per_million,m.cache_write_usd_per_million
 		FROM upstreams u JOIN pricing_model_prices m ON m.profile_id=u.pricing_profile_id
 		WHERE u.id=$1 AND (m.model=$2 OR m.model=COALESCE(u.model_aliases ->> $2,$2))
 			AND m.valid_from <= $3 AND (m.valid_to IS NULL OR m.valid_to > $3)
 		ORDER BY CASE WHEN m.model=$2 THEN 0 ELSE 1 END,m.valid_from DESC LIMIT 1`,
-		upstreamID, model, at.UTC()).Scan(&input, &output, &cacheRead, &cacheWrite)
+		upstreamID, key.model, at.UTC()).Scan(&rate.input, &rate.output, &rate.cacheRead, &rate.cacheWrite)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		rate.expires = now.Add(30 * time.Second)
+	} else if err != nil {
+		return pricingCacheEntry{}, err
+	} else {
+		rate.found = true
+		rate.expires = now.Add(5 * time.Minute)
 	}
-	if err != nil {
-		return nil, err
+	if at.After(now.Add(-2*time.Minute)) && at.Before(now.Add(2*time.Minute)) {
+		s.pricingMu.Lock()
+		if s.pricingCache == nil {
+			s.pricingCache = make(map[pricingCacheKey]pricingCacheEntry)
+		}
+		s.pricingCache[key] = rate
+		s.pricingMu.Unlock()
 	}
-	total := calculateRequestCost(PricingModelPrice{
-		InputUSDPerMillion: input, OutputUSDPerMillion: output,
-		CacheReadUSDPerMillion: cacheRead, CacheWriteUSDPerMillion: cacheWrite,
-	}, usage)
-	return &total, nil
+	return rate, nil
+}
+
+func (s *Store) invalidatePricingCache() {
+	s.pricingMu.Lock()
+	s.pricingCache = make(map[pricingCacheKey]pricingCacheEntry)
+	s.pricingMu.Unlock()
 }
 
 func calculateRequestCost(price PricingModelPrice, usage core.Usage) float64 {

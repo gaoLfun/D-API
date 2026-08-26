@@ -772,6 +772,16 @@ async function refreshPricing() {
   } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
 }
 
+async function backfillPricing() {
+  if (!(await requestConfirmation('回算历史成本', '将按请求发生时有效的价格档案补齐最近 365 天未知成本。'))) return
+  saving.value = true
+  try {
+    const result = await api.post<Json>('/api/admin/pricing/backfill', {})
+    await loadCurrent()
+    notify(`已回算 ${Number(result?.logs_updated || 0).toLocaleString()} 条请求成本`)
+  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
+}
+
 function openPricingProfile(profile?: Json) {
   editingPricing.value = profile?.id ?? null
   const prices = listOf<Json>(profile?.prices).map((price) => [price.model, price.input_usd_per_million, price.output_usd_per_million, price.cache_read_usd_per_million, price.cache_write_usd_per_million].join(', ')).join('\n')
@@ -1619,7 +1629,7 @@ onBeforeUnmount(() => {
           </section>
           <div class="dashboard-detail-grid">
             <section class="panel cost-breakdown"><div class="panel-head"><div><h2>成本明细</h2><p>近 30 天 · 模型与 Token 类型</p></div><span class="muted">{{ fmtPercent(dashboardCostCoverage) }} 已计价</span></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>请求</th><th>覆盖率</th><th>Token 构成</th><th class="right">USD</th><th class="right">CNY</th></tr></thead><tbody><tr v-for="row in dashboardCostByModel" :key="row.model"><td><strong>{{ row.model }}</strong></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtPercent(row.requests ? row.known / row.requests : null) }}</td><td><small class="token-breakdown">入 {{ fmtNumber(row.input) }} · 出 {{ fmtNumber(row.output) }}<br />读 {{ fmtNumber(row.cached) }} · 写 {{ fmtNumber(row.cacheWrite) }}</small></td><td class="right"><strong>{{ fmtCurrency(row.cost_usd, 'USD') }}</strong></td><td class="right">{{ fmtCurrency(row.cost_usd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }}</td></tr><tr v-if="!dashboardCostByModel.length"><td colspan="6"><div class="empty"><CircleDollarSign :size="20" /><strong>暂无可计价成本</strong><span>绑定价格档案并产生带 Token 的请求后显示。</span></div></td></tr></tbody></table></div></section>
-            <section class="panel pricing-snapshot"><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.prices?.length || 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<Json>(pricing.profiles).length" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
+            <section class="panel pricing-snapshot"><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" :disabled="saving" @click="backfillPricing"><RefreshCw :class="{ spin: saving }" :size="15" />回算成本</button><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.prices?.length || 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<Json>(pricing.profiles).length" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
           </div>
           <section class="panel">
             <div class="panel-head"><div><h2>上游状态</h2><p>当前路由顺序与连接状态</p></div><button class="text-button" @click="go('upstreams')">查看全部 <ChevronRight :size="15" /></button></div>

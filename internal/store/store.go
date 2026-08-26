@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/cryptox"
@@ -15,8 +16,10 @@ import (
 var schema string
 
 type Store struct {
-	db  *sql.DB
-	box *cryptox.SecretBox
+	db           *sql.DB
+	box          *cryptox.SecretBox
+	pricingMu    sync.RWMutex
+	pricingCache map[pricingCacheKey]pricingCacheEntry
 }
 
 func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Store, error) {
@@ -31,7 +34,7 @@ func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Sto
 		db.Close()
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
-	return &Store{db: db, box: box}, nil
+	return &Store{db: db, box: box, pricingCache: make(map[pricingCacheKey]pricingCacheEntry)}, nil
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

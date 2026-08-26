@@ -117,6 +117,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("PUT /api/admin/pricing/profiles/{id}", s.admin(http.HandlerFunc(s.updatePricingProfile)))
 	mux.Handle("DELETE /api/admin/pricing/profiles/{id}", s.admin(http.HandlerFunc(s.deletePricingProfile)))
 	mux.Handle("POST /api/admin/pricing/refresh", s.admin(http.HandlerFunc(s.refreshPricing)))
+	mux.Handle("POST /api/admin/pricing/backfill", s.admin(http.HandlerFunc(s.backfillPricing)))
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -1214,6 +1215,38 @@ func (s *Server) refreshPricing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"checked_at": time.Now().UTC(), "mode": "litellm-sync"})
 }
 
+func (s *Server) backfillPricing(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", err.Error())
+		return
+	}
+	from, err := parseOptionalDate(input.From)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", "from 日期无效")
+		return
+	}
+	to, err := parseOptionalDate(input.To)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", "to 日期无效")
+		return
+	}
+	result, err := s.store.BackfillPricingCosts(r.Context(), from, to)
+	if errors.Is(err, store.ErrInvalidPricing) {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", "回算范围必须在 365 天以内")
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "pricing.backfill", "pricing_profile", 0, result)
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) deletePricingProfile(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -1540,6 +1573,14 @@ func sameOrigin(r *http.Request) bool {
 	}
 	parsed, err := url.Parse(origin)
 	return err == nil && strings.EqualFold(parsed.Host, r.Host)
+}
+
+func parseOptionalDate(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse("2006-01-02", value)
 }
 
 func parseInt(value string, fallback int) int {

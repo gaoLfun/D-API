@@ -47,6 +47,7 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `GET` | `/api/admin/pricing` | 价格档案和 USD/CNY 汇率 |
 | `POST/PUT/DELETE` | `/api/admin/pricing/profiles[/{id}]` | 管理价格档案 |
 | `POST` | `/api/admin/pricing/refresh` | 同步 LiteLLM 价格 |
+| `POST` | `/api/admin/pricing/backfill` | 按历史有效价格回算未知请求成本 |
 
 ## 上游
 
@@ -117,6 +118,12 @@ Google Gemini 价格档案，自动从 LiteLLM 的结构化价格文件同步；
 请求日志和用量统计会在上游已绑定档案、模型匹配且请求包含 Token 用量时计算
 `cost_usd`。找不到价格或 Token 缺失时成本为空，并通过覆盖率字段标示未知；
 该数值仅用于运营估算，不代表供应商账单，也不执行扣费。
+
+历史请求不会因新增或更新价格档案自动重算。调用
+`POST /api/admin/pricing/backfill` 可补齐最近 365 天内的未知成本；请求体字段可选：
+`{"from":"2026-08-01","to":"2026-08-26"}`，日期按 UTC 解释。接口只更新
+`request_logs.cost_usd` 为空的记录，并同步更新已存在的日/小时聚合，不覆盖已有成本。
+如果对应聚合行已被清理，回算不会重建该聚合行。
 
 ## 分组与路由范围
 

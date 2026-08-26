@@ -111,6 +111,9 @@ func (s *Store) CreateUpstream(ctx context.Context, upstream core.Upstream) (int
 		upstream.ConnectTimeout.Milliseconds(), upstream.FirstByteTimeout.Milliseconds(),
 		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), pricingProfileIDArg(upstream.PricingProfileID),
 	).Scan(&id)
+	if err == nil {
+		s.invalidatePricingCache()
+	}
 	return id, err
 }
 
@@ -138,6 +141,7 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) erro
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidatePricingCache()
 	return nil
 }
 
@@ -165,7 +169,11 @@ func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE groups g SET enabled=false,updated_at=now() WHERE g.enabled AND NOT EXISTS (SELECT 1 FROM group_upstreams gu WHERE gu.group_id=g.id)`); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidatePricingCache()
+	return nil
 }
 
 func (s *Store) SaveModels(ctx context.Context, id int64, models []string) error {
