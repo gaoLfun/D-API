@@ -5,6 +5,10 @@ Anthropic-compatible HTTP APIs. Compatibility means routing request and response
 payloads in the same protocol; D-API does not implement every vendor endpoint or
 translate between protocols.
 
+This document covers client-facing `/v1/*` routes. The cookie-authenticated
+administrator surface is documented separately in [Management API](admin-api.md)
+and is not part of the compatibility promise.
+
 ## Supported Routes
 
 | Route | Family | Behavior |
@@ -53,6 +57,18 @@ Health checks discover models through each upstream's `GET /v1/models`. Manual
 model selection can lock the list so later probes do not replace it. An empty
 upstream model list permits routing any requested model, but it contributes no
 entries to D-API's `/v1/models` list.
+
+The admin console's **model test** is a separate real-request check. NewAPI
+tests follow its channel tester's endpoint convention: regular models use Chat
+Completions while Codex-like models use Responses. Sub2API tests first issue one
+HEAD request to the endpoint origin, then run the selected models through the
+native protocol adapters concurrently. Each Sub2API request contains a
+per-run few-shot arithmetic challenge and is accepted only when the expected
+number appears in the response; successful responses taking six seconds or
+more are reported as degraded. NewAPI Responses probes use an input message
+array; Sub2API Responses probes use `instructions` and a string `input`. These
+tests are explicit admin actions and may consume provider quota; they are never
+triggered by ordinary client traffic or background health checks.
 
 ## Failover
 
@@ -109,12 +125,20 @@ Non-retryable upstream responses are passed through as received.
 For non-streaming responses, D-API reads common OpenAI/Anthropic token fields
 from the top-level `usage` object. For server-sent events, it looks for usage in
 `usage`, `response.usage`, or `message.usage`. Recognized values include input or
-prompt tokens, output or completion tokens, and cached-input variants.
+prompt tokens, output or completion tokens, cached-input variants, and
+`cache_creation_input_tokens` (cache writes).
 
-Usage is best effort: an upstream that omits usage produces zero/unknown local
-counts. D-API does not calculate token counts, prices, or billable cost. It stores
-request metadata, attempts, latency, status, client IP, and discovered usage;
-request and response bodies are not stored.
+The administrator log records total duration, TTFB, and streaming TTFT in
+integer milliseconds, plus the upstream attempt chain. Anthropic Messages usage
+counts `input_tokens` and cache-creation tokens as uncached input; OpenAI-style
+usage treats cached input as a subset of total input. The usage report can split
+daily, weekly, or monthly totals by upstream, client key, protocol, or model,
+with Top-N/other aggregation and average/P95 latency.
+
+Usage is best effort: missing fields remain unknown in administrator views. D-API
+does not calculate token counts, prices, or billable cost. It stores request
+metadata, attempts, latency, status, client IP, and discovered usage; request and
+response bodies are not stored.
 
 ## Balance Discovery
 

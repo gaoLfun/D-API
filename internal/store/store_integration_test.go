@@ -103,9 +103,12 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 
 	rawKey := "dapi_test_client_key"
-	keyID, err := database.InsertAPIKey(ctx, "client", "dapi_test", auth.HashToken(rawKey), []string{core.ProtocolChat}, []string{})
+	keyID, err := database.InsertAPIKeyWithSecret(ctx, "client", "dapi_test", auth.HashToken(rawKey), rawKey, []string{core.ProtocolChat}, []string{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if secret, err := database.APIKeySecret(ctx, keyID); err != nil || secret != rawKey {
+		t.Fatalf("API key secret retrieval failed: %q %v", secret, err)
 	}
 	if key, err := database.AuthenticateAPIKey(ctx, rawKey); err != nil || key.ID != keyID {
 		t.Fatalf("API key authentication failed: %#v %v", key, err)
@@ -117,6 +120,13 @@ func TestStoreLifecycle(t *testing.T) {
 		CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
+	}
+	todayUsage, err := database.TodayUpstreamUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := todayUsage[upstreamID]; got.Requests != 1 || got.Tokens != 15 {
+		t.Fatalf("today upstream usage=%#v", got)
 	}
 	if err := database.DeleteAPIKey(ctx, keyID); err != nil {
 		t.Fatal(err)
@@ -145,5 +155,25 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 	if _, found, err := database.AlertState(ctx, rules[0].ID, "stale"); err != nil || found {
 		t.Fatalf("stale alert state found=%t err=%v", found, err)
+	}
+
+	if err := database.WriteAudit(ctx, &adminID, "test", "test", "1", nil, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SaveAlertEvent(ctx, nil, "test", "resolved", "test"); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().AddDate(0, 0, 1)
+	for name, cleanup := range map[string]func(context.Context, time.Time) error{
+		"request_logs": database.CleanupLogs, "audit_logs": database.CleanupAuditLogs,
+		"alert_events": database.CleanupAlertEvents, "daily_usage": database.CleanupDailyUsage,
+	} {
+		if err := cleanup(ctx, before); err != nil {
+			t.Fatalf("cleanup %s: %v", name, err)
+		}
+		var count int
+		if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM `+name).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("cleanup %s left %d rows: %v", name, count, err)
+		}
 	}
 }

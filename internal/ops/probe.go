@@ -1,24 +1,37 @@
 package ops
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
+	"github.com/gaoLfun/dapi/internal/netguard"
 )
 
 const (
-	maxProbeBody      = 1 << 20
-	newAPIQuotaPerUSD = 500000.0
-	unlimitedSentinel = 100000000.0
+	maxProbeBody             = 1 << 20
+	newAPIQuotaPerUSD        = 500000.0
+	unlimitedSentinel        = 100000000.0
+	newAPIProbePrompt        = "hi"
+	probeInstructions        = "You are a channel health-check endpoint. Answer the arithmetic challenge exactly and briefly."
+	probeMaxTokens           = 16
+	sub2APIPingTimeout       = 8 * time.Second
+	sub2APIDegradedThreshold = 6 * time.Second
 )
+
+var probeNumberPattern = regexp.MustCompile(`-?\d+`)
 
 type Health struct {
 	Status     string        `json:"status"`
@@ -29,20 +42,37 @@ type Health struct {
 	CheckedAt  time.Time     `json:"checked_at"`
 }
 
+type ModelProbe struct {
+	Protocol      string `json:"protocol"`
+	Status        string `json:"status"`
+	StatusCode    int    `json:"status_code"`
+	LatencyMS     int64  `json:"latency_ms"`
+	PingLatencyMS int64  `json:"ping_latency_ms,omitempty"`
+	Error         string `json:"error"`
+}
+
+type ModelTest struct {
+	Model   string       `json:"model"`
+	Status  string       `json:"status"`
+	Results []ModelProbe `json:"results"`
+}
+
 type Prober struct {
 	Client  *http.Client
 	Timeout time.Duration
+	secure  bool
 }
 
 func NewProber(client *http.Client, timeout time.Duration) *Prober {
+	secure := client == nil
 	if client == nil {
-		client = http.DefaultClient
+		client = netguard.NewHTTPClient(timeout)
 	}
 	client = withoutRedirects(client)
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return &Prober{Client: client, Timeout: timeout}
+	return &Prober{Client: client, Timeout: timeout, secure: secure}
 }
 
 func withoutRedirects(client *http.Client) *http.Client {
@@ -69,6 +99,126 @@ func (p *Prober) CheckHealth(ctx context.Context, upstream core.Upstream) Health
 	result.Status = "healthy"
 	result.Models = models
 	return result
+}
+
+func (p *Prober) TestModel(ctx context.Context, upstream core.Upstream, model string) ModelTest {
+	result := ModelTest{Model: strings.TrimSpace(model), Status: "unavailable", Results: []ModelProbe{}}
+	challenge := modelProbeChallenge(upstream.Kind)
+	var pingLatencyMS int64
+	if upstream.Kind == "sub2api" {
+		pingLatencyMS, _ = p.pingOrigin(ctx, upstream)
+	}
+	protocols := modelProbeProtocols(upstream, result.Model)
+	succeeded := 0
+	for _, protocol := range protocols {
+		probe := p.testModelProtocol(ctx, upstream, result.Model, protocol, challenge)
+		probe.PingLatencyMS = pingLatencyMS
+		result.Results = append(result.Results, probe)
+		if probe.Status == "success" || probe.Status == "degraded" {
+			succeeded++
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if succeeded > 0 {
+		result.Status = "partial"
+		if succeeded == len(protocols) {
+			result.Status = "available"
+		}
+	}
+	return result
+}
+
+// modelProbeProtocols mirrors the channel testers' endpoint selection. The
+// configured protocol list still limits what can be used, but one model test
+// exercises the selected native endpoint rather than multiplying provider calls.
+func modelProbeProtocols(upstream core.Upstream, model string) []string {
+	preferred := core.ProtocolChat
+	if upstream.Kind == "newapi" && strings.Contains(strings.ToLower(model), "codex") {
+		preferred = core.ProtocolResponses
+	}
+	if hasProtocol(upstream.Protocols, preferred) {
+		return []string{preferred}
+	}
+	for _, protocol := range []string{core.ProtocolResponses, core.ProtocolChat, core.ProtocolMessages} {
+		if hasProtocol(upstream.Protocols, protocol) {
+			return []string{protocol}
+		}
+	}
+	return nil
+}
+
+func (p *Prober) testModelProtocol(ctx context.Context, upstream core.Upstream, model, protocol string, challenge probeChallenge) ModelProbe {
+	started := time.Now()
+	result := ModelProbe{Protocol: protocol, Status: "failed"}
+	endpoint, payload, expected := modelProbeRequestWithChallenge(protocol, upstream.Kind, model, challenge)
+	body, err := json.Marshal(payload)
+	if err == nil {
+		body, result.StatusCode, err = p.post(ctx, upstream, endpoint, body, protocol)
+	}
+	result.LatencyMS = time.Since(started).Milliseconds()
+	if err == nil {
+		err = parseModelContent(protocol, body, expected)
+	}
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.Status = "success"
+	if upstream.Kind == "sub2api" && time.Since(started) >= sub2APIDegradedThreshold {
+		result.Status = "degraded"
+	}
+	return result
+}
+
+func modelProbeRequest(protocol, kind, model string) (string, any, string) {
+	return modelProbeRequestWithChallenge(protocol, kind, model, modelProbeChallenge(kind))
+}
+
+type probeChallenge struct {
+	Prompt   string
+	Expected string
+}
+
+func modelProbeChallenge(kind string) probeChallenge {
+	if kind != "sub2api" {
+		return probeChallenge{Prompt: newAPIProbePrompt}
+	}
+	left := rand.IntN(50) + 1
+	right := rand.IntN(50) + 1
+	operator := "+"
+	answer := left + right
+	if rand.IntN(2) == 1 {
+		if right > left {
+			left, right = right, left
+		}
+		operator = "-"
+		answer = left - right
+	}
+	prompt := fmt.Sprintf("Calculate and respond with ONLY the number, nothing else.\n\nQ: 3 + 5 = ?\nA: 8\n\nQ: 12 - 7 = ?\nA: 5\n\nQ: %d %s %d = ?\nA:", left, operator, right)
+	return probeChallenge{Prompt: prompt, Expected: strconv.Itoa(answer)}
+}
+
+func modelProbeRequestWithChallenge(protocol, kind, model string, challenge probeChallenge) (string, any, string) {
+	message := []map[string]string{{"role": "user", "content": challenge.Prompt}}
+	if protocol == core.ProtocolResponses {
+		payload := map[string]any{
+			"model": model, "max_output_tokens": probeMaxTokens, "stream": false,
+		}
+		if kind == "newapi" {
+			// NewAPI's channel tester uses the Responses message-array shape.
+			payload["input"] = message
+		} else {
+			// Sub2API's monitor accepts a string input and explicit instructions.
+			payload["instructions"] = probeInstructions
+			payload["input"] = challenge.Prompt
+		}
+		return "/v1/responses", payload, challenge.Expected
+	}
+	return "/v1/" + map[string]string{core.ProtocolChat: "chat/completions", core.ProtocolMessages: "messages"}[protocol], map[string]any{
+		"model": model, "messages": message, "max_tokens": probeMaxTokens, "stream": false,
+	}, challenge.Expected
 }
 
 func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.Balance {
@@ -167,6 +317,122 @@ func (p *Prober) get(ctx context.Context, upstream core.Upstream, endpoint, cred
 	return body, resp.StatusCode, nil
 }
 
+func (p *Prober) post(ctx context.Context, upstream core.Upstream, endpoint string, body []byte, protocol string) ([]byte, int, error) {
+	target, err := endpointURL(upstream.BaseURL, endpoint)
+	if err != nil {
+		return nil, 0, err
+	}
+	connectTimeout, firstByteTimeout, totalTimeout := p.modelTimeouts(upstream)
+	requestCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, errors.New("build request")
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	if protocol == core.ProtocolMessages {
+		req.Header.Set("X-Api-Key", upstream.APIKey)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+	}
+	client := *p.Client
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	if base, ok := transport.(*http.Transport); ok {
+		cloned := base.Clone()
+		if p.secure {
+			cloned.Proxy = nil
+		}
+		if p.secure {
+			cloned.DialContext = (&netguard.Dialer{Timeout: connectTimeout}).DialContext
+		} else {
+			cloned.DialContext = (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext
+		}
+		cloned.ResponseHeaderTimeout = firstByteTimeout
+		client.Transport = cloned
+		defer cloned.CloseIdleConnections()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeBody+1))
+	if err != nil {
+		return nil, resp.StatusCode, errors.New("read response")
+	}
+	if len(responseBody) > maxProbeBody {
+		return nil, resp.StatusCode, errors.New("response too large")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, probeHTTPError(resp.StatusCode, responseBody)
+	}
+	return responseBody, resp.StatusCode, nil
+}
+
+// pingOrigin mirrors Sub2API's monitor preflight. A failed HEAD is informational
+// only; the model request remains the source of truth for availability.
+func (p *Prober) pingOrigin(ctx context.Context, upstream core.Upstream) (int64, bool) {
+	u, err := url.Parse(strings.TrimSpace(upstream.BaseURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return 0, false
+	}
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
+	requestCtx, cancel := context.WithTimeout(ctx, sub2APIPingTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodHead, u.String(), nil)
+	if err != nil {
+		return 0, false
+	}
+	started := time.Now()
+	response, err := p.Client.Do(request)
+	if err != nil {
+		return 0, false
+	}
+	_ = response.Body.Close()
+	return time.Since(started).Milliseconds(), true
+}
+
+func (p *Prober) modelTimeouts(upstream core.Upstream) (time.Duration, time.Duration, time.Duration) {
+	fallback := p.Timeout
+	if fallback <= 0 {
+		fallback = 10 * time.Second
+	}
+	connect, firstByte := upstream.ConnectTimeout, upstream.FirstByteTimeout
+	if connect <= 0 {
+		connect = fallback
+	}
+	if firstByte <= 0 {
+		firstByte = fallback
+	}
+	total := connect + firstByte
+	if total < fallback {
+		total = fallback
+	}
+	return connect, firstByte, total
+}
+
+func probeHTTPError(status int, body []byte) error {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &payload) == nil {
+		if message := strings.TrimSpace(payload.Error.Message); message != "" {
+			return errors.New(message)
+		}
+		if message := strings.TrimSpace(payload.Message); message != "" {
+			return errors.New(message)
+		}
+	}
+	return fmt.Errorf("HTTP %d", status)
+}
+
 func endpointURL(base, endpoint string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(base))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -196,6 +462,115 @@ func parseModels(body []byte) ([]string, error) {
 		}
 	}
 	return models, nil
+}
+
+func parseModelContent(protocol string, body []byte, expected string) error {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return probeHTTPError(http.StatusBadGateway, body)
+	}
+	texts := make([]string, 0, 2)
+	switch protocol {
+	case core.ProtocolChat:
+		var payload struct {
+			Choices []struct {
+				Message struct {
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return errors.New("invalid response")
+		}
+		for _, choice := range payload.Choices {
+			texts = append(texts, rawContentText(choice.Message.Content))
+		}
+	case core.ProtocolResponses:
+		var payload struct {
+			OutputText string `json:"output_text"`
+			Output     []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return errors.New("invalid response")
+		}
+		texts = append(texts, payload.OutputText)
+		for _, output := range payload.Output {
+			for _, content := range output.Content {
+				texts = append(texts, content.Text)
+			}
+		}
+	case core.ProtocolMessages:
+		var payload struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			return errors.New("invalid response")
+		}
+		for _, content := range payload.Content {
+			texts = append(texts, content.Text)
+		}
+	}
+	for _, text := range texts {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		if expected == "" || probeAnswerMatches(text, expected) {
+			return nil
+		}
+	}
+	if expected != "" {
+		return errors.New("response content mismatch")
+	}
+	return errors.New("response content missing")
+}
+
+func rawContentText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part.Text) != "" {
+			texts = append(texts, part.Text)
+		}
+	}
+	return strings.Join(texts, "")
+}
+
+func probeAnswerMatches(text, expected string) bool {
+	if strings.TrimSpace(text) == "" || expected == "" {
+		return false
+	}
+	for _, number := range probeNumberPattern.FindAllString(text, -1) {
+		if number == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProtocol(protocols []string, target string) bool {
+	for _, protocol := range protocols {
+		if protocol == target {
+			return true
+		}
+	}
+	return false
 }
 
 func parseSubscription(body []byte, now time.Time) (core.Balance, error) {

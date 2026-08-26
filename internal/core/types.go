@@ -75,12 +75,16 @@ type Attempt struct {
 	StatusCode   int    `json:"status_code,omitempty"`
 	Error        string `json:"error,omitempty"`
 	DurationMS   int64  `json:"duration_ms"`
+	TTFBMS       *int64 `json:"ttfb_ms,omitempty"`
+	TTFTMS       *int64 `json:"ttft_ms,omitempty"`
 }
 
 type Usage struct {
-	InputTokens       *int64 `json:"input_tokens,omitempty"`
-	OutputTokens      *int64 `json:"output_tokens,omitempty"`
-	CachedInputTokens *int64 `json:"cached_input_tokens,omitempty"`
+	InputTokens              *int64 `json:"input_tokens,omitempty"`
+	OutputTokens             *int64 `json:"output_tokens,omitempty"`
+	CachedInputTokens        *int64 `json:"cached_input_tokens,omitempty"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+	UncachedInputTokens      *int64 `json:"uncached_input_tokens,omitempty"`
 }
 
 type RequestLog struct {
@@ -91,6 +95,8 @@ type RequestLog struct {
 	Model      string    `json:"model"`
 	StatusCode int       `json:"status_code"`
 	DurationMS int64     `json:"duration_ms"`
+	TTFBMS     *int64    `json:"ttfb_ms,omitempty"`
+	TTFTMS     *int64    `json:"ttft_ms,omitempty"`
 	Attempts   []Attempt `json:"attempts"`
 	Usage      Usage     `json:"usage"`
 	ErrorCode  string    `json:"error_code,omitempty"`

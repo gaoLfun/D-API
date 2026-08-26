@@ -27,21 +27,51 @@ type DailyStat struct {
 	Tokens    int64     `json:"tokens"`
 }
 
+type UpstreamUsageToday struct {
+	Requests int64 `json:"requests"`
+	Tokens   int64 `json:"tokens"`
+}
+
+func (s *Store) TodayUpstreamUsage(ctx context.Context) (map[int64]UpstreamUsageToday, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT upstream_id,sum(requests),sum(input_tokens+output_tokens)
+		FROM daily_usage WHERE day=(now() AT TIME ZONE 'UTC')::date GROUP BY upstream_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int64]UpstreamUsageToday)
+	for rows.Next() {
+		var upstreamID int64
+		var usage UpstreamUsageToday
+		if err := rows.Scan(&upstreamID, &usage.Requests, &usage.Tokens); err != nil {
+			return nil, err
+		}
+		result[upstreamID] = usage
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 	var result Dashboard
 	err := s.db.QueryRowContext(ctx, `
+		WITH metrics AS (
+			SELECT count(*) AS requests,
+				COALESCE(100.0*count(*) FILTER (WHERE status_code BETWEEN 200 AND 399)/NULLIF(count(*),0),0) AS success_rate,
+				COALESCE(avg(duration_ms),0) AS average_latency,
+				COALESCE(sum(input_tokens),0) AS input_tokens,
+				COALESCE(sum(output_tokens),0) AS output_tokens
+			FROM request_logs WHERE created_at >= now()-interval '24 hours'
+		)
 		SELECT
 			(SELECT count(*) FROM upstreams),
 			(SELECT count(*) FROM upstreams WHERE enabled AND health_status='healthy'),
 			(SELECT count(*) FROM upstreams WHERE enabled AND health_status IN ('degraded','unhealthy')),
 			(SELECT count(*) FROM api_keys WHERE enabled),
-			(SELECT count(*) FROM request_logs WHERE created_at >= now()-interval '24 hours'),
-			COALESCE((SELECT 100.0*count(*) FILTER (WHERE status_code BETWEEN 200 AND 399)/NULLIF(count(*),0) FROM request_logs WHERE created_at >= now()-interval '24 hours'),0),
-			COALESCE((SELECT avg(duration_ms) FROM request_logs WHERE created_at >= now()-interval '24 hours'),0),
-			COALESCE((SELECT sum(input_tokens) FROM request_logs WHERE created_at >= now()-interval '24 hours'),0),
-			COALESCE((SELECT sum(output_tokens) FROM request_logs WHERE created_at >= now()-interval '24 hours'),0),
+			m.requests,m.success_rate,m.average_latency,m.input_tokens,m.output_tokens,
 			(SELECT count(*) FROM alert_states WHERE active) +
 			(SELECT count(*) FROM upstreams WHERE enabled AND health_status='unhealthy')
+		FROM metrics m
 	`).Scan(&result.Upstreams, &result.Healthy, &result.Degraded, &result.ActiveKeys,
 		&result.Requests24H, &result.SuccessRate24H, &result.AverageLatency,
 		&result.InputTokens24H, &result.OutputTokens24H, &result.ActiveAlerts)

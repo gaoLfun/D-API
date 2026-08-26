@@ -20,9 +20,17 @@ import (
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
+	"github.com/gaoLfun/dapi/internal/netguard"
 )
 
 const maxBodyBytes = 32 << 20
+
+const (
+	defaultMaxConcurrentRequests = 256
+	defaultMaxConcurrentPerKey   = 32
+	defaultMaxRequestsPerMinute  = 600
+	defaultMaxRequestDuration    = 15 * time.Minute
+)
 
 var ErrInvalidAPIKey = errors.New("invalid API key")
 
@@ -49,14 +57,138 @@ type Handler struct {
 	mux        *http.ServeMux
 	mu         sync.Mutex
 	transports map[transportKey]*http.Client
+	limits     Limits
+	gate       requestGate
+	rate       requestRateLimiter
+	secure     bool
+}
+
+// Limits bounds resource use by authenticated clients. Zero values use safe defaults.
+type Limits struct {
+	MaxConcurrentRequests int
+	MaxConcurrentPerKey   int
+	MaxRequestsPerMinute  int
+	MaxRequestDuration    time.Duration
+}
+
+type requestGate struct {
+	mu     sync.Mutex
+	active int
+	byKey  map[int64]int
+}
+
+func (g *requestGate) acquire(key int64, limits Limits) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.byKey == nil {
+		g.byKey = make(map[int64]int)
+	}
+	if g.active >= limits.MaxConcurrentRequests || g.byKey[key] >= limits.MaxConcurrentPerKey {
+		return false
+	}
+	g.active++
+	g.byKey[key]++
+	return true
+}
+
+func (g *requestGate) release(key int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.active > 0 {
+		g.active--
+	}
+	if count := g.byKey[key] - 1; count > 0 {
+		g.byKey[key] = count
+	} else {
+		delete(g.byKey, key)
+	}
+}
+
+type requestRate struct {
+	window time.Time
+	count  int
+}
+
+type requestRateLimiter struct {
+	mu          sync.Mutex
+	entries     map[int64]requestRate
+	lastCleanup time.Time
+}
+
+func (l *requestRateLimiter) allow(key int64, max int, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.entries == nil {
+		l.entries = make(map[int64]requestRate)
+	}
+	window := now.UTC().Truncate(time.Minute)
+	// Remove stale keys occasionally so an attacker cannot grow this map by
+	// creating many API keys. The scan is bounded to once per minute.
+	if l.lastCleanup.IsZero() || now.Sub(l.lastCleanup) >= time.Minute {
+		for id, candidate := range l.entries {
+			if candidate.window.Before(window) {
+				delete(l.entries, id)
+			}
+		}
+		l.lastCleanup = now
+	}
+	entry := l.entries[key]
+	if !entry.window.Equal(window) {
+		entry = requestRate{window: window}
+	}
+	if entry.count >= max {
+		l.entries[key] = entry
+		return false
+	}
+	entry.count++
+	l.entries[key] = entry
+	return true
 }
 
 type transportKey struct {
 	connect, firstByte, idle time.Duration
 }
 
-func NewHandler(repo Repository) *Handler {
-	h := &Handler{repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*http.Client)}
+func NewHandler(repo Repository, configured ...Limits) *Handler {
+	return newHandler(repo, false, configured...)
+}
+
+// NewSecureHandler enables the outbound address boundary used by the
+// production server. NewHandler remains useful for embedders that provide
+// their own network boundary (and for in-process test servers).
+func NewSecureHandler(repo Repository, configured ...Limits) *Handler {
+	return newHandler(repo, true, configured...)
+}
+
+func newHandler(repo Repository, secure bool, configured ...Limits) *Handler {
+	limits := Limits{MaxConcurrentRequests: defaultMaxConcurrentRequests, MaxConcurrentPerKey: defaultMaxConcurrentPerKey, MaxRequestsPerMinute: defaultMaxRequestsPerMinute, MaxRequestDuration: defaultMaxRequestDuration}
+	if len(configured) > 0 {
+		if configured[0].MaxConcurrentRequests > 0 {
+			limits.MaxConcurrentRequests = configured[0].MaxConcurrentRequests
+		}
+		if configured[0].MaxConcurrentPerKey > 0 {
+			limits.MaxConcurrentPerKey = configured[0].MaxConcurrentPerKey
+		}
+		if configured[0].MaxRequestsPerMinute > 0 {
+			limits.MaxRequestsPerMinute = configured[0].MaxRequestsPerMinute
+		}
+		if configured[0].MaxRequestDuration > 0 {
+			limits.MaxRequestDuration = configured[0].MaxRequestDuration
+		}
+	}
+	if limits.MaxConcurrentRequests > 10000 {
+		limits.MaxConcurrentRequests = 10000
+	}
+	if limits.MaxConcurrentPerKey > 1000 {
+		limits.MaxConcurrentPerKey = 1000
+	}
+	if limits.MaxRequestsPerMinute > 100000 {
+		limits.MaxRequestsPerMinute = 100000
+	}
+	if limits.MaxRequestDuration > 24*time.Hour {
+		limits.MaxRequestDuration = 24 * time.Hour
+	}
+	h := &Handler{repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*http.Client), limits: limits, secure: secure}
 	h.mux.HandleFunc("POST /v1/responses", h.proxy(core.ProtocolResponses))
 	h.mux.HandleFunc("POST /v1/messages", h.proxy(core.ProtocolMessages))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.proxy(core.ProtocolChat))
@@ -87,6 +219,24 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 			logEntry.DurationMS = time.Since(started).Milliseconds()
 			h.record(logEntry)
 		}()
+		if !h.gate.acquire(key.ID, h.limits) {
+			logEntry.StatusCode = http.StatusTooManyRequests
+			logEntry.ErrorCode = "concurrency_limited"
+			w.Header().Set("Retry-After", "1")
+			writeError(w, protocol, http.StatusTooManyRequests, "concurrency_limited", "too many concurrent requests")
+			return
+		}
+		defer h.gate.release(key.ID)
+		if !h.rate.allow(key.ID, h.limits.MaxRequestsPerMinute, time.Now()) {
+			logEntry.StatusCode = http.StatusTooManyRequests
+			logEntry.ErrorCode = "rate_limited"
+			w.Header().Set("Retry-After", "60")
+			writeError(w, protocol, http.StatusTooManyRequests, "rate_limited", "request rate limit exceeded")
+			return
+		}
+		requestCtx, cancel := context.WithTimeout(r.Context(), h.limits.MaxRequestDuration)
+		defer cancel()
+		r = r.WithContext(requestCtx)
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
@@ -165,13 +315,16 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							logEntry.Attempts = append(logEntry.Attempts, attempt)
 							allRateLimited = allRateLimited && response.StatusCode == http.StatusTooManyRequests
 							allTimedOut = allTimedOut && response.StatusCode == http.StatusGatewayTimeout
-							h.markFailure(upstream.ID, response.StatusCode, attempt.Error)
+							if countsAsUpstreamFailure(response.StatusCode) {
+								h.markFailure(upstream.ID, response.StatusCode, attempt.Error)
+							}
 							drainAndClose(response.Body)
 							continue
 						}
 						if payload.Stream {
-							committed, streamUsage, streamErr := h.relayStream(r.Context(), w, response, requestID, upstream.Name, len(logEntry.Attempts)+1, upstream.FirstByteTimeout, upstream.IdleTimeout)
+							committed, streamUsage, ttfbMS, ttftMS, streamErr := h.relayStreamWithMetrics(r.Context(), w, response, requestID, upstream.Name, len(logEntry.Attempts)+1, upstream.FirstByteTimeout, upstream.IdleTimeout, protocol, attemptStarted)
 							attempt.DurationMS = time.Since(attemptStarted).Milliseconds()
+							attempt.TTFBMS, attempt.TTFTMS = ttfbMS, ttftMS
 							if streamErr != nil {
 								attempt.Error = streamErr.Error()
 							}
@@ -180,6 +333,7 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 								logEntry.UpstreamID = int64ptr(upstream.ID)
 								logEntry.StatusCode = response.StatusCode
 								logEntry.Usage = streamUsage
+								logEntry.TTFBMS, logEntry.TTFTMS = ttfbMS, ttftMS
 								if streamErr != nil && r.Context().Err() == nil && !errors.Is(streamErr, errClientClosed) {
 									logEntry.ErrorCode = "stream_interrupted"
 									h.markFailure(upstream.ID, response.StatusCode, streamErr.Error())
@@ -191,8 +345,13 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 								return
 							}
 							if r.Context().Err() != nil || errors.Is(streamErr, context.Canceled) {
-								logEntry.StatusCode = 499
-								logEntry.ErrorCode = "client_closed"
+								if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+									logEntry.StatusCode = http.StatusGatewayTimeout
+									logEntry.ErrorCode = "request_timeout"
+								} else {
+									logEntry.StatusCode = 499
+									logEntry.ErrorCode = "client_closed"
+								}
 								return
 							}
 							h.markFailure(upstream.ID, 0, streamErr.Error())
@@ -201,14 +360,16 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							continue
 						}
 
-						responseBody, readErr := readResponse(r.Context(), response.Body, upstream.FirstByteTimeout, upstream.IdleTimeout)
+						responseBody, ttfbMS, readErr := readResponseWithMetrics(r.Context(), response.Body, upstream.FirstByteTimeout, upstream.IdleTimeout, attemptStarted)
 						response.Body.Close()
 						if readErr == nil {
 							attempt.DurationMS = time.Since(attemptStarted).Milliseconds()
+							attempt.TTFBMS = ttfbMS
 							logEntry.Attempts = append(logEntry.Attempts, attempt)
 							logEntry.UpstreamID = int64ptr(upstream.ID)
 							logEntry.StatusCode = response.StatusCode
-							logEntry.Usage = parseUsage(responseBody)
+							logEntry.TTFBMS = ttfbMS
+							logEntry.Usage = parseUsageWithProtocol(responseBody, protocol)
 							h.markSuccess(upstream.ID)
 							copyResponseHeaders(w.Header(), response.Header)
 							setGatewayHeaders(w.Header(), requestID, upstream.Name, len(logEntry.Attempts))
@@ -216,6 +377,7 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							_, _ = w.Write(responseBody)
 							return
 						}
+						attempt.TTFBMS = ttfbMS
 						err = readErr
 					}
 				}
@@ -257,6 +419,20 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.gate.acquire(key.ID, h.limits) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, core.ProtocolChat, http.StatusTooManyRequests, "concurrency_limited", "too many concurrent requests")
+		return
+	}
+	defer h.gate.release(key.ID)
+	if !h.rate.allow(key.ID, h.limits.MaxRequestsPerMinute, time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, core.ProtocolChat, http.StatusTooManyRequests, "rate_limited", "request rate limit exceeded")
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(r.Context(), h.limits.MaxRequestDuration)
+	defer cancel()
+	r = r.WithContext(requestCtx)
 	models, err := h.repo.AvailableModels(r.Context(), key)
 	if err != nil {
 		writeError(w, core.ProtocolChat, http.StatusInternalServerError, "internal_error", "model list unavailable")
@@ -331,11 +507,17 @@ func (h *Handler) client(upstream core.Upstream) *http.Client {
 		return client
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{Timeout: key.connect, KeepAlive: 30 * time.Second}).DialContext
+	if h.secure {
+		transport.Proxy = nil
+		transport.DialContext = (&netguard.Dialer{Timeout: key.connect}).DialContext
+	} else {
+		transport.DialContext = (&net.Dialer{Timeout: key.connect, KeepAlive: 30 * time.Second}).DialContext
+	}
 	transport.ResponseHeaderTimeout = key.firstByte
 	transport.IdleConnTimeout = key.idle
 	transport.MaxIdleConns = 200
 	transport.MaxIdleConnsPerHost = 100
+	transport.MaxConnsPerHost = 128
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
@@ -359,7 +541,7 @@ func upstreamRequest(in *http.Request, upstream core.Upstream, body []byte, prot
 	if err != nil {
 		return nil, err
 	}
-	out.Header = in.Header.Clone()
+	out.Header = filteredRequestHeaders(in.Header)
 	stripHopHeaders(out.Header)
 	out.Header.Del("Content-Length")
 	out.Header.Del("X-Api-Key")
@@ -384,6 +566,11 @@ func replaceModel(body []byte, model string) ([]byte, error) {
 }
 
 func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, response *http.Response, requestID, upstreamName string, attempts int, firstByteTimeout, idleTimeout time.Duration) (bool, core.Usage, error) {
+	committed, usage, _, _, err := h.relayStreamWithMetrics(ctx, w, response, requestID, upstreamName, attempts, firstByteTimeout, idleTimeout, "", time.Now())
+	return committed, usage, err
+}
+
+func (h *Handler) relayStreamWithMetrics(ctx context.Context, w http.ResponseWriter, response *http.Response, requestID, upstreamName string, attempts int, firstByteTimeout, idleTimeout time.Duration, protocol string, attemptStarted time.Time) (bool, core.Usage, *int64, *int64, error) {
 	defer response.Body.Close()
 	if firstByteTimeout <= 0 {
 		firstByteTimeout = 60 * time.Second
@@ -420,7 +607,8 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 	}()
 
 	committed := false
-	parser := sseUsageParser{}
+	parser := sseUsageParser{protocol: protocol}
+	var ttfbMS, ttftMS *int64
 	timeout := firstByteTimeout
 	for {
 		timer := time.NewTimer(timeout)
@@ -433,6 +621,10 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 				}
 			}
 			if result.n > 0 {
+				if ttfbMS == nil {
+					value := time.Since(attemptStarted).Milliseconds()
+					ttfbMS = &value
+				}
 				if !committed {
 					copyResponseHeaders(w.Header(), response.Header)
 					setGatewayHeaders(w.Header(), requestID, upstreamName, attempts)
@@ -441,13 +633,17 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 					committed = true
 				}
 				parser.Feed(buffer[:result.n])
+				if ttftMS == nil && parser.HasText() {
+					value := time.Since(attemptStarted).Milliseconds()
+					ttftMS = &value
+				}
 				if _, err := w.Write(buffer[:result.n]); err != nil {
 					acknowledge <- struct{}{}
-					return true, parser.Usage(), fmt.Errorf("%w: %v", errClientClosed, err)
+					return true, parser.Usage(), ttfbMS, ttftMS, fmt.Errorf("%w: %v", errClientClosed, err)
 				}
 				acknowledge <- struct{}{}
 				if err := http.NewResponseController(w).Flush(); err != nil {
-					return true, parser.Usage(), fmt.Errorf("%w: %v", errClientClosed, err)
+					return true, parser.Usage(), ttfbMS, ttftMS, fmt.Errorf("%w: %v", errClientClosed, err)
 				}
 				timeout = idleTimeout
 			}
@@ -459,16 +655,16 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 						w.WriteHeader(response.StatusCode)
 						committed = true
 					}
-					return committed, parser.Usage(), nil
+					return committed, parser.Usage(), ttfbMS, ttftMS, nil
 				}
-				return committed, parser.Usage(), result.err
+				return committed, parser.Usage(), ttfbMS, ttftMS, result.err
 			}
 		case <-timer.C:
 			_ = response.Body.Close()
 			if committed {
-				return true, parser.Usage(), upstreamTimeout("upstream stream idle timeout")
+				return true, parser.Usage(), ttfbMS, ttftMS, upstreamTimeout("upstream stream idle timeout")
 			}
-			return false, parser.Usage(), upstreamTimeout("upstream first byte timeout")
+			return false, parser.Usage(), ttfbMS, ttftMS, upstreamTimeout("upstream first byte timeout")
 		case <-ctx.Done():
 			if !timer.Stop() {
 				select {
@@ -477,12 +673,17 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 				}
 			}
 			_ = response.Body.Close()
-			return committed, parser.Usage(), ctx.Err()
+			return committed, parser.Usage(), ttfbMS, ttftMS, ctx.Err()
 		}
 	}
 }
 
 func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idleTimeout time.Duration) ([]byte, error) {
+	content, _, err := readResponseWithMetrics(ctx, body, firstByteTimeout, idleTimeout, time.Now())
+	return content, err
+}
+
+func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteTimeout, idleTimeout time.Duration, started time.Time) ([]byte, *int64, error) {
 	if firstByteTimeout <= 0 {
 		firstByteTimeout = 60 * time.Second
 	}
@@ -512,6 +713,7 @@ func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idl
 	}()
 
 	content := make([]byte, 0)
+	var ttfbMS *int64
 	timeout := firstByteTimeout
 	for {
 		timer := time.NewTimer(timeout)
@@ -524,25 +726,29 @@ func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idl
 				}
 			}
 			if len(result.content) > 0 {
+				if ttfbMS == nil {
+					value := time.Since(started).Milliseconds()
+					ttfbMS = &value
+				}
 				if len(content)+len(result.content) > maxBodyBytes {
 					_ = body.Close()
-					return nil, errors.New("upstream response exceeds 32 MiB")
+					return nil, ttfbMS, errors.New("upstream response exceeds 32 MiB")
 				}
 				content = append(content, result.content...)
 				timeout = idleTimeout
 			}
 			if result.err != nil {
 				if errors.Is(result.err, io.EOF) {
-					return content, nil
+					return content, ttfbMS, nil
 				}
-				return nil, result.err
+				return nil, ttfbMS, result.err
 			}
 		case <-timer.C:
 			_ = body.Close()
 			if len(content) == 0 {
-				return nil, upstreamTimeout("upstream first byte timeout")
+				return nil, ttfbMS, upstreamTimeout("upstream first byte timeout")
 			}
-			return nil, upstreamTimeout("upstream response idle timeout")
+			return nil, ttfbMS, upstreamTimeout("upstream response idle timeout")
 		case <-ctx.Done():
 			if !timer.Stop() {
 				select {
@@ -551,29 +757,49 @@ func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idl
 				}
 			}
 			_ = body.Close()
-			return nil, ctx.Err()
+			return nil, ttfbMS, ctx.Err()
 		}
 	}
 }
 
 func parseUsage(body []byte) core.Usage {
+	return parseUsageWithProtocol(body, "")
+}
+
+func parseUsageWithProtocol(body []byte, protocol string) core.Usage {
 	var payload struct {
-		Usage json.RawMessage `json:"usage"`
+		Usage    json.RawMessage `json:"usage"`
+		Response struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+		Message struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"message"`
 	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Usage) == 0 {
+	if json.Unmarshal(body, &payload) != nil {
 		return core.Usage{}
 	}
-	return parseUsageObject(payload.Usage)
+	if len(payload.Usage) == 0 {
+		payload.Usage = payload.Response.Usage
+	}
+	if len(payload.Usage) == 0 {
+		payload.Usage = payload.Message.Usage
+	}
+	if len(payload.Usage) == 0 {
+		return core.Usage{}
+	}
+	return parseUsageObjectForProtocol(payload.Usage, protocol)
 }
 
 type usageFields struct {
-	Input        *int64 `json:"input_tokens"`
-	Output       *int64 `json:"output_tokens"`
-	Prompt       *int64 `json:"prompt_tokens"`
-	Completion   *int64 `json:"completion_tokens"`
-	Cached       *int64 `json:"cached_input_tokens"`
-	CacheRead    *int64 `json:"cache_read_input_tokens"`
-	InputDetails struct {
+	Input         *int64 `json:"input_tokens"`
+	Output        *int64 `json:"output_tokens"`
+	Prompt        *int64 `json:"prompt_tokens"`
+	Completion    *int64 `json:"completion_tokens"`
+	Cached        *int64 `json:"cached_input_tokens"`
+	CacheRead     *int64 `json:"cache_read_input_tokens"`
+	CacheCreation *int64 `json:"cache_creation_input_tokens"`
+	InputDetails  struct {
 		Cached *int64 `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
 	PromptDetails struct {
@@ -582,11 +808,15 @@ type usageFields struct {
 }
 
 func parseUsageObject(body []byte) core.Usage {
+	return parseUsageObjectForProtocol(body, "")
+}
+
+func parseUsageObjectForProtocol(body []byte, protocol string) core.Usage {
 	var fields usageFields
 	if json.Unmarshal(body, &fields) != nil {
 		return core.Usage{}
 	}
-	usage := core.Usage{InputTokens: fields.Input, OutputTokens: fields.Output, CachedInputTokens: fields.Cached}
+	usage := core.Usage{InputTokens: fields.Input, OutputTokens: fields.Output, CachedInputTokens: fields.Cached, CacheCreationInputTokens: fields.CacheCreation}
 	if usage.InputTokens == nil {
 		usage.InputTokens = fields.Prompt
 	}
@@ -602,13 +832,37 @@ func parseUsageObject(body []byte) core.Usage {
 	if usage.CachedInputTokens == nil {
 		usage.CachedInputTokens = fields.PromptDetails.Cached
 	}
+	return normalizeUsageForProtocol(usage, protocol)
+}
+
+func normalizeUsage(usage core.Usage) core.Usage {
+	return normalizeUsageForProtocol(usage, "")
+}
+
+func normalizeUsageForProtocol(usage core.Usage, protocol string) core.Usage {
+	if usage.InputTokens != nil {
+		uncached := *usage.InputTokens
+		if protocol == core.ProtocolMessages {
+			if usage.CacheCreationInputTokens != nil {
+				uncached += *usage.CacheCreationInputTokens
+			}
+		} else if usage.CachedInputTokens != nil {
+			uncached -= *usage.CachedInputTokens
+		}
+		if uncached < 0 {
+			uncached = 0
+		}
+		usage.UncachedInputTokens = &uncached
+	}
 	return usage
 }
 
 type sseUsageParser struct {
-	pending []byte
-	discard bool
-	usage   core.Usage
+	pending  []byte
+	discard  bool
+	usage    core.Usage
+	protocol string
+	textSeen bool
 }
 
 func (p *sseUsageParser) Feed(content []byte) {
@@ -650,6 +904,8 @@ func (p *sseUsageParser) parseLine(line []byte) {
 		return
 	}
 	var event struct {
+		Type     string          `json:"type"`
+		Delta    json.RawMessage `json:"delta"`
 		Usage    json.RawMessage `json:"usage"`
 		Response struct {
 			Usage json.RawMessage `json:"usage"`
@@ -657,15 +913,79 @@ func (p *sseUsageParser) parseLine(line []byte) {
 		Message struct {
 			Usage json.RawMessage `json:"usage"`
 		} `json:"message"`
+		Choices []struct {
+			Text  string `json:"text"`
+			Delta struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
 	}
 	if json.Unmarshal(data, &event) != nil {
 		return
 	}
 	for _, raw := range []json.RawMessage{event.Usage, event.Response.Usage, event.Message.Usage} {
 		if len(raw) > 0 {
-			p.merge(parseUsageObject(raw))
+			p.merge(parseUsageObjectForProtocol(raw, p.protocol))
 		}
 	}
+	if eventHasText(event.Type, event.Delta, event.Choices, p.protocol) {
+		p.textSeen = true
+	}
+}
+
+func eventHasText(eventType string, delta json.RawMessage, choices []struct {
+	Text  string `json:"text"`
+	Delta struct {
+		Content json.RawMessage `json:"content"`
+	} `json:"delta"`
+}, protocol string) bool {
+	switch protocol {
+	case core.ProtocolResponses:
+		return eventType == "response.output_text.delta" && rawString(delta) != ""
+	case core.ProtocolMessages:
+		if eventType != "content_block_delta" {
+			return false
+		}
+		var value struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		return json.Unmarshal(delta, &value) == nil && value.Type == "text_delta" && value.Text != ""
+	case core.ProtocolChat:
+		for _, choice := range choices {
+			if rawHasText(choice.Delta.Content) || choice.Text != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rawString(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return value
+}
+
+func rawHasText(raw json.RawMessage) bool {
+	if rawString(raw) != "" {
+		return true
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return false
+	}
+	for _, part := range parts {
+		if (part.Type == "text" || part.Type == "output_text" || part.Type == "") && part.Text != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *sseUsageParser) merge(usage core.Usage) {
@@ -678,6 +998,12 @@ func (p *sseUsageParser) merge(usage core.Usage) {
 	if usage.CachedInputTokens != nil {
 		p.usage.CachedInputTokens = usage.CachedInputTokens
 	}
+	if usage.CacheCreationInputTokens != nil {
+		p.usage.CacheCreationInputTokens = usage.CacheCreationInputTokens
+	}
+	if usage.UncachedInputTokens != nil {
+		p.usage.UncachedInputTokens = usage.UncachedInputTokens
+	}
 }
 
 func (p *sseUsageParser) Usage() core.Usage {
@@ -685,11 +1011,17 @@ func (p *sseUsageParser) Usage() core.Usage {
 		p.parseLine(p.pending)
 	}
 	p.pending = nil
-	return p.usage
+	return normalizeUsageForProtocol(p.usage, p.protocol)
 }
+
+func (p *sseUsageParser) HasText() bool { return p.textSeen }
 
 func retryStatus(status int) bool {
 	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusTooManyRequests || status >= 500
+}
+
+func countsAsUpstreamFailure(status int) bool {
+	return status == http.StatusUnauthorized || status >= 500
 }
 
 func writeError(w http.ResponseWriter, protocol string, status int, code, message string) {
@@ -720,17 +1052,45 @@ func setGatewayHeaders(header http.Header, requestID, upstream string, attempts 
 
 func copyResponseHeaders(destination, source http.Header) {
 	for key := range destination {
-		if strings.HasPrefix(http.CanonicalHeaderKey(key), "X-Dapi-") {
+		if preservedGatewayHeader(key) {
 			continue
 		}
 		destination.Del(key)
 	}
 	for key, values := range source {
+		if blockedResponseHeader(key) {
+			continue
+		}
 		for _, value := range values {
 			destination.Add(key, value)
 		}
 	}
 	stripHopHeaders(destination)
+}
+
+func preservedGatewayHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "X-Dapi-Request-Id", "X-Dapi-Upstream", "X-Dapi-Attempts",
+		"Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options",
+		"Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy":
+		return true
+	default:
+		return false
+	}
+}
+
+func blockedResponseHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	if strings.HasPrefix(canonical, "Access-Control-") {
+		return true
+	}
+	switch canonical {
+	case "Set-Cookie", "Set-Cookie2", "Location", "Content-Security-Policy",
+		"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy", "Strict-Transport-Security":
+		return true
+	default:
+		return false
+	}
 }
 
 func stripHopHeaders(header http.Header) {
@@ -743,7 +1103,22 @@ func stripHopHeaders(header http.Header) {
 }
 
 func drainAndClose(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
 	_ = body.Close()
+}
+
+func filteredRequestHeaders(source http.Header) http.Header {
+	destination := make(http.Header)
+	for _, name := range []string{
+		"Accept", "Accept-Encoding", "Cache-Control", "Content-Type", "Pragma", "User-Agent",
+		"X-Request-ID", "OpenAI-Organization", "OpenAI-Project", "OpenAI-Beta",
+		"Anthropic-Version", "Anthropic-Beta",
+	} {
+		for _, value := range source.Values(name) {
+			destination.Add(name, value)
+		}
+	}
+	return destination
 }
 
 func isTimeout(err error) bool {

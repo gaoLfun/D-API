@@ -29,6 +29,10 @@ Admin ---- HTTPS -------------| - API gateway        |
 Running multiple D-API replicas is not an officially supported v0.1.0 topology.
 Some rate-limit and notification cooldown state is process-local.
 
+The browser uses the same origin for the SPA and management API. The management
+surface uses a session cookie; client traffic uses independently created `dapi_`
+API keys. These authentication paths do not share credentials or permissions.
+
 ## Request Flow
 
 1. D-API hashes the presented client API key and looks up an enabled key.
@@ -39,8 +43,9 @@ Some rate-limit and notification cooldown state is process-local.
    constrained to 1 through 5.
 5. For a model alias, only the request's top-level `model` value is rewritten.
 6. The response is returned with D-API request, upstream, and attempt headers.
-7. Request metadata, attempts, result, latency, client IP, and available token
-   usage are recorded. The request and response bodies are not persisted.
+7. Request metadata, attempts, result, total/first-byte/first-token latency,
+   client IP, and available token usage are recorded. The request and response
+   bodies are not persisted.
 
 Upstreams with the same priority retain database order. There is no weighted,
 random, cost-aware, or least-latency load balancing in v0.1.0.
@@ -67,30 +72,61 @@ but the committed stream cannot be replayed safely.
   interval is 30 seconds.
 - Successful health probes update discovered models unless the administrator
   has locked the model list.
+- The admin upstream form also provides an explicit model probe. NewAPI probes
+  follow its endpoint selection convention: regular models use Chat and
+  Responses/Codex models use Responses, with the configured protocol list
+  constraining what is tested. Sub2API probes first send one HEAD request to
+  the endpoint origin, then send a small arithmetic challenge through the
+  selected protocol; the expected number is generated per run. Sub2API model
+  responses slower than six seconds are marked degraded. Model probes are
+  foreground admin actions, are not part of the 30-second health loop, and can
+  consume upstream quota.
 - Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
   is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
 - Alert rules are evaluated once per minute and can deliver email or webhook
   notifications.
 - Request logs older than the configured retention are removed once per day.
-  Daily usage aggregates are retained.
+  Daily usage aggregates, audit entries, and alert events are retained for the
+  configured `DAPI_LOG_RETENTION` window and removed in bounded batches.
 
 Only enabled upstreams are probed by background jobs.
+
+## Observability and Failure Isolation
+
+Every proxied request receives a request ID and records an ordered attempt chain.
+The record includes status, total duration, time to first byte, streaming time to
+first token when observable, token metadata, and the client IP. Bodies are
+deliberately excluded. Health failures update the upstream circuit in
+PostgreSQL, while gateway concurrency and login limits remain in process memory.
+
+An upstream request is bounded by the global request lifetime, per-upstream
+connect/first-byte/idle timeouts, and a maximum buffered response size. The
+outbound network guard resolves and validates destinations again immediately
+before dialing and disables redirects and environment proxy variables. This
+keeps probes, webhooks, SMTP, and normal forwarding behind the same egress
+boundary.
 
 ## Data and Security Boundaries
 
 - Upstream API keys, optional NewAPI balance credentials, and notification
   channel configurations are encrypted with AES-256-GCM using
   `DAPI_MASTER_KEY`.
-- Client API keys and session tokens are stored as SHA-256 hashes. Client key
-  plaintext is returned only when the key is created.
+- Client API keys use SHA-256 hashes for authentication and an AES-256-GCM
+  encrypted copy for administrator copy/CCSwitch import. Existing keys created
+  before this encrypted copy was introduced cannot be recovered and must be
+  recreated. Session tokens remain hash-only.
 - Administrator passwords use bcrypt. Changing or resetting the password
   revokes existing sessions.
 - Admin sessions use `HttpOnly`, `SameSite=Strict` cookies. The `Secure` flag is
   set when the request is HTTPS or a trusted proxy reports HTTPS.
 - Admin mutations reject a mismatched `Origin` header. Login attempts are
-  rate-limited per observed client IP in process memory.
+  rate-limited per observed client IP and account identifier in process memory.
 - `DAPI_TRUST_PROXY` defines whether `X-Real-IP` is trusted. The supplied Caddy
   configuration overwrites this header. Direct exposure must disable trust.
+- Administrator-configured HTTP and SMTP destinations pass an outbound network
+  guard. Loopback, private, link-local, multicast, carrier-grade NAT, and cloud
+  metadata addresses are rejected both when saved and immediately before DNS
+  connections; redirects are disabled.
 
 The master key is deliberately not stored in PostgreSQL. Database backups are
 not sufficient for recovery unless the same key is retained separately.
@@ -110,6 +146,8 @@ usage identifiers for historical totals.
 - Maximum client request body: 32 MiB.
 - Maximum buffered non-streaming upstream response: 32 MiB.
 - Health/balance probe response limit: 1 MiB.
+- Gateway defaults: 256 concurrent requests globally, 32 per client key, 600
+  requests per key per minute, and a 15-minute request lifetime.
 - One administrator account is the intended deployment model.
 - No distributed rate limiter, distributed scheduler, or external job queue.
 - No protocol translation, request billing, or multi-tenant isolation.

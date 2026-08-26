@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,53 @@ type monitorRepository struct {
 	health    []Health
 	events    []Event
 	status    string
+}
+
+type boundedMonitorRepository struct{ upstreams []core.Upstream }
+
+func (r boundedMonitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {
+	return r.upstreams, nil
+}
+func (boundedMonitorRepository) SaveHealth(context.Context, int64, Health) (string, error) {
+	return "healthy", nil
+}
+func (boundedMonitorRepository) SaveBalance(context.Context, int64, core.Balance) error { return nil }
+func (boundedMonitorRepository) SaveEvent(context.Context, Event) error                 { return nil }
+
+type boundedMonitorProber struct {
+	active int32
+	max    int32
+}
+
+func (p *boundedMonitorProber) CheckHealth(context.Context, core.Upstream) Health {
+	active := atomic.AddInt32(&p.active, 1)
+	for {
+		previous := atomic.LoadInt32(&p.max)
+		if active <= previous || atomic.CompareAndSwapInt32(&p.max, previous, active) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	atomic.AddInt32(&p.active, -1)
+	return Health{Status: "healthy", CheckedAt: time.Now()}
+}
+func (*boundedMonitorProber) CheckBalance(context.Context, core.Upstream) core.Balance {
+	return core.Balance{Status: "unknown"}
+}
+
+func TestMonitorParallelUsesBoundedWorkers(t *testing.T) {
+	upstreams := make([]core.Upstream, 20)
+	for i := range upstreams {
+		upstreams[i] = core.Upstream{ID: int64(i + 1), Enabled: true, HealthStatus: "healthy"}
+	}
+	prober := &boundedMonitorProber{}
+	monitor := NewMonitor(boundedMonitorRepository{upstreams: upstreams}, prober, nil, MonitorConfig{Concurrency: 3})
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&prober.max); got > 3 {
+		t.Fatalf("max concurrent probes = %d, want <= 3", got)
+	}
 }
 
 func (r *monitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {

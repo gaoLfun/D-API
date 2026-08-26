@@ -69,8 +69,25 @@ func (s *Store) DeleteSession(ctx context.Context, hash []byte) error {
 }
 
 func (s *Store) DeleteExpiredSessions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= now()`)
-	return err
+	const batchSize = 1000
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := s.db.ExecContext(ctx, `
+			DELETE FROM sessions
+			WHERE ctid IN (
+				SELECT ctid FROM sessions WHERE expires_at <= now()
+				ORDER BY expires_at LIMIT $1
+			)`, batchSize)
+		if err != nil {
+			return err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil || deleted < batchSize {
+			return err
+		}
+	}
 }
 
 func (s *Store) UpdateAdminPassword(ctx context.Context, adminID int64, passwordHash []byte) error {

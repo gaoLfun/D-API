@@ -1,5 +1,8 @@
 .git
 .env
+.env.*
+!.env.example
+.impeccable
 bin
 coverage
 web/dist
@@ -7,4 +10,8 @@ web/node_modules
 web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
+web/playwright-report
+web/test-results
+*.log
 *.sql.gz
+*.dump

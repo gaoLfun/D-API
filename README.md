@@ -1,5 +1,9 @@
 # D-API
 
+[![CI](https://github.com/gaoLfun/D-API/actions/workflows/ci.yml/badge.svg)](https://github.com/gaoLfun/D-API/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/gaoLfun/D-API?include_prereleases&sort=semver)](https://github.com/gaoLfun/D-API/releases)
+
 [简体中文](README.zh-CN.md)
 
 D-API is a lightweight, single-administrator gateway for NewAPI and Sub2API
@@ -21,6 +25,7 @@ management API may still change before v1.0.
 - Single-administrator web console with audit logs and login rate limiting
 - Email and webhook notifications with configurable alert rules
 - One Go service, one Vue frontend, PostgreSQL, and an optional Caddy proxy
+- Bounded concurrency, per-key rate limits, request lifetime limits, and SSRF protection
 
 ## Quick Start
 
@@ -35,7 +40,7 @@ openssl rand -base64 32
 Put the generated value in `DAPI_MASTER_KEY`, then set a separate
 `POSTGRES_PASSWORD` and an administrator password of at least 12 characters in
 `.env`. Keep the master key outside the database backup: losing it makes stored
-upstream and notification credentials unreadable.
+upstream, notification, and client-key copies unreadable.
 
 ```sh
 docker compose up -d --build
@@ -47,14 +52,22 @@ inbound TCP ports 80 and 443. Caddy obtains and renews HTTPS certificates. For a
 local installation, the default address is `https://localhost`; its local CA
 may need to be trusted by your browser.
 
+The Compose file maps D-API itself to `127.0.0.1:18083` and keeps
+`DAPI_TRUST_PROXY=false` by default. If Caddy is the only public entry point,
+set `DAPI_TRUST_PROXY=true` so audit logs and login limits use the client IP;
+never expose port 18083 publicly while proxy trust is enabled. See
+[Deployment](docs/deployment.md) for temporary direct-IP HTTP access.
+
 Log in with `DAPI_ADMIN_USERNAME` and `DAPI_ADMIN_PASSWORD`, then:
 
-1. Add a NewAPI or Sub2API upstream and use **Test connection** before saving.
-2. Select supported protocols and models. Lower priority numbers route first.
-3. Create a client API key. Its plaintext value is shown only once.
+1. Add a NewAPI or Sub2API upstream and use **Fetch upstream models** before saving.
+2. Select models and run **Test model** for one or more entries. This sends a small real model request (Sub2API uses an arithmetic challenge) and may consume upstream quota.
+3. Select supported protocols and models. Lower priority numbers route first.
+4. Create a client API key. The list shows only its prefix; use the copy button or CCSwitch import. Keys created before encrypted copies were added must be recreated.
 
 For production details, direct-IP HTTP access, upgrades, backups, and restores,
-see [Deployment](docs/deployment.md).
+see [Deployment](docs/deployment.md). For a scriptable administrator interface,
+see [Management API](docs/admin-api.md).
 
 ## Client Requests
 
@@ -100,16 +113,35 @@ before storage. Request bodies are not stored.
 See [Architecture](docs/architecture.md) for routing, health, persistence, and
 security boundaries.
 
+## Production Checklist
+
+- Use HTTPS and restrict the administrator console to a trusted network.
+- Keep `DAPI_MASTER_KEY`, `.env`, database backups, and client-key creation
+  responses outside source control and routine logs.
+- Set a database `sslmode` suitable for external PostgreSQL; Compose uses
+  `disable` only because the database is on its private Docker network.
+- Review the configured upstream model allowlists and run a model test before
+  enabling traffic. Tests are real requests and may consume quota.
+- Configure log retention and a tested backup schedule. A database dump without
+  the exact master key cannot recover encrypted secrets.
+- Read [Security](SECURITY.md) and [Troubleshooting](docs/troubleshooting.md)
+  before exposing a direct port.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Deployment, backup, and restore](docs/deployment.md)
 - [API compatibility](docs/api-compatibility.md)
+- [Management API](docs/admin-api.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Documentation index](docs/README.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Support policy](SUPPORT.md)
 - [Changelog](CHANGELOG.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Release guide](RELEASING.md)
 
 ## Development
 
@@ -141,6 +173,10 @@ docker build -t dapi:local .
 
 PostgreSQL integration tests run only when `DAPI_TEST_DATABASE_URL` is set.
 
+The CI workflow runs the same backend/frontend checks on every pull request.
+Maintainers use [RELEASING.md](RELEASING.md) for versioning and GitHub Release
+preparation.
+
 ## Scope
 
 D-API is intentionally dedicated and small. v0.1.0 does **not** aim to provide:
@@ -151,6 +187,11 @@ D-API is intentionally dedicated and small. v0.1.0 does **not** aim to provide:
 - Protocol translation or a general-purpose reverse proxy
 - A stable public management API
 
+D-API is an independent compatibility project and is not affiliated with or
+endorsed by NewAPI, Sub2API, CCSwitch, OpenAI, or Anthropic.
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 gaoLfun.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for bundled font and dependency
+licenses.

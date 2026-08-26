@@ -2,7 +2,8 @@
 
 The supported v0.1.0 production target is a single Linux host running Docker
 Compose v2. Other operating systems and bare-binary installations are best
-effort.
+effort. The stack is intentionally single-instance: rate-limit counters,
+notification cooldowns, and scheduled probes are process-local.
 
 ## Prerequisites
 
@@ -11,6 +12,8 @@ effort.
 - Inbound TCP ports 80 and 443
 - Outbound HTTPS access to configured upstreams and certificate authorities
 - Enough persistent storage for PostgreSQL and request logs
+- A host firewall that limits PostgreSQL to the Compose network and, when
+  applicable, limits the direct D-API port to localhost
 
 ## First Deployment
 
@@ -39,6 +42,11 @@ docker compose ps
 curl -fsS https://api.example.com/healthz
 ```
 
+For a first installation, open the web console only after `/healthz` is healthy.
+Use the configured administrator credentials, then change the password from the
+console after confirming the first login. Do not put real upstream credentials
+in a model test until the HTTPS path and backup procedure have been verified.
+
 The `postgres_data` volume contains the database. `caddy_data` and
 `caddy_config` contain Caddy state and certificates. Do not delete these volumes
 during normal upgrades.
@@ -46,8 +54,10 @@ during normal upgrades.
 ## Proxy and Network Boundary
 
 The default Compose topology publishes Caddy on ports 80/443 and also maps D-API
-to `127.0.0.1:18083`. Compose sets `DAPI_TRUST_PROXY=true`; the supplied Caddy
-configuration overwrites `X-Real-IP` with the connecting client address.
+to `127.0.0.1:18083`. Compose keeps `DAPI_TRUST_PROXY=false` by default; this
+avoids trusting forged forwarding headers if the direct port is exposed.
+When using the supplied Caddy proxy, set `DAPI_TRUST_PROXY=true` explicitly;
+Caddy overwrites `X-Real-IP` with the connecting client address.
 
 Do not expose port 18083 publicly while proxy trust is enabled. A client that
 can bypass Caddy could forge the IP used for auditing and login rate limiting.
@@ -84,6 +94,9 @@ status and individual connectivity checks.
 The service emits structured Go application logs to stdout. Request attempts
 and usage are stored in PostgreSQL and shown in the admin console; audit and
 alert records are also stored in PostgreSQL. Request bodies are not stored.
+Logs can contain request IDs, upstream names, model names, client IPs, status,
+timings, and error summaries. They must be treated as operationally sensitive;
+never forward them unredacted to a third-party log service.
 
 ## Administrator Password Reset
 
@@ -173,6 +186,12 @@ docker compose ps
 
 The application applies its embedded idempotent schema at startup. v0.1.0 does
 not provide automatic schema rollback, so retain a pre-upgrade backup.
+
+After an upgrade, verify both the direct health endpoint and the public proxy,
+then perform one low-cost request with a test client key. If the new process
+cannot start, keep the previous image available and restore the pre-upgrade
+database backup before retrying; changing only the image may not reverse a
+schema change.
 
 ## Uninstall
 

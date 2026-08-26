@@ -18,6 +18,8 @@ RUN apk add --no-cache ca-certificates tzdata && addgroup -S dapi && adduser -S 
 WORKDIR /app
 COPY --from=go-build /dapi /app/dapi
 COPY --from=web-build /src/web/dist /app/web
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /app/
+COPY web/src/assets/NotoSansCJK-LICENSE.txt /app/
 USER dapi
 EXPOSE 8080
 ENV DAPI_ADDR=:8080 DAPI_WEB_DIR=/app/web

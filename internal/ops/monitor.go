@@ -165,27 +165,39 @@ func (m *Monitor) parallel(ctx context.Context, upstreams []core.Upstream, work 
 	if limit <= 0 {
 		limit = 8
 	}
-	slots := make(chan struct{}, limit)
 	errs := make(chan error, len(upstreams))
+	jobs := make(chan core.Upstream)
 	var wg sync.WaitGroup
+	for i := 0; i < limit; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case upstream, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if err := work(ctx, upstream); err != nil {
+						errs <- fmt.Errorf("upstream %d: %w", upstream.ID, err)
+					}
+				}
+			}
+		}()
+	}
 	for _, upstream := range upstreams {
 		if !upstream.Enabled {
 			continue
 		}
-		wg.Add(1)
-		go func(upstream core.Upstream) {
-			defer wg.Done()
-			select {
-			case slots <- struct{}{}:
-				defer func() { <-slots }()
-			case <-ctx.Done():
-				return
-			}
-			if err := work(ctx, upstream); err != nil {
-				errs <- fmt.Errorf("upstream %d: %w", upstream.ID, err)
-			}
-		}(upstream)
+		select {
+		case jobs <- upstream:
+		case <-ctx.Done():
+			break
+		}
 	}
+	close(jobs)
 	wg.Wait()
 	close(errs)
 	var joined []error

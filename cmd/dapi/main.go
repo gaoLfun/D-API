@@ -61,7 +61,12 @@ func run() error {
 	operations := app.Operations{Store: db, Prober: prober}
 	notifier := app.ChannelNotifier{Store: db}
 	httpapi.New(db, cfg, operations, notifier).Register(mux)
-	mux.Handle("/v1/", gateway.NewHandler(app.GatewayRepository{Store: db}))
+	mux.Handle("/v1/", gateway.NewSecureHandler(app.GatewayRepository{Store: db}, gateway.Limits{
+		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
+		MaxConcurrentPerKey:   cfg.MaxConcurrentPerKey,
+		MaxRequestsPerMinute:  cfg.MaxRequestsPerMinute,
+		MaxRequestDuration:    cfg.MaxRequestDuration,
+	}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		payload := map[string]string{"status": "ok"}
@@ -92,9 +97,11 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.ProxyHeaders(mux, cfg.TrustProxy),
+		Handler:           httpapi.ProxyHeaders(httpapi.SecurityHeaders(mux), cfg.TrustProxy),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -141,8 +148,18 @@ func cleanup(ctx context.Context, database *store.Store, retention time.Duration
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for {
-		if err := database.CleanupLogs(ctx, time.Now().Add(-retention)); err != nil && ctx.Err() == nil {
+		before := time.Now().Add(-retention)
+		if err := database.CleanupLogs(ctx, before); err != nil && ctx.Err() == nil {
 			slog.Error("request log cleanup failed", "error", err)
+		}
+		if err := database.CleanupAuditLogs(ctx, before); err != nil && ctx.Err() == nil {
+			slog.Error("audit log cleanup failed", "error", err)
+		}
+		if err := database.CleanupAlertEvents(ctx, before); err != nil && ctx.Err() == nil {
+			slog.Error("alert event cleanup failed", "error", err)
+		}
+		if err := database.CleanupDailyUsage(ctx, before); err != nil && ctx.Err() == nil {
+			slog.Error("daily usage cleanup failed", "error", err)
 		}
 		if err := database.DeleteExpiredSessions(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("expired session cleanup failed", "error", err)

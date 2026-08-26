@@ -13,31 +13,51 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	WebDir        string
-	DatabaseURL   string
-	MasterKey     []byte
-	AdminUsername string
-	AdminPassword string
-	SessionTTL    time.Duration
-	LogRetention  time.Duration
-	BalanceEvery  time.Duration
-	HealthEvery   time.Duration
-	TrustProxy    bool
+	Addr                  string
+	WebDir                string
+	DatabaseURL           string
+	MasterKey             []byte
+	AdminUsername         string
+	AdminPassword         string
+	SessionTTL            time.Duration
+	LogRetention          time.Duration
+	BalanceEvery          time.Duration
+	HealthEvery           time.Duration
+	TrustProxy            bool
+	MaxConcurrentRequests int
+	MaxConcurrentPerKey   int
+	MaxRequestsPerMinute  int
+	MaxRequestDuration    time.Duration
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:          env("DAPI_ADDR", ":8080"),
-		WebDir:        env("DAPI_WEB_DIR", "web/dist"),
-		DatabaseURL:   databaseURL(),
-		AdminUsername: strings.TrimSpace(os.Getenv("DAPI_ADMIN_USERNAME")),
-		AdminPassword: os.Getenv("DAPI_ADMIN_PASSWORD"),
-		SessionTTL:    duration("DAPI_SESSION_TTL", 24*time.Hour),
-		LogRetention:  duration("DAPI_LOG_RETENTION", 30*24*time.Hour),
-		BalanceEvery:  duration("DAPI_BALANCE_INTERVAL", 10*time.Minute),
-		HealthEvery:   duration("DAPI_HEALTH_INTERVAL", 30*time.Second),
-		TrustProxy:    boolean("DAPI_TRUST_PROXY", false),
+		Addr:                  env("DAPI_ADDR", ":8080"),
+		WebDir:                env("DAPI_WEB_DIR", "web/dist"),
+		DatabaseURL:           databaseURL(),
+		AdminUsername:         strings.TrimSpace(os.Getenv("DAPI_ADMIN_USERNAME")),
+		AdminPassword:         os.Getenv("DAPI_ADMIN_PASSWORD"),
+		SessionTTL:            duration("DAPI_SESSION_TTL", 24*time.Hour),
+		LogRetention:          duration("DAPI_LOG_RETENTION", 30*24*time.Hour),
+		BalanceEvery:          duration("DAPI_BALANCE_INTERVAL", 10*time.Minute),
+		HealthEvery:           duration("DAPI_HEALTH_INTERVAL", 30*time.Second),
+		TrustProxy:            boolean("DAPI_TRUST_PROXY", false),
+		MaxConcurrentRequests: Int("DAPI_MAX_CONCURRENT_REQUESTS", 256),
+		MaxConcurrentPerKey:   Int("DAPI_MAX_CONCURRENT_PER_KEY", 32),
+		MaxRequestsPerMinute:  Int("DAPI_MAX_REQUESTS_PER_MINUTE", 600),
+		MaxRequestDuration:    duration("DAPI_MAX_REQUEST_DURATION", 15*time.Minute),
+	}
+	if cfg.MaxConcurrentRequests > 10000 {
+		cfg.MaxConcurrentRequests = 10000
+	}
+	if cfg.MaxConcurrentPerKey > 1000 {
+		cfg.MaxConcurrentPerKey = 1000
+	}
+	if cfg.MaxRequestsPerMinute > 100000 {
+		cfg.MaxRequestsPerMinute = 100000
+	}
+	if cfg.MaxRequestDuration > 24*time.Hour {
+		cfg.MaxRequestDuration = 24 * time.Hour
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DAPI_DATABASE_URL is required")
@@ -122,5 +142,5 @@ func boolean(name string, fallback bool) bool {
 }
 
 func (c Config) String() string {
-	return fmt.Sprintf("addr=%s balance_interval=%s health_interval=%s trust_proxy=%t", c.Addr, c.BalanceEvery, c.HealthEvery, c.TrustProxy)
+	return fmt.Sprintf("addr=%s balance_interval=%s health_interval=%s trust_proxy=%t max_concurrent=%d max_per_key=%d max_rpm=%d max_duration=%s", c.Addr, c.BalanceEvery, c.HealthEvery, c.TrustProxy, c.MaxConcurrentRequests, c.MaxConcurrentPerKey, c.MaxRequestsPerMinute, c.MaxRequestDuration)
 }

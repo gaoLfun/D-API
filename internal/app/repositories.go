@@ -26,8 +26,8 @@ func (r GatewayRepository) Authenticate(ctx context.Context, raw string) (core.A
 	return key, err
 }
 
-func (r GatewayRepository) Candidates(ctx context.Context, _, _ string) ([]core.Upstream, error) {
-	return r.Store.ListUpstreams(ctx)
+func (r GatewayRepository) Candidates(ctx context.Context, protocol, model string) ([]core.Upstream, error) {
+	return r.Store.ListRouteUpstreams(ctx, protocol, model)
 }
 
 func (r GatewayRepository) AvailableModels(ctx context.Context, key core.APIKey) ([]string, error) {
@@ -103,6 +103,10 @@ func (o Operations) Check(ctx context.Context, id int64) (ops.Health, error) {
 
 func (o Operations) Probe(ctx context.Context, upstream core.Upstream) ops.Health {
 	return o.Prober.CheckHealth(ctx, upstream)
+}
+
+func (o Operations) TestModel(ctx context.Context, upstream core.Upstream, model string) ops.ModelTest {
+	return o.Prober.TestModel(ctx, upstream, model)
 }
 
 func (o Operations) Balance(ctx context.Context, id int64) (core.Balance, error) {

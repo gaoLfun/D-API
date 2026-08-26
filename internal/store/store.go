@@ -35,8 +35,21 @@ func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Sto
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration: %w", err)
+	}
+	defer tx.Rollback()
+	// Serialize DDL across replicas while keeping the lock scoped to this
+	// transaction and connection.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(739842106)`); err != nil {
+		return fmt.Errorf("lock migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
 	}
 	return nil
 }

@@ -38,6 +38,33 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 	return upstreams, nil
 }
 
+// ListRouteUpstreams applies cheap routing predicates in SQL before decrypting
+// credentials. Circuit state is included so the gateway does not pay the
+// decryption cost for entries it will immediately reject.
+func (s *Store) ListRouteUpstreams(ctx context.Context, protocol, model string) ([]core.Upstream, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+upstreamColumns+`
+		FROM upstreams
+		WHERE enabled
+		  AND $1 = ANY(protocols)
+		  AND (cardinality(models)=0 OR $2 = ANY(models) OR model_aliases ? $2)
+		  AND (circuit_open_until IS NULL OR circuit_open_until <= now())
+		ORDER BY priority,id`, protocol, model)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]core.Upstream, 0)
+	for rows.Next() {
+		record, err := s.scanUpstream(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, record.Upstream)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) ListUpstreamRecords(ctx context.Context) ([]UpstreamRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+upstreamColumns+` FROM upstreams ORDER BY priority, id`)
 	if err != nil {

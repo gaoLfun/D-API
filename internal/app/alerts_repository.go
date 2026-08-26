@@ -115,17 +115,25 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 		upstreamID = *rule.UpstreamID
 	}
 	rows, err := r.Store.DB().QueryContext(ctx, `
-		SELECT u.id,u.name,COUNT(a),
-			COALESCE(100.0*COUNT(a) FILTER (WHERE COALESCE((a->>'status_code')::int,0)=0 OR
-				COALESCE((a->>'status_code')::int,0) IN (401,403,404,429) OR COALESCE((a->>'status_code')::int,0)>=500)
-				/NULLIF(COUNT(a),0),0),
-			COALESCE(AVG(COALESCE((a->>'duration_ms')::double precision,0)),0)
-		FROM upstreams u
-		LEFT JOIN request_logs l ON l.created_at >= now()-make_interval(secs=>$1)
-		LEFT JOIN LATERAL jsonb_array_elements(l.attempts) a ON COALESCE((a->>'upstream_id')::bigint,0)=u.id
+		WITH attempts AS (
+			SELECT COALESCE((a->>'upstream_id')::bigint,0) AS upstream_id,
+				COALESCE((a->>'status_code')::int,0) AS status_code,
+				COALESCE((a->>'duration_ms')::double precision,0) AS duration_ms
+			FROM request_logs l
+			CROSS JOIN LATERAL jsonb_array_elements(l.attempts) a
+			WHERE l.created_at >= now()-make_interval(secs=>$1)
+		), metrics AS (
+			SELECT upstream_id,COUNT(*) AS attempts,
+				100.0*COUNT(*) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500)
+					/NULLIF(COUNT(*),0) AS error_rate,
+				AVG(duration_ms) AS latency
+			FROM attempts GROUP BY upstream_id
+		)
+		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),COALESCE(m.latency,0)
+		FROM upstreams u LEFT JOIN metrics m ON m.upstream_id=u.id
 		WHERE u.enabled AND ($2=0 OR u.id=$2)
 			AND ($2<>0 OR NOT EXISTS (SELECT 1 FROM alert_rules ar WHERE ar.event=$3 AND ar.upstream_id=u.id AND ar.enabled))
-		GROUP BY u.id,u.name ORDER BY u.id`, window, upstreamID, rule.Event)
+		ORDER BY u.id`, window, upstreamID, rule.Event)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,14 @@
-export const UPSTREAM_PROTOCOLS = ['chat', 'responses', 'messages'] as const
-export const DEFAULT_UPSTREAM_PROTOCOLS = [...UPSTREAM_PROTOCOLS]
-export const COMMON_UPSTREAM_MODELS = ['gpt-5', 'gpt-5-mini', 'claude-sonnet-4', 'claude-opus-4'] as const
+export const UPSTREAM_PROTOCOLS = ['responses', 'chat', 'messages'] as const
+export const DEFAULT_UPSTREAM_PROTOCOLS = ['responses'] as const
+export const COMMON_UPSTREAM_MODELS = [
+  'gpt-5.6',
+  'gpt-5.6-mini',
+  'gpt-5.6-codex',
+  'claude-opus-4',
+  'claude-opus-4-1',
+  'claude-opus-4-5',
+  'claude-opus-4-6',
+] as const
 
 export function usesNewAPICredentials(kind: string) {
   return kind === 'newapi'
@@ -14,6 +22,19 @@ export function setModelSelected(value: string, model: string, selected: boolean
   const models = parseModelList(value).filter((item) => item !== model)
   if (selected) models.push(model)
   return models.join(', ')
+}
+
+export function bulkSetModels(value: string, discovered: string[], selected: boolean) {
+  const discoveredModels = parseModelList(discovered.join(','))
+  const discoveredSet = new Set(discoveredModels)
+  const manualModels = parseModelList(value).filter((model) => !discoveredSet.has(model))
+  return [...manualModels, ...(selected ? discoveredModels : [])].join(', ')
+}
+
+export function modelBatchSelection(value: string, discovered: string[], limit = 20) {
+  const selected = new Set(parseModelList(value))
+  const models = parseModelList(discovered.join(',')).filter((model) => selected.has(model))
+  return { models: models.slice(0, limit), total: models.length, exceedsLimit: models.length > limit }
 }
 
 export function modelsForPayload(value: string, manual: boolean) {

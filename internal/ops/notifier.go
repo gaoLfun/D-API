@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gaoLfun/dapi/internal/netguard"
 )
 
 type Notifier interface {
@@ -101,7 +103,7 @@ type WebhookNotifier struct {
 
 func NewWebhookNotifier(config WebhookConfig, client *http.Client) *WebhookNotifier {
 	if client == nil {
-		client = http.DefaultClient
+		client = netguard.NewHTTPClient(config.Timeout)
 	}
 	client = withoutRedirects(client)
 	if config.Timeout <= 0 {
@@ -123,6 +125,9 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for key, value := range n.config.Headers {
+		if isHopHeader(key) {
+			continue
+		}
 		req.Header.Set(key, value)
 	}
 	resp, err := n.client.Do(req)
@@ -135,6 +140,15 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func isHopHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length":
+		return true
+	default:
+		return false
+	}
 }
 
 type SMTPConfig struct {
@@ -157,22 +171,26 @@ func NewSMTPNotifier(config SMTPConfig) *SMTPNotifier {
 }
 
 func (n *SMTPNotifier) Notify(ctx context.Context, event Event) error {
+	requestCtx, cancel := context.WithTimeout(ctx, n.config.Timeout)
+	defer cancel()
 	host, _, err := net.SplitHostPort(n.config.Address)
 	if err != nil || n.config.From == "" || len(n.config.To) == 0 {
 		return errors.New("invalid SMTP configuration")
 	}
-	dialer := &net.Dialer{Timeout: n.config.Timeout}
-	var conn net.Conn
-	if n.config.ImplicitTLS {
-		conn, err = (&tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}}).DialContext(ctx, "tcp", n.config.Address)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", n.config.Address)
-	}
+	conn, err := (&netguard.Dialer{Timeout: n.config.Timeout}).DialContext(requestCtx, "tcp", n.config.Address)
 	if err != nil {
 		return fmt.Errorf("connect SMTP: %w", err)
 	}
+	if n.config.ImplicitTLS {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err := tlsConn.HandshakeContext(requestCtx); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("start SMTP TLS: %w", err)
+		}
+		conn = tlsConn
+	}
 	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := requestCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(n.config.Timeout))

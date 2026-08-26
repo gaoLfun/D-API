@@ -183,6 +183,75 @@ func TestMessagesAcceptsAndReplacesAPIKeyHeader(t *testing.T) {
 	}
 }
 
+func TestProxyDoesNotForwardClientSessionOrProxyHeaders(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range []string{"Cookie", "Forwarded", "X-Forwarded-For", "X-Forwarded-Proto", "X-Real-IP"} {
+			if value := r.Header.Get(name); value != "" {
+				t.Errorf("sensitive header %s was forwarded: %q", name, value)
+			}
+		}
+		w.Header().Set("Set-Cookie", "session=upstream")
+		w.Header().Set("Location", "https://upstream.invalid")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstreamServer.Close()
+
+	repo := &fakeRepository{
+		key:        core.APIKey{ID: 1, Enabled: true, Protocols: []string{core.ProtocolResponses}},
+		candidates: []core.Upstream{upstream(1, upstreamServer.URL)},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m"}`))
+	request.Header.Set("Authorization", "Bearer client-secret")
+	request.Header.Set("Cookie", "dapi_session=secret")
+	request.Header.Set("Forwarded", "for=10.0.0.1")
+	request.Header.Set("X-Forwarded-For", "10.0.0.1")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Real-IP", "10.0.0.1")
+	recorder := httptest.NewRecorder()
+	NewHandler(repo).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Set-Cookie") != "" || recorder.Header().Get("Location") != "" {
+		t.Fatalf("unexpected response: status=%d headers=%v body=%s", recorder.Code, recorder.Header(), recorder.Body.String())
+	}
+}
+
+func TestGatewayLimitsConcurrentRequests(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstreamServer.Close()
+	repo := &fakeRepository{
+		key:        core.APIKey{ID: 7, Enabled: true, Protocols: []string{core.ProtocolResponses}},
+		candidates: []core.Upstream{upstream(1, upstreamServer.URL)},
+	}
+	h := NewHandler(repo, Limits{MaxConcurrentRequests: 1, MaxConcurrentPerKey: 1, MaxRequestsPerMinute: 10})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, requestWithAuth(http.MethodPost, "/v1/responses", `{"model":"m"}`))
+		firstDone <- recorder
+	}()
+	<-started
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, requestWithAuth(http.MethodPost, "/v1/responses", `{"model":"m"}`))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, body = %s", second.Code, second.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first request status = %d", first.Code)
+	}
+}
+
+func requestWithAuth(method, path, body string) *http.Request {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer client-secret")
+	return request
+}
+
 func TestModelsAreFilteredSortedAndDeduplicated(t *testing.T) {
 	repo := &fakeRepository{
 		key:    core.APIKey{ID: 1, Enabled: true, Models: []string{"b", "c"}},
@@ -280,7 +349,7 @@ func TestStreamIdleTimeoutAndUsage(t *testing.T) {
 	t.Run("idle timeout after commit marks upstream failure", func(t *testing.T) {
 		upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
 			w.(http.Flusher).Flush()
 			time.Sleep(50 * time.Millisecond)
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
@@ -306,7 +375,7 @@ func TestStreamIdleTimeoutAndUsage(t *testing.T) {
 	t.Run("terminal SSE usage is recorded incrementally", func(t *testing.T) {
 		upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: {\"response\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n\ndata: [DONE]\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: {\"response\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":2},\"cache_creation_input_tokens\":4}}}\n\ndata: [DONE]\n\n")
 		}))
 		defer upstreamServer.Close()
 
@@ -321,10 +390,38 @@ func TestStreamIdleTimeoutAndUsage(t *testing.T) {
 			t.Fatalf("logs = %#v", repo.logs)
 		}
 		usage := repo.logs[0].Usage
-		if usage.InputTokens == nil || *usage.InputTokens != 13 || usage.OutputTokens == nil || *usage.OutputTokens != 8 || usage.CachedInputTokens == nil || *usage.CachedInputTokens != 2 {
+		if usage.InputTokens == nil || *usage.InputTokens != 13 || usage.OutputTokens == nil || *usage.OutputTokens != 8 || usage.CachedInputTokens == nil || *usage.CachedInputTokens != 2 || usage.CacheCreationInputTokens == nil || *usage.CacheCreationInputTokens != 4 || usage.UncachedInputTokens == nil || *usage.UncachedInputTokens != 11 {
 			t.Fatalf("usage = %#v", usage)
 		}
+		if repo.logs[0].TTFBMS == nil || repo.logs[0].TTFTMS == nil {
+			t.Fatalf("timing = ttfb:%v ttft:%v", repo.logs[0].TTFBMS, repo.logs[0].TTFTMS)
+		}
 	})
+}
+
+func TestSSEParserDetectsProtocolTextDeltas(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		event    string
+	}{
+		{name: "responses", protocol: core.ProtocolResponses, event: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"},
+		{name: "chat", protocol: core.ProtocolChat, event: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"},
+		{name: "messages", protocol: core.ProtocolMessages, event: "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parser := sseUsageParser{protocol: test.protocol}
+			parser.Feed([]byte(test.event))
+			if !parser.HasText() {
+				t.Fatalf("parser did not detect %s text delta", test.protocol)
+			}
+		})
+	}
+	usage := parseUsageWithProtocol([]byte(`{"usage":{"input_tokens":10,"cache_read_input_tokens":5}}`), core.ProtocolMessages)
+	if usage.UncachedInputTokens == nil || *usage.UncachedInputTokens != 10 {
+		t.Fatalf("Anthropic uncached input = %#v", usage.UncachedInputTokens)
+	}
 }
 
 func TestClientCancellationDoesNotMarkUpstreamFailed(t *testing.T) {
