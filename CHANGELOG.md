@@ -21,6 +21,8 @@ All notable changes to D-API will be documented in this file. The format is base
   download or parse failures.
 - Historical cost backfill for unknown request costs, limited to 365 days and
   preserving existing cost values and retained aggregates.
+- Dashboard topology view for inspecting client keys, group decisions, and
+  normalized upstream clusters alongside the existing upstream status table.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

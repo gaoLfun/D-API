@@ -203,6 +203,7 @@ const editingPricing = ref<number | null>(null)
 const pricingForm = reactive({ name: '', provider: '', source_url: '', source_version: 'custom', prices: '' })
 const dashboardRange = ref<'24h' | '7d' | '30d'>('24h')
 const dashboardMetric = ref<'requests' | 'tokens' | 'cache' | 'cost'>('requests')
+const dashboardRouteView = ref<'current' | 'topology'>('current')
 const upstreams = ref<Upstream[]>([])
 const upstreamGroupDrawer = ref<UpstreamGroup | null>(null)
 const groups = ref<Group[]>([])
@@ -315,6 +316,12 @@ const upstreamGroups = computed<UpstreamGroup[]>(() => {
   })).sort((a, b) => a.priority - b.priority || a.base_url.localeCompare(b.base_url))
 })
 const shownDashUpstreams = computed<UpstreamGroup[]>(() => upstreamGroups.value.slice(0, 8))
+const dashboardTopologyGroups = computed<Group[]>(() => {
+  const enabledGroups = groups.value.filter((group) => group.enabled)
+  return (enabledGroups.length ? enabledGroups : groups.value).slice(0, 4)
+})
+const dashboardTopologyKeys = computed<ClientKey[]>(() => keys.value.slice(0, 6))
+const dashboardTopologyHasData = computed(() => Boolean(dashboardTopologyKeys.value.length || dashboardTopologyGroups.value.length || shownDashUpstreams.value.length))
 const dashboardRows = computed<Json[]>(() => {
   const rows = dashboard.value.daily
   return Array.isArray(rows) ? rows : []
@@ -698,15 +705,18 @@ async function loadCurrent() {
   const signal = controller.signal
   try {
     if (view.value === 'dashboard') {
-      const [dash, ups, costData, pricingData] = await Promise.all([
+      const [dash, ups, costData, pricingData, groupData, keyData] = await Promise.all([
         api.get<Json>('/api/admin/dashboard', { signal }), api.get('/api/admin/upstreams', { signal }),
         api.get<Json>('/api/admin/usage?days=30&granularity=day&dimension=model&top_n=8', { signal }),
         api.get<Json>('/api/admin/pricing', { signal }),
+        api.get('/api/admin/groups', { signal }), api.get('/api/admin/keys', { signal }),
       ])
       dashboard.value = dash || {}
       upstreams.value = listOf<Upstream>(ups)
       dashboardCostRows.value = listOf<Json>(costData?.daily || costData?.items)
       pricing.value = pricingData || {}
+      groups.value = listOf<Group>(groupData)
+      keys.value = listOf<ClientKey>(keyData)
     } else if (view.value === 'upstreams') {
       const [upstreamData, pricingData] = await Promise.all([api.get('/api/admin/upstreams', { signal }), api.get<Json>('/api/admin/pricing', { signal })])
       upstreams.value = listOf<Upstream>(upstreamData)
@@ -833,6 +843,18 @@ function groupStatusTone(group: UpstreamGroup) {
 
 function groupCircuitText(group: UpstreamGroup) {
   return group.circuit_open ? `熔断 ${group.circuit_open}/${group.enabled}` : '未熔断'
+}
+
+function topologyGroupUpstreams(group: Group) {
+  return (group.upstream_ids || []).map((id) => upstreams.value.find((item) => Number(item.id) === Number(id))).filter(Boolean) as Upstream[]
+}
+
+function topologyGroupPriorities(group: Group) {
+  return [...new Set(topologyGroupUpstreams(group).map((item) => Number(item.priority)).filter((priority) => Number.isFinite(priority)))].sort((a, b) => a - b)
+}
+
+function topologyKeysForGroup(group: Group) {
+  return keys.value.filter((key) => Number(key.group_id) === Number(group.id))
 }
 
 function openUpstreamGroup(group: UpstreamGroup) {
@@ -1632,8 +1654,17 @@ onBeforeUnmount(() => {
             <section class="panel pricing-snapshot"><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" :disabled="saving" @click="backfillPricing"><RefreshCw :class="{ spin: saving }" :size="15" />回算成本</button><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.prices?.length || 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<Json>(pricing.profiles).length" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
           </div>
           <section class="panel">
-            <div class="panel-head"><div><h2>上游状态</h2><p>当前路由顺序与连接状态</p></div><button class="text-button" @click="go('upstreams')">查看全部 <ChevronRight :size="15" /></button></div>
-            <div class="table-wrap">
+            <div class="panel-head dashboard-route-head">
+              <div><h2>上游状态</h2><p>{{ dashboardRouteView === 'topology' ? '按 baseurl 聚合的路由拓扑与决策路径' : '当前路由顺序与连接状态' }}</p></div>
+              <div class="dashboard-route-actions">
+                <div class="segmented-control" aria-label="上游视图">
+                  <button :class="{ active: dashboardRouteView === 'current' }" :aria-pressed="dashboardRouteView === 'current'" @click="dashboardRouteView = 'current'">列表</button>
+                  <button :class="{ active: dashboardRouteView === 'topology' }" :aria-pressed="dashboardRouteView === 'topology'" @click="dashboardRouteView = 'topology'">拓扑</button>
+                </div>
+                <button class="text-button" @click="go('upstreams')">查看全部 <ChevronRight :size="15" /></button>
+              </div>
+            </div>
+            <div v-if="dashboardRouteView === 'current'" class="table-wrap">
               <table class="dashboard-upstream-table">
                 <thead><tr><th>优先级</th><th>上游</th><th>状态</th><th>今日用量</th><th>余额</th><th>协议</th><th>最后检查</th></tr></thead>
                 <tbody>
@@ -1649,6 +1680,59 @@ onBeforeUnmount(() => {
               <tr v-if="!shownDashUpstreams.length"><td colspan="7"><div class="empty"><Server :size="22" /><strong>暂无上游</strong><span>创建路由目标后，这里会显示健康与余额状态。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
                 </tbody>
               </table>
+            </div>
+            <div v-else class="dashboard-route-topology" :class="{ 'is-empty': !dashboardTopologyHasData }">
+              <div v-if="dashboardTopologyHasData" class="topology-flow">
+                <section class="topology-column topology-source" aria-label="客户端密钥入口">
+                  <div class="topology-column-label"><KeyRound :size="14" /><span>客户端密钥</span><small>{{ keys.length }} 个</small></div>
+                  <div v-if="dashboardTopologyKeys.length" class="topology-node-list">
+                    <article v-for="item in dashboardTopologyKeys" :key="item.id" class="topology-node key-node">
+                      <span class="topology-node-mark"><KeyRound :size="13" /></span>
+                      <div><strong>{{ item.name || item.prefix || item.key_prefix || `密钥 #${item.id}` }}</strong><small>{{ item.group_name || '未分组' }}</small></div>
+                      <span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span>
+                    </article>
+                  </div>
+                  <div v-else class="topology-empty-node"><KeyRound :size="17" /><span>暂无客户端密钥</span></div>
+                  <span v-if="keys.length > dashboardTopologyKeys.length" class="topology-more">+ {{ keys.length - dashboardTopologyKeys.length }} 个未展开</span>
+                </section>
+
+                <div class="topology-bridge" aria-hidden="true"><span class="topology-bridge-line"></span><i class="topology-pulse"></i><small>匹配分组</small></div>
+
+                <section class="topology-column topology-decision" aria-label="分组策略">
+                  <div class="topology-column-label"><Network :size="14" /><span>分组决策</span><small>{{ groups.length }} 个</small></div>
+                  <div v-if="dashboardTopologyGroups.length" class="topology-node-list">
+                    <article v-for="item in dashboardTopologyGroups" :key="item.id" class="topology-node group-node">
+                      <div class="topology-node-heading"><strong>{{ item.name }}</strong><span class="topology-strategy">按优先级</span></div>
+                      <div class="topology-group-meta"><span>{{ item.key_count || 0 }} 个密钥</span><span>{{ item.upstream_ids?.length || 0 }} 条线路</span><span v-if="topologyGroupPriorities(item).length">优先级 {{ topologyGroupPriorities(item).map((priority) => `P${priority}`).join(' / ') }}</span><span v-else>待配置</span></div>
+                      <div class="topology-group-keys"><span v-for="key in topologyKeysForGroup(item).slice(0, 3)" :key="key.id" class="topology-client-key"><KeyRound :size="10" />{{ key.name || key.prefix || key.key_prefix || `密钥 #${key.id}` }}</span><span v-if="topologyKeysForGroup(item).length > 3" class="topology-key-overflow">+{{ topologyKeysForGroup(item).length - 3 }}</span><span v-if="!topologyKeysForGroup(item).length" class="muted">暂无客户端密钥</span></div>
+                      <div class="topology-group-line"><span :style="{ transform: `scaleX(${Math.max(18, Math.min(100, (item.upstream_ids?.length || 0) * 28)) / 100})` }"></span></div>
+                    </article>
+                  </div>
+                  <div v-else class="topology-empty-node"><Network :size="17" /><span>暂无分组策略</span></div>
+                  <span v-if="groups.length > dashboardTopologyGroups.length" class="topology-more">+ {{ groups.length - dashboardTopologyGroups.length }} 个未展开</span>
+                </section>
+
+                <div class="topology-bridge" aria-hidden="true"><span class="topology-bridge-line"></span><i class="topology-pulse"></i><small>按优先级路由</small></div>
+
+                <section class="topology-column topology-target" aria-label="上游集群">
+                  <div class="topology-column-label"><Server :size="14" /><span>上游集群</span><small>{{ upstreamGroups.length }} 个 baseurl</small></div>
+                  <div v-if="shownDashUpstreams.length" class="topology-node-list">
+                    <article v-for="item in shownDashUpstreams" :key="item.key" class="topology-node upstream-node" :class="groupStatusTone(item)" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
+                      <div class="topology-node-heading"><strong :title="item.base_url">{{ item.base_url }}</strong><span class="priority-badge">P{{ item.priority }}</span></div>
+                      <div class="topology-upstream-state"><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><span class="topology-circuit" :class="item.circuit_open ? 'bad' : 'muted'">{{ groupCircuitText(item) }}</span></div>
+                      <div class="topology-upstream-keys"><div v-for="key in item.items.slice(0, 6)" :key="key.id" class="topology-upstream-key"><span class="topology-key-dot" :class="key.health_status === 'healthy' ? 'healthy' : key.health_status === 'open' ? 'open' : 'unknown'">{{ (key.name || `#${key.id}`).slice(0, 1).toUpperCase() }}</span><strong :title="key.name">{{ key.name || `上游 Key #${key.id}` }}</strong><span class="topology-key-priority">P{{ key.priority }}</span><span class="status" :class="statusTone(key.health_status)"><i></i>{{ statusText(key.health_status) }}</span></div><span v-if="item.total > 6" class="topology-more">+ {{ item.total - 6 }} 个 Key，点击查看全部</span></div>
+                      <div class="topology-upstream-meta"><span>{{ item.healthy }}/{{ item.enabled }} 健康</span><span>{{ fmtNumber(item.today_requests) }} 次 · {{ fmtNumber(item.today_tokens) }} Token</span></div>
+                    </article>
+                  </div>
+                  <div v-else class="topology-empty-node"><Server :size="17" /><span>暂无上游集群</span></div>
+                  <span v-if="upstreamGroups.length > shownDashUpstreams.length" class="topology-more">+ {{ upstreamGroups.length - shownDashUpstreams.length }} 个未展开</span>
+                </section>
+              </div>
+              <div v-else class="empty"><Network :size="22" /><strong>暂无路由拓扑数据</strong><span>创建客户端密钥、分组和上游后，这里会显示完整决策路径。</span></div>
+              <div v-if="dashboardTopologyHasData" class="topology-response">
+                <span class="topology-response-line" aria-hidden="true"></span>
+                <div class="topology-response-node"><span class="topology-response-icon"><Check :size="15" /></span><div><strong>响应出口</strong><small>{{ fmtNumber(summary.requests) }} 请求 · 成功率 {{ summary.success.toFixed(1) }}% · 平均 {{ fmtDuration(summary.latency) }}</small></div><span class="status" :class="summary.success >= 99 ? 'good' : summary.success >= 95 ? 'warn' : 'bad'"><i></i>{{ summary.success >= 99 ? '稳定' : summary.success >= 95 ? '关注' : '异常' }}</span></div>
+              </div>
             </div>
           </section>
         </section>

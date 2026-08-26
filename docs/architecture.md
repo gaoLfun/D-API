@@ -104,6 +104,13 @@ first token when observable, token metadata, and the client IP. Bodies are
 deliberately excluded. Health failures update the upstream circuit in
 PostgreSQL, while gateway concurrency and login limits remain in process memory.
 
+The admin dashboard's upstream panel provides a tabular view and a topology view.
+The topology groups upstream entries by normalized base URL and shows the
+client-key to group-decision to upstream-cluster path, while preserving the
+priority and health state used by the gateway. It is an operational summary;
+actual routing still follows the persisted group membership and SQL eligibility
+filters described above.
+
 An upstream request is bounded by the global request lifetime, per-upstream
 connect/first-byte/idle timeouts, and a maximum buffered response size. The
 outbound network guard resolves and validates destinations again immediately
