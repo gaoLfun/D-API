@@ -84,6 +84,9 @@ but the committed stream cannot be replayed safely.
   consume upstream quota.
 - Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
   is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
+- The pricing refresh job checks built-in pricing source URLs once per day. It
+  only verifies that the sources respond; configured price snapshots remain in
+  PostgreSQL and custom profiles are never contacted.
 - Alert rules are evaluated once per minute and can deliver email or webhook
   notifications.
 - Request logs older than the configured retention are removed once per day.
@@ -112,6 +115,9 @@ boundary.
 - Upstream API keys, optional NewAPI balance credentials, and notification
   channel configurations are encrypted with AES-256-GCM using
   `DAPI_MASTER_KEY`.
+- Pricing profiles and per-upstream assignments are stored in PostgreSQL. Costs
+  are estimates derived from recorded Token usage and matching profile prices;
+  D-API has no billing or quota-charging subsystem.
 - Client API keys use SHA-256 hashes for authentication and an AES-256-GCM
   encrypted copy for administrator copy/CCSwitch import. Existing keys created
   before this encrypted copy was introduced cannot be recovered and must be

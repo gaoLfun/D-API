@@ -14,6 +14,8 @@ All notable changes to D-API will be documented in this file. The format is base
   hit rates, multidimensional usage grouping, average/P95 latency, and charts.
 - Upstream groups with group-scoped client keys, group routing, and group-level
   request-log and usage filters.
+- Pricing profiles with built-in snapshots, per-upstream assignment, estimated
+  USD cost, CNY display conversion, and cost coverage metrics.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

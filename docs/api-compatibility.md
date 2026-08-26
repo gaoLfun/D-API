@@ -136,14 +136,17 @@ The administrator log records total duration, TTFB, and streaming TTFT in
 integer milliseconds, plus the upstream attempt chain. Anthropic Messages usage
 counts `input_tokens` and cache-creation tokens as uncached input; OpenAI-style
 usage treats cached input as a subset of total input. The usage report can split
-daily, weekly, or monthly totals by upstream, client key, protocol, or model,
-with Top-N/other aggregation and average/P95 latency. Group is also available as
-a usage dimension.
+daily, weekly, or monthly totals by upstream, client key, group, protocol, or
+model, with Top-N/other aggregation and average/P95 latency. It also reports
+optional `cost_usd` and cost coverage based on the administrator-assigned pricing
+profile for each upstream. These are operational estimates only, not provider
+billing or client-facing charges.
 
-Usage is best effort: missing fields remain unknown in administrator views. D-API
-does not calculate token counts, prices, or billable cost. It stores request
-metadata, attempts, latency, status, client IP, and discovered usage; request and
-response bodies are not stored.
+Usage is best effort: missing fields remain unknown in administrator views, and
+costs remain unknown when no matching price or Token usage is available. D-API
+does not perform billing or charge clients. It stores request metadata, attempts,
+latency, status, client IP, discovered usage, and optional cost estimates; request
+and response bodies are not stored.
 
 ## Balance Discovery
 

@@ -25,6 +25,7 @@ type Upstream struct {
 	Models             []string          `json:"models"`
 	ModelsLocked       bool              `json:"models_locked"`
 	ModelAliases       map[string]string `json:"model_aliases"`
+	PricingProfileID   *int64            `json:"pricing_profile_id,omitempty"`
 	ConnectTimeout     time.Duration     `json:"-"`
 	FirstByteTimeout   time.Duration     `json:"-"`
 	IdleTimeout        time.Duration     `json:"-"`
@@ -114,6 +115,7 @@ type RequestLog struct {
 	TTFTMS     *int64    `json:"ttft_ms,omitempty"`
 	Attempts   []Attempt `json:"attempts"`
 	Usage      Usage     `json:"usage"`
+	CostUSD    *float64  `json:"cost_usd,omitempty"`
 	ErrorCode  string    `json:"error_code,omitempty"`
 	ClientIP   string    `json:"client_ip,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`

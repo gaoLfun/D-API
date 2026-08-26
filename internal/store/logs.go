@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
@@ -34,28 +36,35 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
+	if entry.UpstreamID != nil {
+		entry.CostUSD, err = s.RequestCost(ctx, *entry.UpstreamID, entry.Model, entry.Usage, entry.CreatedAt)
+		if err != nil {
+			return err
+		}
+	}
 	_, err = s.db.ExecContext(ctx, `
 		WITH inserted AS (
 			INSERT INTO request_logs(
 				request_id,api_key_id,group_id,upstream_id,protocol,model,status_code,duration_ms,ttfb_ms,ttft_ms,
-				attempts,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens,error_code,client_ip,created_at
-			) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+				attempts,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens,cost_usd,error_code,client_ip,created_at
+			) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 				RETURNING api_key_id,group_id,upstream_id,protocol,model,status_code,error_code,created_at,
-				input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens
-		)
+				input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,uncached_input_tokens,cost_usd
+		),
+		daily AS (
 		INSERT INTO daily_usage(
-			day,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
-			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests
-		)
-		SELECT (created_at AT TIME ZONE 'UTC')::date,api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
+				day,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
+				cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests
+			)
+			SELECT (created_at AT TIME ZONE 'UTC')::date,api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
 			CASE WHEN status_code BETWEEN 200 AND 399 AND error_code='' THEN 1 ELSE 0 END,
 			COALESCE(input_tokens,0),COALESCE(output_tokens,0),COALESCE(cached_input_tokens,0),
-			COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
-			COALESCE(uncached_input_tokens,0),CASE WHEN input_tokens IS NULL THEN 0 ELSE 1 END,
-			CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END
-		FROM inserted
-		WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
-		ON CONFLICT(day,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
+				COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
+				COALESCE(uncached_input_tokens,0),CASE WHEN input_tokens IS NULL THEN 0 ELSE 1 END,
+				CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END
+			FROM inserted
+			WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
+			ON CONFLICT(day,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
 			requests=daily_usage.requests+1,
 			successes=daily_usage.successes+EXCLUDED.successes,
 			input_tokens=daily_usage.input_tokens+EXCLUDED.input_tokens,
@@ -65,11 +74,40 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 			cache_creation_usage_requests=daily_usage.cache_creation_usage_requests+EXCLUDED.cache_creation_usage_requests,
 			uncached_input_tokens=daily_usage.uncached_input_tokens+EXCLUDED.uncached_input_tokens,
 			usage_requests=daily_usage.usage_requests+EXCLUDED.usage_requests,
-			cache_hit_requests=daily_usage.cache_hit_requests+EXCLUDED.cache_hit_requests`,
+			cache_hit_requests=daily_usage.cache_hit_requests+EXCLUDED.cache_hit_requests,
+			cost_usd=daily_usage.cost_usd+EXCLUDED.cost_usd,
+			cost_known_requests=daily_usage.cost_known_requests+EXCLUDED.cost_known_requests
+		RETURNING 1
+		)
+		INSERT INTO hourly_usage(
+			hour,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
+			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests
+		)
+		SELECT date_trunc('hour',created_at),api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
+			CASE WHEN status_code BETWEEN 200 AND 399 AND error_code='' THEN 1 ELSE 0 END,
+			COALESCE(input_tokens,0),COALESCE(output_tokens,0),COALESCE(cached_input_tokens,0),
+			COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
+			COALESCE(uncached_input_tokens,0),CASE WHEN input_tokens IS NULL THEN 0 ELSE 1 END,
+			CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END
+		FROM inserted
+		WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
+		ON CONFLICT(hour,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
+			requests=hourly_usage.requests+1,
+			successes=hourly_usage.successes+EXCLUDED.successes,
+			input_tokens=hourly_usage.input_tokens+EXCLUDED.input_tokens,
+			output_tokens=hourly_usage.output_tokens+EXCLUDED.output_tokens,
+			cached_input_tokens=hourly_usage.cached_input_tokens+EXCLUDED.cached_input_tokens,
+			cache_creation_input_tokens=hourly_usage.cache_creation_input_tokens+EXCLUDED.cache_creation_input_tokens,
+			cache_creation_usage_requests=hourly_usage.cache_creation_usage_requests+EXCLUDED.cache_creation_usage_requests,
+			uncached_input_tokens=hourly_usage.uncached_input_tokens+EXCLUDED.uncached_input_tokens,
+			usage_requests=hourly_usage.usage_requests+EXCLUDED.usage_requests,
+			cache_hit_requests=hourly_usage.cache_hit_requests+EXCLUDED.cache_hit_requests,
+			cost_usd=hourly_usage.cost_usd+EXCLUDED.cost_usd,
+			cost_known_requests=hourly_usage.cost_known_requests+EXCLUDED.cost_known_requests`,
 		entry.RequestID, nullableID(entry.APIKeyID), entry.GroupID, entry.UpstreamID, entry.Protocol, entry.Model,
 		entry.StatusCode, entry.DurationMS, entry.TTFBMS, entry.TTFTMS, attempts, entry.Usage.InputTokens, entry.Usage.OutputTokens,
 		entry.Usage.CachedInputTokens, entry.Usage.CacheCreationInputTokens, entry.Usage.UncachedInputTokens,
-		entry.ErrorCode, entry.ClientIP, entry.CreatedAt,
+		entry.CostUSD, entry.ErrorCode, entry.ClientIP, entry.CreatedAt,
 	)
 	if err != nil {
 		return err
@@ -89,7 +127,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT l.request_id,COALESCE(l.api_key_id,0),l.group_id,l.upstream_id,l.protocol,l.model,l.status_code,l.duration_ms,l.ttfb_ms,l.ttft_ms,
-			l.attempts,l.input_tokens,l.output_tokens,l.cached_input_tokens,l.cache_creation_input_tokens,l.uncached_input_tokens,l.error_code,l.client_ip,l.created_at,
+			l.attempts,l.input_tokens,l.output_tokens,l.cached_input_tokens,l.cache_creation_input_tokens,l.uncached_input_tokens,l.cost_usd,l.error_code,l.client_ip,l.created_at,
 			COALESCE(k.name,''),COALESCE(g.name,''),COALESCE(u.name,'')
 		FROM request_logs l
 		LEFT JOIN api_keys k ON k.id=l.api_key_id LEFT JOIN groups g ON g.id=l.group_id LEFT JOIN upstreams u ON u.id=l.upstream_id
@@ -108,7 +146,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 		if err := rows.Scan(
 			&entry.RequestID, &entry.APIKeyID, &entry.GroupID, &entry.UpstreamID, &entry.Protocol, &entry.Model,
 			&entry.StatusCode, &entry.DurationMS, &entry.TTFBMS, &entry.TTFTMS, &attempts, &entry.Usage.InputTokens,
-			&entry.Usage.OutputTokens, &entry.Usage.CachedInputTokens, &entry.Usage.CacheCreationInputTokens, &entry.Usage.UncachedInputTokens, &entry.ErrorCode,
+			&entry.Usage.OutputTokens, &entry.Usage.CachedInputTokens, &entry.Usage.CacheCreationInputTokens, &entry.Usage.UncachedInputTokens, &entry.CostUSD, &entry.ErrorCode,
 			&entry.ClientIP, &entry.CreatedAt, &entry.APIKeyName, &entry.GroupName, &entry.UpstreamName,
 		); err != nil {
 			return nil, err
@@ -129,6 +167,7 @@ type UsageRow struct {
 	GroupName                string    `json:"group_name"`
 	UpstreamID               int64     `json:"upstream_id"`
 	UpstreamName             string    `json:"upstream_name"`
+	UpstreamBaseURL          string    `json:"-"`
 	Protocol                 string    `json:"protocol"`
 	Model                    string    `json:"model"`
 	Requests                 int64     `json:"requests"`
@@ -140,6 +179,9 @@ type UsageRow struct {
 	UncachedInputTokens      int64     `json:"uncached_input_tokens"`
 	UsageRequests            int64     `json:"usage_requests"`
 	CacheHitRequests         int64     `json:"cache_hit_requests"`
+	CostUSD                  float64   `json:"cost_usd"`
+	CostKnownRequests        int64     `json:"cost_known_requests"`
+	CostCoverage             *float64  `json:"cost_coverage,omitempty"`
 	CacheHitRate             *float64  `json:"cache_hit_rate,omitempty"`
 	RequestHitRate           *float64  `json:"request_hit_rate,omitempty"`
 	AverageDurationMS        *float64  `json:"average_duration_ms,omitempty"`
@@ -180,6 +222,9 @@ type UsageTotals struct {
 	CacheHitRequests         int64    `json:"cache_hit_requests"`
 	CacheHitRate             *float64 `json:"cache_hit_rate,omitempty"`
 	RequestHitRate           *float64 `json:"request_hit_rate,omitempty"`
+	CostUSD                  float64  `json:"cost_usd"`
+	CostKnownRequests        int64    `json:"cost_known_requests"`
+	CostCoverage             *float64 `json:"cost_coverage,omitempty"`
 	AverageDurationMS        *float64 `json:"average_duration_ms,omitempty"`
 	P95DurationMS            *float64 `json:"p95_duration_ms,omitempty"`
 }
@@ -195,7 +240,8 @@ func (s *Store) UsageTotals(ctx context.Context, filter UsageFilter) (UsageTotal
 			COALESCE(sum(cache_creation_input_tokens),0)::bigint,
 			COALESCE(sum(cache_creation_usage_requests),0)::bigint,
 			COALESCE(sum(uncached_input_tokens),0)::bigint,
-			COALESCE(sum(usage_requests),0)::bigint, COALESCE(sum(cache_hit_requests),0)::bigint
+			COALESCE(sum(usage_requests),0)::bigint, COALESCE(sum(cache_hit_requests),0)::bigint,
+			COALESCE(sum(cost_usd),0)::double precision, COALESCE(sum(cost_known_requests),0)::bigint
 		FROM daily_usage
 		WHERE day >= $1::date AND day <= $2::date
 		  AND ($3=0 OR upstream_id=$3) AND ($4=0 OR api_key_id=$4) AND ($5=0 OR group_id=$5)
@@ -203,7 +249,7 @@ func (s *Store) UsageTotals(ctx context.Context, filter UsageFilter) (UsageTotal
 		from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model).Scan(
 		&totals.Requests, &totals.Successes, &totals.InputTokens, &totals.OutputTokens,
 		&totals.CachedInputTokens, &cacheWrite, &cacheWriteKnown, &totals.UncachedInputTokens,
-		&totals.UsageRequests, &totals.CacheHitRequests)
+		&totals.UsageRequests, &totals.CacheHitRequests, &totals.CostUSD, &totals.CostKnownRequests)
 	if err != nil {
 		return UsageTotals{}, err
 	}
@@ -211,6 +257,10 @@ func (s *Store) UsageTotals(ctx context.Context, filter UsageFilter) (UsageTotal
 		totals.CacheCreationInputTokens = &cacheWrite
 	}
 	finalizeUsageTotals(&totals)
+	if totals.Requests > 0 {
+		coverage := float64(totals.CostKnownRequests) / float64(totals.Requests)
+		totals.CostCoverage = &coverage
+	}
 	var avg, p95 *float64
 	err = s.db.QueryRowContext(ctx, `
 		SELECT avg(duration_ms)::double precision,
@@ -245,9 +295,10 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 	dimension := normalizeDimension(filter.Dimension)
 	granularity := normalizeGranularity(filter.Granularity)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.day,d.api_key_id,COALESCE(k.name,''),d.group_id,COALESCE(g.name,''),d.upstream_id,COALESCE(u.name,''),d.protocol,d.model,
+		SELECT d.day,d.api_key_id,COALESCE(k.name,''),d.group_id,COALESCE(g.name,''),d.upstream_id,COALESCE(u.name,''),COALESCE(u.base_url,''),d.protocol,d.model,
 			d.requests,d.successes,d.input_tokens,d.output_tokens,d.cached_input_tokens,
-			d.cache_creation_input_tokens,d.cache_creation_usage_requests,d.uncached_input_tokens,d.usage_requests,d.cache_hit_requests
+			 d.cache_creation_input_tokens,d.cache_creation_usage_requests,d.uncached_input_tokens,d.usage_requests,d.cache_hit_requests
+			,d.cost_usd,d.cost_known_requests
 		FROM daily_usage d
 		LEFT JOIN api_keys k ON k.id=d.api_key_id LEFT JOIN groups g ON g.id=d.group_id LEFT JOIN upstreams u ON u.id=d.upstream_id
 		WHERE d.day >= $1::date AND d.day <= $2::date
@@ -263,10 +314,10 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 		var day time.Time
 		var row UsageRow
 		var cacheCreation, cacheCreationKnown int64
-		if err := rows.Scan(&day, &row.APIKeyID, &row.APIKeyName, &row.GroupID, &row.GroupName, &row.UpstreamID, &row.UpstreamName,
+		if err := rows.Scan(&day, &row.APIKeyID, &row.APIKeyName, &row.GroupID, &row.GroupName, &row.UpstreamID, &row.UpstreamName, &row.UpstreamBaseURL,
 			&row.Protocol, &row.Model, &row.Requests, &row.Successes, &row.InputTokens,
 			&row.OutputTokens, &row.CachedInputTokens, &cacheCreation, &cacheCreationKnown, &row.UncachedInputTokens,
-			&row.UsageRequests, &row.CacheHitRequests); err != nil {
+			&row.UsageRequests, &row.CacheHitRequests, &row.CostUSD, &row.CostKnownRequests); err != nil {
 			return nil, err
 		}
 		if cacheCreationKnown > 0 {
@@ -325,6 +376,8 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 			current.UncachedInputTokens += row.UncachedInputTokens
 			current.UsageRequests += row.UsageRequests
 			current.CacheHitRequests += row.CacheHitRequests
+			current.CostUSD += row.CostUSD
+			current.CostKnownRequests += row.CostKnownRequests
 			groups[key] = current
 		} else {
 			groups[key] = row
@@ -399,6 +452,8 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 					prev.UncachedInputTokens += row.UncachedInputTokens
 					prev.UsageRequests += row.UsageRequests
 					prev.CacheHitRequests += row.CacheHitRequests
+					prev.CostUSD += row.CostUSD
+					prev.CostKnownRequests += row.CostKnownRequests
 					other[key] = prev
 				} else {
 					other[key] = row
@@ -495,7 +550,7 @@ func usageBucketSQL(granularity string) string {
 func usageDimensionSQL(dimension string) string {
 	switch dimension {
 	case "upstream":
-		return "COALESCE(upstream_id,0)::text"
+		return fmt.Sprintf("COALESCE((SELECT %s FROM upstreams u WHERE u.id=request_logs.upstream_id),'')", usageBaseURLSQL("base_url"))
 	case "api_key":
 		return "COALESCE(api_key_id,0)::text"
 	case "group":
@@ -509,6 +564,29 @@ func usageDimensionSQL(dimension string) string {
 	}
 }
 
+func usageBaseURLSQL(column string) string {
+	return fmt.Sprintf("lower(regexp_replace(regexp_replace(regexp_replace(trim(trailing '/' FROM %s), '[?#].*$', ''), '(?i)^https://([^/:]+):443(/|$)', 'https://\\1\\2'), '(?i)^http://([^/:]+):80(/|$)', 'http://\\1\\2'))", column)
+}
+
+func normalizeUsageBaseURL(value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	if (parsed.Scheme == "https" && parsed.Port() == "443") || (parsed.Scheme == "http" && parsed.Port() == "80") {
+		parsed.Host = parsed.Hostname()
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawQuery, parsed.Fragment = "", ""
+	return strings.ToLower(strings.TrimRight(parsed.String(), "/"))
+}
+
 func valueFloat(value *float64) float64 {
 	if value == nil {
 		return 0
@@ -519,15 +597,15 @@ func valueFloat(value *float64) float64 {
 func usageDateRange(filter UsageFilter) (time.Time, time.Time) {
 	now := time.Now().UTC()
 	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if filter.ToDay != nil {
+		to = filter.ToDay.UTC()
+	}
 	from := to.AddDate(0, 0, -29)
 	if filter.Days > 0 && filter.Days <= 365 {
 		from = to.AddDate(0, 0, -(filter.Days - 1))
 	}
 	if filter.FromDay != nil {
 		from = filter.FromDay.UTC()
-	}
-	if filter.ToDay != nil {
-		to = filter.ToDay.UTC()
 	}
 	// Keep analytical queries bounded even when called outside the HTTP API.
 	// The daily rollup is intended for a one-year window; older data remains
@@ -575,7 +653,8 @@ func bucketDate(day time.Time, granularity string) time.Time {
 func dimensionValue(row UsageRow, dimension string) (string, string) {
 	switch dimension {
 	case "upstream":
-		return fmt.Sprintf("%d", row.UpstreamID), row.UpstreamName
+		key := normalizeUsageBaseURL(row.UpstreamBaseURL)
+		return key, key
 	case "api_key":
 		return fmt.Sprintf("%d", row.APIKeyID), row.APIKeyName
 	case "group":
@@ -601,6 +680,10 @@ func finalizeUsageRow(row *UsageRow) {
 		}
 		reqRate := float64(row.CacheHitRequests) / float64(row.UsageRequests)
 		row.RequestHitRate = &reqRate
+	}
+	if row.Requests > 0 {
+		coverage := float64(row.CostKnownRequests) / float64(row.Requests)
+		row.CostCoverage = &coverage
 	}
 }
 
@@ -644,6 +727,30 @@ func (s *Store) CleanupDailyUsage(ctx context.Context, before time.Time) error {
 				ORDER BY day
 				LIMIT $2
 			)`, before, batchSize)
+		if err != nil {
+			return err
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil || deleted < batchSize {
+			return err
+		}
+	}
+}
+
+func (s *Store) CleanupHourlyUsage(ctx context.Context, before time.Time) error {
+	const batchSize = 1000
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := s.db.ExecContext(ctx, `
+			DELETE FROM hourly_usage
+			WHERE ctid IN (
+				SELECT ctid FROM hourly_usage
+				WHERE hour < $1
+				ORDER BY hour
+				LIMIT $2
+			)`, before.UTC(), batchSize)
 		if err != nil {
 			return err
 		}

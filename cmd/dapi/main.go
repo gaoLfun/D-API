@@ -94,6 +94,7 @@ func run() error {
 		}
 	}()
 	go cleanup(ctx, db, cfg.LogRetention)
+	go refreshPricing(ctx, db)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -118,6 +119,21 @@ func run() error {
 			return nil
 		}
 		return err
+	}
+}
+
+func refreshPricing(ctx context.Context, database *store.Store) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		if err := database.RefreshPricingProfiles(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("pricing refresh failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -160,6 +176,9 @@ func cleanup(ctx context.Context, database *store.Store, retention time.Duration
 		}
 		if err := database.CleanupDailyUsage(ctx, before); err != nil && ctx.Err() == nil {
 			slog.Error("daily usage cleanup failed", "error", err)
+		}
+		if err := database.CleanupHourlyUsage(ctx, time.Now().Add(-90*24*time.Hour)); err != nil && ctx.Err() == nil {
+			slog.Error("hourly usage cleanup failed", "error", err)
 		}
 		if err := database.DeleteExpiredSessions(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("expired session cleanup failed", "error", err)

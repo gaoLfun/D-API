@@ -24,7 +24,7 @@ const upstreamColumns = `
 	enabled, priority, protocols, models, models_locked, model_aliases, connect_timeout_ms,
 	first_byte_timeout_ms, idle_timeout_ms, failure_threshold, cooldown_seconds,
 	health_status, consecutive_failures, circuit_open_until, last_check_at, last_error,
-	balance, created_at, updated_at`
+	balance, created_at, updated_at, pricing_profile_id`
 
 func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 	records, err := s.ListUpstreamRecords(ctx)
@@ -103,13 +103,13 @@ func (s *Store) CreateUpstream(ctx context.Context, upstream core.Upstream) (int
 		INSERT INTO upstreams(
 			name,kind,base_url,api_key_encrypted,access_token_encrypted,user_id_encrypted,
 			enabled,priority,protocols,models,models_locked,model_aliases,connect_timeout_ms,
-			first_byte_timeout_ms,idle_timeout_ms,failure_threshold,cooldown_seconds
-		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			first_byte_timeout_ms,idle_timeout_ms,failure_threshold,cooldown_seconds,pricing_profile_id
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 		RETURNING id`,
 		upstream.Name, upstream.Kind, upstream.BaseURL, apiKey, accessToken, userID,
 		upstream.Enabled, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
 		upstream.ConnectTimeout.Milliseconds(), upstream.FirstByteTimeout.Milliseconds(),
-		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()),
+		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), pricingProfileIDArg(upstream.PricingProfileID),
 	).Scan(&id)
 	return id, err
 }
@@ -124,12 +124,12 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) erro
 			name=$1,kind=$2,base_url=$3,api_key_encrypted=$4,access_token_encrypted=$5,
 			user_id_encrypted=$6,enabled=$7,priority=$8,protocols=$9,models=$10,models_locked=$11,
 			model_aliases=$12,connect_timeout_ms=$13,first_byte_timeout_ms=$14,
-			idle_timeout_ms=$15,failure_threshold=$16,cooldown_seconds=$17,updated_at=now()
-		WHERE id=$18`,
+			idle_timeout_ms=$15,failure_threshold=$16,cooldown_seconds=$17,pricing_profile_id=$18,updated_at=now()
+		WHERE id=$19`,
 		upstream.Name, upstream.Kind, upstream.BaseURL, apiKey, accessToken, userID,
 		upstream.Enabled, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
 		upstream.ConnectTimeout.Milliseconds(), upstream.FirstByteTimeout.Milliseconds(),
-		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), upstream.ID,
+		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), pricingProfileIDArg(upstream.PricingProfileID), upstream.ID,
 	)
 	if err != nil {
 		return err
@@ -139,6 +139,13 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) erro
 		return ErrNotFound
 	}
 	return nil
+}
+
+func pricingProfileIDArg(id *int64) any {
+	if id == nil {
+		return nil
+	}
+	return nullableID(*id)
 }
 
 func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
@@ -236,7 +243,7 @@ func (s *Store) scanUpstream(row scanner) (UpstreamRecord, error) {
 		&record.Enabled, &record.Priority, pq.Array(&record.Protocols), pq.Array(&record.Models), &record.ModelsLocked, &aliases,
 		&connectMS, &firstByteMS, &idleMS, &record.FailureThreshold, &cooldownSeconds,
 		&record.HealthStatus, &record.ConsecutiveFailure, &record.CircuitOpenUntil, &record.LastCheckAt,
-		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt,
+		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt, &record.PricingProfileID,
 	)
 	if err != nil {
 		return UpstreamRecord{}, err

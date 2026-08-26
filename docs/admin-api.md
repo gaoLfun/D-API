@@ -44,6 +44,9 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `GET/POST/DELETE` | `/api/admin/channels[/{id}]` | Webhook/邮件渠道 |
 | `GET/POST/PUT/DELETE` | `/api/admin/alert-rules[/{id}]` | 告警规则 |
 | `GET/PUT` | `/api/admin/settings` | 路由最大尝试次数 |
+| `GET` | `/api/admin/pricing` | 价格档案和 USD/CNY 汇率 |
+| `POST/PUT/DELETE` | `/api/admin/pricing/profiles[/{id}]` | 管理价格档案 |
+| `POST` | `/api/admin/pricing/refresh` | 检查内置价格来源 |
 
 ## 上游
 
@@ -80,6 +83,38 @@ HTTP(S) URL 和指向回环、私网、链路本地、组播、CGNAT 或云元�
 
 模型测试会发送真实的最小请求，可能消耗上游额度。NewAPI 按模型选择
 Chat 或 Responses；Sub2API 先做源站 HEAD，再发送带算术 challenge 的模型请求。
+
+## 价格档案与成本估算
+
+上游可通过 `pricing_profile_id` 绑定一个价格档案。价格档案按模型记录输入、
+输出、缓存读和缓存写的 **USD / 百万 Token** 单价：
+
+```json
+{
+  "name": "自定义价格",
+  "provider": "Example",
+  "source_url": "https://example.com/pricing",
+  "source_version": "2026-08",
+  "prices": [{
+    "model": "example-model",
+    "input_usd_per_million": 1,
+    "output_usd_per_million": 2,
+    "cache_read_usd_per_million": 0.2,
+    "cache_write_usd_per_million": 0.4
+  }]
+}
+```
+
+`GET /api/admin/pricing` 返回 `profiles` 和 `usd_cny_rate`（默认 7.2）。
+`POST /api/admin/pricing/profiles` 创建档案并返回 `201 {"id":123}`；更新和
+删除分别使用 `PUT`、`DELETE`。数据库首次迁移会内置 OpenAI、Anthropic 和
+Google Gemini 的价格快照，可按需修改或删除。
+
+`POST /api/admin/pricing/refresh` 只对内置来源执行 HTTP HEAD 检查并更新
+`last_refreshed_at`，不会抓取或自动改写价格；自定义档案永远由管理员维护。
+请求日志和用量统计会在上游已绑定档案、模型匹配且请求包含 Token 用量时计算
+`cost_usd`。找不到价格或 Token 缺失时成本为空，并通过覆盖率字段标示未知；
+该数值仅用于运营估算，不代表供应商账单，也不执行扣费。
 
 ## 分组与路由范围
 
@@ -148,8 +183,8 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 | `upstream_id`/`api_key_id`/`group_id`/`protocol`/`model` | 可选筛选条件 |
 
 响应同时提供 `daily`、`items`、`totals` 和 `summary` 字段，包含请求、成功、
-输入/输出 Token、缓存读写、缓存命中率、平均耗时和 P95 耗时。缺少上游
-usage 字段时对应数值保持未知或为零，不会推测价格。
+输入/输出 Token、缓存读写、缓存命中率、平均耗时、P95 耗时、`cost_usd` 和
+成本覆盖率。缺少上游 usage 字段或价格档案时对应成本保持未知，不会推测价格。
 
 ## 通知、告警和设置
 

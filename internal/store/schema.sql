@@ -50,6 +50,34 @@ CREATE INDEX IF NOT EXISTS upstreams_protocols_idx ON upstreams USING GIN(protoc
 CREATE INDEX IF NOT EXISTS upstreams_models_idx ON upstreams USING GIN(models);
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS models_locked BOOLEAN NOT NULL DEFAULT FALSE;
 
+CREATE TABLE IF NOT EXISTS pricing_profiles (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    source_version TEXT NOT NULL DEFAULT '',
+    last_refreshed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pricing_model_prices (
+    id BIGSERIAL PRIMARY KEY,
+    profile_id BIGINT NOT NULL REFERENCES pricing_profiles(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_usd_per_million NUMERIC(20,8) NOT NULL DEFAULT 0,
+    output_usd_per_million NUMERIC(20,8) NOT NULL DEFAULT 0,
+    cache_read_usd_per_million NUMERIC(20,8) NOT NULL DEFAULT 0,
+    cache_write_usd_per_million NUMERIC(20,8) NOT NULL DEFAULT 0,
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to TIMESTAMPTZ,
+    source TEXT NOT NULL DEFAULT '',
+    UNIQUE(profile_id, model, valid_from)
+);
+CREATE INDEX IF NOT EXISTS pricing_model_prices_lookup_idx ON pricing_model_prices(profile_id, model, valid_from DESC);
+
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS pricing_profile_id BIGINT REFERENCES pricing_profiles(id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS groups (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -99,6 +127,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cached_input_tokens BIGINT,
     cache_creation_input_tokens BIGINT,
     uncached_input_tokens BIGINT,
+    cost_usd NUMERIC(20,8),
     error_code TEXT NOT NULL DEFAULT '',
     client_ip TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -107,6 +136,7 @@ ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS ttfb_ms BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS ttft_ms BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS uncached_input_tokens BIGINT;
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(20,8);
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS group_id BIGINT;
 CREATE INDEX IF NOT EXISTS request_logs_created_idx ON request_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS request_logs_upstream_idx ON request_logs(upstream_id, created_at DESC);
@@ -125,6 +155,8 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     input_tokens BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0,
     cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cost_usd NUMERIC(20,8) NOT NULL DEFAULT 0,
+    cost_known_requests BIGINT NOT NULL DEFAULT 0,
     cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     cache_creation_usage_requests BIGINT NOT NULL DEFAULT 0,
     uncached_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -140,8 +172,33 @@ ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_creation_usage_requests B
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS uncached_input_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS usage_requests BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_hit_requests BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(20,8) NOT NULL DEFAULT 0;
+ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cost_known_requests BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_api_key_id_fkey;
 ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_upstream_id_fkey;
+
+CREATE TABLE IF NOT EXISTS hourly_usage (
+    hour TIMESTAMPTZ NOT NULL,
+    api_key_id BIGINT NOT NULL,
+    group_id BIGINT NOT NULL DEFAULT 0,
+    upstream_id BIGINT NOT NULL,
+    protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests BIGINT NOT NULL DEFAULT 0,
+    successes BIGINT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_usage_requests BIGINT NOT NULL DEFAULT 0,
+    uncached_input_tokens BIGINT NOT NULL DEFAULT 0,
+    usage_requests BIGINT NOT NULL DEFAULT 0,
+    cache_hit_requests BIGINT NOT NULL DEFAULT 0,
+    cost_usd NUMERIC(20,8) NOT NULL DEFAULT 0,
+    cost_known_requests BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY(hour, api_key_id, group_id, upstream_id, protocol, model)
+);
+CREATE INDEX IF NOT EXISTS hourly_usage_hour_idx ON hourly_usage(hour);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id BIGSERIAL PRIMARY KEY,
@@ -224,6 +281,26 @@ CREATE TABLE IF NOT EXISTS settings (
     value JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+INSERT INTO settings(key,value) VALUES('usd_cny_rate','7.2'::jsonb) ON CONFLICT(key) DO NOTHING;
+
+INSERT INTO pricing_profiles(name,provider,source_url,source_version)
+VALUES
+    ('OpenAI','OpenAI','https://openai.com/api/pricing/','snapshot-2026-01'),
+    ('Anthropic','Anthropic','https://www.anthropic.com/pricing#api','snapshot-2026-01'),
+    ('Google Gemini','Google','https://ai.google.dev/gemini-api/docs/pricing','snapshot-2026-01')
+ON CONFLICT(name) DO NOTHING;
+INSERT INTO pricing_model_prices(profile_id,model,input_usd_per_million,output_usd_per_million,cache_read_usd_per_million,cache_write_usd_per_million,source)
+SELECT p.id,v.model,v.input,v.output,v.cache_read,v.cache_write,'built-in snapshot'
+FROM pricing_profiles p
+JOIN (VALUES
+    ('OpenAI','gpt-4o',2.5,10,1.25,0),
+    ('OpenAI','gpt-4o-mini',0.15,0.6,0.075,0),
+    ('Anthropic','claude-3-5-sonnet-20241022',3,15,0.3,3.75),
+    ('Anthropic','claude-3-7-sonnet-20250219',3,15,0.3,3.75),
+    ('Google Gemini','gemini-2.0-flash',0.1,0.4,0.025,0),
+    ('Google Gemini','gemini-2.5-pro',1.25,10,0.3125,0)
+) AS v(provider,model,input,output,cache_read,cache_write) ON v.provider=p.name
+WHERE NOT EXISTS (SELECT 1 FROM pricing_model_prices m WHERE m.profile_id=p.id AND m.model=v.model);
 
 -- The first migration keeps existing clients on the current global route pool.
 INSERT INTO groups(name, enabled) VALUES('默认分组', TRUE) ON CONFLICT(name) DO NOTHING;

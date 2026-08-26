@@ -45,6 +45,6 @@ export function connectionTestText(result: { status?: string; status_code?: numb
   if (result.status !== 'healthy') return result.error || '连接失败'
   const parts = ['连接正常']
   if (result.status_code) parts.push(`HTTP ${result.status_code}`)
-  if (Number.isFinite(result.latency)) parts.push(`${Math.round(Number(result.latency) / 1_000_000)} ms`)
+  if (Number.isFinite(result.latency)) parts.push(`${(Number(result.latency) / 1_000_000_000).toFixed(2)} s`)
   return parts.join(' · ')
 }

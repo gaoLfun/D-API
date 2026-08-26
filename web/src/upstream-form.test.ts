@@ -42,7 +42,7 @@ describe('upstream form', () => {
   })
 
   it('格式化连通性结果', () => {
-    expect(connectionTestText({ status: 'healthy', status_code: 200, latency: 12_400_000 })).toBe('连接正常 · HTTP 200 · 12 ms')
+    expect(connectionTestText({ status: 'healthy', status_code: 200, latency: 12_400_000 })).toBe('连接正常 · HTTP 200 · 0.01 s')
     expect(connectionTestText({ status: 'unhealthy', error: 'HTTP 401' })).toBe('HTTP 401')
   })
 })

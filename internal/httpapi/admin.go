@@ -112,6 +112,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/admin/alert-rules/{id}", s.admin(http.HandlerFunc(s.deleteAlertRule)))
 	mux.Handle("GET /api/admin/settings", s.admin(http.HandlerFunc(s.getSettings)))
 	mux.Handle("PUT /api/admin/settings", s.admin(http.HandlerFunc(s.updateSettings)))
+	mux.Handle("GET /api/admin/pricing", s.admin(http.HandlerFunc(s.pricing)))
+	mux.Handle("POST /api/admin/pricing/profiles", s.admin(http.HandlerFunc(s.createPricingProfile)))
+	mux.Handle("PUT /api/admin/pricing/profiles/{id}", s.admin(http.HandlerFunc(s.updatePricingProfile)))
+	mux.Handle("DELETE /api/admin/pricing/profiles/{id}", s.admin(http.HandlerFunc(s.deletePricingProfile)))
+	mux.Handle("POST /api/admin/pricing/refresh", s.admin(http.HandlerFunc(s.refreshPricing)))
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -245,11 +250,12 @@ type upstreamPayload struct {
 	UserID                  string            `json:"user_id"`
 	ClearBalanceCredentials bool              `json:"clear_balance_credentials"`
 	Enabled                 *bool             `json:"enabled"`
-	Priority                int               `json:"priority"`
+	Priority                *int              `json:"priority"`
 	Protocols               []string          `json:"protocols"`
 	Models                  []string          `json:"models"`
 	ModelsLocked            *bool             `json:"models_locked"`
 	ModelAliases            map[string]string `json:"model_aliases"`
+	PricingProfileID        *int64            `json:"pricing_profile_id"`
 	ConnectTimeoutMS        int               `json:"connect_timeout_ms"`
 	FirstByteTimeoutMS      int               `json:"first_byte_timeout_ms"`
 	IdleTimeoutMS           int               `json:"idle_timeout_ms"`
@@ -271,6 +277,7 @@ type upstreamView struct {
 	Models              []string          `json:"models"`
 	ModelsLocked        bool              `json:"models_locked"`
 	ModelAliases        map[string]string `json:"model_aliases"`
+	PricingProfileID    *int64            `json:"pricing_profile_id,omitempty"`
 	ConnectTimeoutMS    int64             `json:"connect_timeout_ms"`
 	FirstByteTimeoutMS  int64             `json:"first_byte_timeout_ms"`
 	IdleTimeoutMS       int64             `json:"idle_timeout_ms"`
@@ -638,6 +645,10 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.store.CreateGroup(r.Context(), core.Group{Name: strings.TrimSpace(input.Name), Enabled: enabled, UpstreamIDs: cleanGroupIDs(input.UpstreamIDs)})
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidGroup) {
+			writeError(w, http.StatusBadRequest, "invalid_group", "分组包含不存在的上游")
+			return
+		}
 		writeStoreError(w, err)
 		return
 	}
@@ -1027,7 +1038,7 @@ func validateChannel(channel store.NotificationChannel) error {
 	}
 	var recipient string
 	if json.Unmarshal(rawTo, &recipient) == nil {
-		if len(recipient) > 4096 || strings.ContainsAny(recipient, "\r\n") {
+		if strings.TrimSpace(recipient) == "" || len(recipient) > 4096 || strings.ContainsAny(recipient, "\r\n") {
 			return errors.New("invalid SMTP recipients")
 		}
 	} else {
@@ -1036,7 +1047,7 @@ func validateChannel(channel store.NotificationChannel) error {
 			return errors.New("invalid SMTP recipients")
 		}
 		for _, value := range recipients {
-			if len(value) > 320 || strings.ContainsAny(value, "\r\n") {
+			if strings.TrimSpace(value) == "" || len(value) > 320 || strings.ContainsAny(value, "\r\n") {
 				return errors.New("invalid SMTP recipients")
 			}
 		}
@@ -1138,6 +1149,84 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, input)
 }
 
+func (s *Server) pricing(w http.ResponseWriter, r *http.Request) {
+	profiles, err := s.store.ListPricingProfiles(r.Context())
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	rate, err := s.store.USDCNYRate(r.Context())
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles, "usd_cny_rate": rate})
+}
+
+func (s *Server) createPricingProfile(w http.ResponseWriter, r *http.Request) {
+	var input store.PricingProfile
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", err.Error())
+		return
+	}
+	id, err := s.store.SavePricingProfile(r.Context(), input)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidPricing) {
+			writeError(w, http.StatusBadRequest, "invalid_pricing", "价格档案无效")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "pricing_profile.create", "pricing_profile", id, map[string]any{"name": input.Name})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) updatePricingProfile(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var input store.PricingProfile
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_pricing", err.Error())
+		return
+	}
+	input.ID = id
+	if _, err := s.store.SavePricingProfile(r.Context(), input); err != nil {
+		if errors.Is(err, store.ErrInvalidPricing) {
+			writeError(w, http.StatusBadRequest, "invalid_pricing", "价格档案无效")
+			return
+		}
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "pricing_profile.update", "pricing_profile", id, map[string]any{"name": input.Name})
+	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+func (s *Server) refreshPricing(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.RefreshPricingProfiles(r.Context()); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "pricing.refresh", "pricing_profile", 0, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"checked_at": time.Now().UTC(), "mode": "source-check"})
+}
+
+func (s *Server) deletePricingProfile(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DeletePricingProfile(r.Context(), id); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.audit(r, "pricing_profile.delete", "pricing_profile", id, nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) admin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameOrigin(r) {
@@ -1200,9 +1289,15 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 		enabled = *p.Enabled
 	}
 	apiKey, accessToken, userID := p.APIKey, p.AccessToken, p.UserID
+	priority := 100
+	pricingProfileID := p.PricingProfileID
 	modelsLocked := false
 	if id != 0 {
+		priority = existing.Priority
 		modelsLocked = existing.ModelsLocked
+		if pricingProfileID == nil {
+			pricingProfileID = existing.PricingProfileID
+		}
 		if apiKey == "" {
 			apiKey = existing.APIKey
 		}
@@ -1219,13 +1314,17 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 	if p.ModelsLocked != nil {
 		modelsLocked = *p.ModelsLocked
 	}
+	if p.Priority != nil {
+		priority = *p.Priority
+	}
 	if p.Kind == "sub2api" {
 		accessToken, userID = "", ""
 	}
 	return core.Upstream{
 		ID: id, Name: name, Kind: p.Kind, BaseURL: base, APIKey: apiKey, AccessToken: accessToken, UserID: userID,
-		Enabled: enabled, Priority: defaultInt(p.Priority, 100), Protocols: p.Protocols, Models: cleanStrings(p.Models),
+		Enabled: enabled, Priority: priority, Protocols: p.Protocols, Models: cleanStrings(p.Models),
 		ModelsLocked: modelsLocked, ModelAliases: p.ModelAliases, ConnectTimeout: time.Duration(defaultInt(p.ConnectTimeoutMS, 5000)) * time.Millisecond,
+		PricingProfileID: pricingProfileID,
 		FirstByteTimeout: time.Duration(defaultInt(p.FirstByteTimeoutMS, 60000)) * time.Millisecond,
 		IdleTimeout:      time.Duration(defaultInt(p.IdleTimeoutMS, 300000)) * time.Millisecond,
 		FailureThreshold: defaultInt(p.FailureThreshold, 3), Cooldown: time.Duration(defaultInt(p.CooldownSeconds, 60)) * time.Second,
@@ -1237,7 +1336,7 @@ func viewUpstream(record store.UpstreamRecord) upstreamView {
 		ID: record.ID, Name: record.Name, Kind: record.Kind, BaseURL: record.BaseURL,
 		HasAPIKey: record.APIKey != "", HasAccessToken: record.AccessToken != "", HasUserID: record.UserID != "",
 		Enabled: record.Enabled, Priority: record.Priority, Protocols: record.Protocols, Models: record.Models, ModelsLocked: record.ModelsLocked,
-		ModelAliases: record.ModelAliases, ConnectTimeoutMS: record.ConnectTimeout.Milliseconds(),
+		ModelAliases: record.ModelAliases, PricingProfileID: record.PricingProfileID, ConnectTimeoutMS: record.ConnectTimeout.Milliseconds(),
 		FirstByteTimeoutMS: record.FirstByteTimeout.Milliseconds(), IdleTimeoutMS: record.IdleTimeout.Milliseconds(),
 		FailureThreshold: record.FailureThreshold, CooldownSeconds: int64(record.Cooldown.Seconds()),
 		HealthStatus: record.HealthStatus, ConsecutiveFailures: record.ConsecutiveFailure,
@@ -1300,11 +1399,14 @@ func validateUpstreamPayload(p upstreamPayload, name, base string) error {
 			return errors.New("模型别名无效")
 		}
 	}
+	if p.Priority != nil && (*p.Priority < 0 || *p.Priority > 1000000) {
+		return errors.New("优先级超出范围")
+	}
 	for _, item := range []struct {
 		value    int
 		name     string
 		min, max int
-	}{{p.Priority, "优先级", 0, 1000000}, {p.ConnectTimeoutMS, "连接超时", 0, 120000}, {p.FirstByteTimeoutMS, "首包超时", 0, 600000}, {p.IdleTimeoutMS, "空闲超时", 0, 1800000}, {p.FailureThreshold, "失败阈值", 0, 20}, {p.CooldownSeconds, "冷却时间", 0, 86400}} {
+	}{{p.ConnectTimeoutMS, "连接超时", 0, 120000}, {p.FirstByteTimeoutMS, "首包超时", 0, 600000}, {p.IdleTimeoutMS, "空闲超时", 0, 1800000}, {p.FailureThreshold, "失败阈值", 0, 20}, {p.CooldownSeconds, "冷却时间", 0, 86400}} {
 		if item.value < item.min || item.value > item.max {
 			return fmt.Errorf("%s超出范围", item.name)
 		}

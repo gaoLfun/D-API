@@ -7,6 +7,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 interface UsageRow {
   day?: string
+  hour?: string
   date?: string
   label?: string
   dimension?: string
@@ -28,16 +29,17 @@ interface UsageRow {
   average_duration_ms?: number
   p95_duration_ms?: number
   p95_ms?: number
+  cost_usd?: number
 }
 
-type UsageMetric = 'overview' | 'requests' | 'tokens' | 'latency' | 'cache'
+type UsageMetric = 'overview' | 'requests' | 'tokens' | 'latency' | 'cache' | 'cost'
 
 const props = withDefaults(defineProps<{ rows: UsageRow[]; theme: 'light' | 'dark'; rangeLabel?: string; metric?: UsageMetric }>(), {
   rangeLabel: '近期',
   metric: 'overview',
 })
 const chartLabel = computed(() => {
-  const metric = { overview: '请求与 Token', requests: '请求与成功', tokens: '输入、输出与缓存 Token', cache: '缓存读写 Token', latency: '平均与 P95 耗时' }[props.metric]
+  const metric = { overview: '请求与 Token', requests: '请求与成功', tokens: '输入、输出与缓存 Token', cache: '缓存读写 Token', latency: '平均与 P95 耗时', cost: '估算成本' }[props.metric]
   return `${props.rangeLabel}${metric}趋势图；详细数据见下方明细表`
 })
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -57,7 +59,10 @@ function rowTokens(row: UsageRow) {
 }
 
 function rowLabel(row: UsageRow) {
-  const day = String(row.day || row.date || '').slice(5, 10)
+  const source = row.hour || row.day || row.date || ''
+  const day = row.hour
+    ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(String(source)))
+    : String(source).slice(5, 10)
   const dimension = row.label || row.dimension_label || row.upstream_name || row.api_key_name || row.protocol || row.model || ''
   const raw = dimension ? `${day} · ${dimension}` : day
   return String(raw).length > 18 ? `${String(raw).slice(0, 17)}…` : String(raw)
@@ -73,6 +78,18 @@ function color(name: string, fallback: string) {
 
 function datasets() {
   const rows = props.rows
+  if (props.metric === 'cost') return [{
+    type: 'bar' as const,
+    label: '估算成本 USD',
+    data: rows.map((row) => nullable(row.cost_usd)),
+    backgroundColor: color('--chart-cost', '#176d4f'),
+    hoverBackgroundColor: color('--accent-hover', '#105b40'),
+    borderRadius: 3,
+    borderSkipped: false,
+    maxBarThickness: 22,
+    yAxisID: 'value',
+    order: 2,
+  }]
   if (props.metric === 'tokens') return [
     { type: 'bar' as const, label: '输入 Token', data: rows.map((row) => nullable(row.input_tokens)), backgroundColor: color('--chart-bar', '#2f8968'), borderRadius: 3, borderSkipped: false, maxBarThickness: 22, yAxisID: 'value', order: 2 },
     { type: 'line' as const, label: '输出 Token', data: rows.map((row) => nullable(row.output_tokens)), borderColor: color('--chart-line', '#3978a8'), backgroundColor: color('--chart-line', '#3978a8'), borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: .32, yAxisID: 'value', order: 1 },
@@ -80,8 +97,8 @@ function datasets() {
     { type: 'line' as const, label: '缓存写入', data: rows.map((row) => nullable(row.cache_creation_input_tokens ?? row.cache_write_tokens)), borderColor: color('--chart-cache-write', '#8b5ba8'), backgroundColor: color('--chart-cache-write', '#8b5ba8'), borderWidth: 1.5, borderDash: [2, 2], pointRadius: 0, tension: .32, yAxisID: 'value', order: 1 },
   ]
   if (props.metric === 'latency') return [
-    { type: 'line' as const, label: '平均耗时', data: rows.map((row) => row.avg_duration_ms ?? row.average_duration_ms ?? null), borderColor: color('--chart-line', '#3978a8'), backgroundColor: color('--chart-line', '#3978a8'), borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: .32, yAxisID: 'value', order: 1 },
-    { type: 'line' as const, label: 'P95 耗时', data: rows.map((row) => row.p95_duration_ms ?? row.p95_ms ?? null), borderColor: color('--warning', '#b0782d'), backgroundColor: color('--warning', '#b0782d'), borderWidth: 2, borderDash: [5, 4], pointRadius: 0, pointHoverRadius: 3, tension: .32, yAxisID: 'value', order: 1 },
+    { type: 'line' as const, label: '平均耗时', data: rows.map((row) => { const value = row.avg_duration_ms ?? row.average_duration_ms; return value == null ? null : Number(value) / 1000 }), borderColor: color('--chart-line', '#3978a8'), backgroundColor: color('--chart-line', '#3978a8'), borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: .32, yAxisID: 'value', order: 1 },
+    { type: 'line' as const, label: 'P95 耗时', data: rows.map((row) => { const value = row.p95_duration_ms ?? row.p95_ms; return value == null ? null : Number(value) / 1000 }), borderColor: color('--warning', '#b0782d'), backgroundColor: color('--warning', '#b0782d'), borderWidth: 2, borderDash: [5, 4], pointRadius: 0, pointHoverRadius: 3, tension: .32, yAxisID: 'value', order: 1 },
   ]
   if (props.metric === 'cache') return [
     { type: 'bar' as const, label: '缓存读取', data: rows.map((row) => nullable(row.cached_input_tokens ?? row.cache_read_tokens)), backgroundColor: color('--chart-cache-read', '#b0782d'), borderRadius: 3, borderSkipped: false, maxBarThickness: 22, yAxisID: 'value', order: 2 },
@@ -177,7 +194,7 @@ async function renderChart() {
           borderWidth: 1,
           padding: 10,
           callbacks: {
-            label: (context) => `${context.dataset.label}: ${context.raw == null ? '—' : Number(context.raw).toLocaleString('zh-CN')}${context.dataset.label === '请求' ? ' 次' : context.dataset.label?.includes('耗时') ? ' ms' : ''}`,
+            label: (context) => `${context.dataset.label}: ${context.raw == null ? '—' : Number(context.raw).toLocaleString('zh-CN', { maximumFractionDigits: context.dataset.label?.includes('成本') ? 6 : context.dataset.label?.includes('耗时') ? 2 : 1 })}${context.dataset.label === '请求' ? ' 次' : context.dataset.label?.includes('耗时') ? ' s' : context.dataset.label?.includes('成本') ? ' USD' : ''}`,
             afterBody: (contexts) => {
               const row = props.rows[contexts[0]?.dataIndex ?? -1]
               if (!row?.requests || row.successes == null || props.metric !== 'requests') return ''

@@ -25,3 +25,12 @@ func TestUsageDateRangeNormalizesReversedDates(t *testing.T) {
 		t.Fatalf("range = %s..%s, want equal dates", start, end)
 	}
 }
+
+func TestUsageDateRangeEndsAtExplicitToDay(t *testing.T) {
+	to := time.Date(2020, 1, 30, 0, 0, 0, 0, time.UTC)
+	start, end := usageDateRange(UsageFilter{Days: 30, ToDay: &to})
+	wantStart := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !start.Equal(wantStart) || !end.Equal(to) {
+		t.Fatalf("range = %s..%s, want %s..%s", start, end, wantStart, to)
+	}
+}

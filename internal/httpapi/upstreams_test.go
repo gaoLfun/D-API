@@ -50,6 +50,26 @@ func TestSub2APIPayloadDropsNewAPICredentials(t *testing.T) {
 	}
 }
 
+func TestUpstreamPayloadPreservesPricingAndAcceptsZeroPriority(t *testing.T) {
+	profileID := int64(9)
+	existing := core.Upstream{APIKey: "saved-key", Priority: 15, PricingProfileID: &profileID}
+	input := upstreamPayload{
+		Name: "primary", Kind: "newapi", BaseURL: "https://example.com",
+		Protocols: []string{core.ProtocolChat},
+	}
+	upstream, err := input.upstream(7, existing)
+	if err != nil || upstream.Priority != 15 || upstream.PricingProfileID == nil || *upstream.PricingProfileID != profileID {
+		t.Fatalf("preserved upstream = %#v, %v", upstream, err)
+	}
+
+	zero := 0
+	input.Priority = &zero
+	upstream, err = input.upstream(7, existing)
+	if err != nil || upstream.Priority != 0 {
+		t.Fatalf("zero priority upstream = %#v, %v", upstream, err)
+	}
+}
+
 type modelTestOperations struct {
 	upstream core.Upstream
 	model    string

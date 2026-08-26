@@ -94,6 +94,46 @@ func TestStoreLifecycle(t *testing.T) {
 	if err != nil || !record.ModelsLocked {
 		t.Fatalf("explicit model lock was not saved: %#v %v", record, err)
 	}
+	profileID, err := database.SavePricingProfile(ctx, PricingProfile{
+		Name: "test pricing",
+		Prices: []PricingModelPrice{
+			{Model: "model", InputUSDPerMillion: 1},
+			{Model: "removed-model", InputUSDPerMillion: 2},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.PricingProfileID = &profileID
+	if err := database.UpdateUpstream(ctx, record.Upstream); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SavePricingProfile(ctx, PricingProfile{
+		ID: profileID, Name: "test pricing",
+		Prices: []PricingModelPrice{{Model: "model", InputUSDPerMillion: 1}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := database.ListPricingProfiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundProfile := false
+	for _, profile := range profiles {
+		if profile.ID == profileID {
+			foundProfile = true
+			if len(profile.Prices) != 1 || profile.Prices[0].Model != "model" {
+				t.Fatalf("updated pricing models = %#v", profile.Prices)
+			}
+		}
+	}
+	if !foundProfile {
+		t.Fatalf("updated pricing profile %d was not found", profileID)
+	}
+	oneMillion := int64(1_000_000)
+	if cost, err := database.RequestCost(ctx, upstreamID, "removed-model", core.Usage{InputTokens: &oneMillion}, time.Now()); err != nil || cost != nil {
+		t.Fatalf("removed model cost = %#v, %v", cost, err)
+	}
 	status, err := database.SaveHealth(ctx, upstreamID, false, "HTTP 503", false)
 	if err != nil || status != "degraded" {
 		t.Fatalf("first failure status=%q err=%v", status, err)
