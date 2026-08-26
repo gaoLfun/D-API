@@ -16,7 +16,7 @@ D-API 是面向 NewAPI 和 Sub2API 上游的轻量级单管理员网关。它按
 - 自动故障切换、健康检查、熔断和每上游独立超时
 - 支持 OpenAI Responses、OpenAI Chat Completions 和 Anthropic Messages 接口
 - 模型探测、允许列表和客户端模型到上游模型的别名
-- 上游连通性测试和尽力而为的余额查询
+- 上游连通性测试、余额查询和余额耗尽自动暂停/恢复
 - 本地记录请求尝试过程和 Token 用量
 - 可按分组隔离上游，并限制协议和模型的客户端 API Key
 - 可选价格档案，提供 USD 成本估算和计价覆盖率

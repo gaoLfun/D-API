@@ -23,6 +23,10 @@ All notable changes to D-API will be documented in this file. The format is base
   preserving existing cost values and retained aggregates.
 - Dashboard topology view for inspecting client keys, group decisions, and
   normalized upstream clusters alongside the existing upstream status table.
+- Per-upstream balance protection that pauses exhausted routes, automatically
+  resumes recovered balances, and emits persisted notification events.
+- Per-upstream User-Agent policies shared by gateway forwarding and operational
+  probes, including Codex/OpenCode presets and custom values.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

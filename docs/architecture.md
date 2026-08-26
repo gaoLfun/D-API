@@ -84,6 +84,12 @@ but the committed stream cannot be replayed safely.
   consume upstream quota.
 - Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
   is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
+  Per-upstream balance protection pauses routing after two consecutive automatic
+  zero-balance results (or one manual refresh), persists that state in PostgreSQL,
+  and resumes after the first positive or unlimited balance result. Failed balance
+  queries break the confirmation sequence without resuming a paused upstream.
+  Pause/resume transitions are persisted as operational events and delivered to
+  enabled notification channels without requiring an alert rule.
 - The pricing refresh job downloads the structured LiteLLM model price file once
   per day and updates the managed OpenAI, Anthropic, and Google Gemini profiles
   atomically. Custom profiles remain user-managed and provide the fallback for
@@ -107,9 +113,9 @@ PostgreSQL, while gateway concurrency and login limits remain in process memory.
 The admin dashboard's upstream panel provides a tabular view and a topology view.
 The topology groups upstream entries by normalized base URL and shows the
 client-key to group-decision to upstream-cluster path, while preserving the
-priority and health state used by the gateway. It is an operational summary;
-actual routing still follows the persisted group membership and SQL eligibility
-filters described above.
+priority, health, and balance-pause state used by the gateway. It is an
+operational summary; actual routing still follows the persisted group membership
+and SQL eligibility filters described above.
 
 An upstream request is bounded by the global request lifetime, per-upstream
 connect/first-byte/idle timeouts, and a maximum buffered response size. The
@@ -117,6 +123,10 @@ outbound network guard resolves and validates destinations again immediately
 before dialing and disables redirects and environment proxy variables. This
 keeps probes, webhooks, SMTP, and normal forwarding behind the same egress
 boundary.
+
+Each upstream may optionally override User-Agent. The same configured value is
+used for gateway forwarding, health and balance probes, model discovery, and
+explicit model tests so compatibility behavior stays consistent across paths.
 
 ## Data and Security Boundaries
 

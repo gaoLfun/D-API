@@ -549,6 +549,9 @@ func upstreamRequest(in *http.Request, upstream core.Upstream, body []byte, prot
 	out.Header.Del("Content-Length")
 	out.Header.Del("X-Api-Key")
 	out.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	if upstream.UserAgent != "" {
+		out.Header.Set("User-Agent", upstream.UserAgent)
+	}
 	if protocol == core.ProtocolMessages {
 		out.Header.Set("X-Api-Key", upstream.APIKey)
 	}

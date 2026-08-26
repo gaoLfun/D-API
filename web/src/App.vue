@@ -11,8 +11,9 @@ import { ApiError, api, listOf } from './api'
 const UsageChart = defineAsyncComponent(() => import('./UsageChart.vue'))
 import {
   COMMON_UPSTREAM_MODELS, DEFAULT_UPSTREAM_PROTOCOLS, UPSTREAM_PROTOCOLS, bulkSetModels, connectionTestText, modelBatchSelection,
-  modelsForPayload, parseModelList, setModelSelected, usesNewAPICredentials,
+  modelsForPayload, parseModelList, setModelSelected, userAgentMode, userAgentValue, usesNewAPICredentials,
 } from './upstream-form'
+import type { UpstreamUserAgentMode } from './upstream-form'
 
 type View = 'dashboard' | 'groups' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels'
 type Theme = 'auto' | 'light' | 'dark'
@@ -24,7 +25,11 @@ interface Upstream {
   name: string
   kind: 'newapi' | 'sub2api'
   base_url: string
+  user_agent?: string
   enabled: boolean
+  balance_protection_enabled?: boolean
+  balance_suspended?: boolean
+  zero_balance_checks?: number
   priority: number
   protocols: string[]
   models: string[]
@@ -54,6 +59,8 @@ interface UpstreamGroup {
   total: number
   healthy: number
   enabled: number
+  available: number
+  balance_suspended: number
   circuit_open: number
   protocols: string[]
   models: string[]
@@ -243,7 +250,8 @@ let singleModelTestController: AbortController | null = null
 const upstreamFormElement = ref<HTMLFormElement | null>(null)
 const upstreamForm = reactive({
   name: '', kind: 'sub2api' as 'newapi' | 'sub2api', base_url: '', api_key: '', access_token: '', user_id: '',
-  enabled: true, priority: 100, protocols: [...DEFAULT_UPSTREAM_PROTOCOLS] as string[], models: '', aliases: '', connect_timeout_ms: 5000,
+  user_agent_mode: 'default' as UpstreamUserAgentMode, user_agent: '',
+  enabled: true, balance_protection_enabled: true, priority: 100, protocols: [...DEFAULT_UPSTREAM_PROTOCOLS] as string[], models: '', aliases: '', connect_timeout_ms: 5000,
   first_byte_timeout_ms: 60000, idle_timeout_ms: 300000, failure_threshold: 3, cooldown_seconds: 60, clear_balance_credentials: false, pricing_profile_id: 0,
 })
 const keyModal = ref(false)
@@ -305,8 +313,10 @@ const upstreamGroups = computed<UpstreamGroup[]>(() => {
     items,
     priority: Math.min(...items.map((item) => Number(item.priority ?? 0))),
     total: items.length,
-    healthy: items.filter((item) => item.enabled && item.health_status === 'healthy').length,
+    healthy: items.filter((item) => item.enabled && !item.balance_suspended && item.health_status === 'healthy').length,
     enabled: items.filter((item) => item.enabled).length,
+    available: items.filter((item) => item.enabled && !item.balance_suspended).length,
+    balance_suspended: items.filter((item) => item.enabled && item.balance_suspended).length,
     circuit_open: items.filter((item) => item.enabled && (item.health_status === 'open' || Boolean(item.circuit_open_until && new Date(item.circuit_open_until) > new Date()))).length,
     protocols: [...new Set(items.flatMap((item) => item.protocols || []))],
     models: [...new Set(items.flatMap((item) => item.models || []))],
@@ -832,17 +842,38 @@ function pricingProfileName(id?: number) {
 
 function groupStatusText(group: UpstreamGroup) {
   if (!group.enabled) return '已停用'
-  return group.healthy === group.enabled ? `正常 · ${group.healthy}/${group.enabled}` : group.healthy > 0 ? `部分正常 · ${group.healthy}/${group.enabled}` : `异常 · 0/${group.enabled}`
+  if (!group.available && group.balance_suspended) return `余额暂停 · ${group.balance_suspended}/${group.enabled}`
+  if (group.balance_suspended) return `部分可用 · ${group.available}/${group.enabled}`
+  return group.healthy === group.available ? `正常 · ${group.healthy}/${group.available}` : group.healthy > 0 ? `部分正常 · ${group.healthy}/${group.available}` : `异常 · 0/${group.available}`
 }
 
 function groupStatusTone(group: UpstreamGroup) {
-  if (!group.enabled || group.healthy === 0) return 'bad'
-  if (group.healthy < group.enabled) return 'warn'
+  if (!group.enabled || (!group.available && group.balance_suspended)) return 'warn'
+  if (!group.available || group.healthy === 0) return 'bad'
+  if (group.balance_suspended || group.healthy < group.available) return 'warn'
   return 'good'
 }
 
 function groupCircuitText(group: UpstreamGroup) {
   return group.circuit_open ? `熔断 ${group.circuit_open}/${group.enabled}` : '未熔断'
+}
+
+function upstreamRouteText(upstream: Upstream) {
+  if (!upstream.enabled) return '已停用'
+  if (upstream.balance_suspended) return '余额暂停'
+  return statusText(upstream.health_status)
+}
+
+function upstreamRouteTone(upstream: Upstream) {
+  if (!upstream.enabled || upstream.balance_suspended) return 'warn'
+  return statusTone(upstream.health_status)
+}
+
+function balanceProtectionText(upstream: Upstream) {
+  if (upstream.balance_protection_enabled === false) return '已关闭'
+  if (upstream.balance_suspended) return '已暂停路由'
+  if (upstream.zero_balance_checks) return `待确认 ${upstream.zero_balance_checks}/2`
+  return '保护中'
 }
 
 function topologyGroupUpstreams(group: Group) {
@@ -931,6 +962,8 @@ function openUpstream(item?: Upstream) {
   Object.assign(modelTestProgress, { running: false, stopped: false, total: 0, completed: 0 })
   Object.assign(upstreamForm, item ? {
     name: item.name, kind: item.kind, base_url: item.base_url, api_key: '', access_token: '', user_id: '', enabled: item.enabled,
+    balance_protection_enabled: item.balance_protection_enabled ?? true,
+    user_agent_mode: userAgentMode(item.user_agent || ''), user_agent: item.user_agent || '',
     priority: item.priority, protocols: [...(item.protocols || [])], models: (item.models || []).join(', '),
     aliases: Object.entries(item.model_aliases || {}).map(([from, to]) => `${from}=${to}`).join('\n'),
     connect_timeout_ms: item.connect_timeout_ms ?? 5000, first_byte_timeout_ms: item.first_byte_timeout_ms ?? 60000,
@@ -939,6 +972,8 @@ function openUpstream(item?: Upstream) {
     pricing_profile_id: item.pricing_profile_id ?? 0,
   } : {
     name: '', kind: 'sub2api', base_url: '', api_key: '', access_token: '', user_id: '', enabled: true, priority: 100,
+    balance_protection_enabled: true,
+    user_agent_mode: 'default', user_agent: '',
     protocols: [...DEFAULT_UPSTREAM_PROTOCOLS], models: '', aliases: '', connect_timeout_ms: 5000, first_byte_timeout_ms: 60000,
     idle_timeout_ms: 300000, failure_threshold: 3, cooldown_seconds: 60, clear_balance_credentials: false, pricing_profile_id: 0,
   })
@@ -952,8 +987,10 @@ function upstreamPayload() {
     if (from?.trim() && to.join('=').trim()) aliases[from.trim()] = to.join('=').trim()
   })
   const newapi = usesNewAPICredentials(upstreamForm.kind)
+  const { user_agent_mode: userAgentModeValue, ...payload } = upstreamForm
   return {
-    ...upstreamForm,
+    ...payload,
+    user_agent: userAgentValue(userAgentModeValue, upstreamForm.user_agent),
     base_url: upstreamForm.base_url.replace(/\/+$/, ''),
     access_token: newapi ? upstreamForm.access_token : '',
     user_id: newapi ? upstreamForm.user_id : '',
@@ -1670,7 +1707,7 @@ onBeforeUnmount(() => {
                 <tbody>
                   <tr v-for="item in shownDashUpstreams" :key="item.key" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
                     <td><span class="priority">{{ item.priority }}</span></td>
-                    <td><strong>{{ item.base_url }}</strong><small>{{ item.total }} 个 Key · {{ item.enabled }} 个启用</small></td>
+                    <td><strong>{{ item.base_url }}</strong><small>{{ item.total }} 个 Key · {{ item.available }} 个可路由</small></td>
                     <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span></td>
                   <td><strong class="usage-value">{{ fmtNumber(item.today_tokens) }} Token</strong><small>{{ fmtNumber(item.today_requests) }} 次请求</small></td>
                     <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small v-if="item.total > 1">展开查看余额</small></td>
@@ -1720,8 +1757,8 @@ onBeforeUnmount(() => {
                     <article v-for="item in shownDashUpstreams" :key="item.key" class="topology-node upstream-node" :class="groupStatusTone(item)" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
                       <div class="topology-node-heading"><strong :title="item.base_url">{{ item.base_url }}</strong><span class="priority-badge">P{{ item.priority }}</span></div>
                       <div class="topology-upstream-state"><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><span class="topology-circuit" :class="item.circuit_open ? 'bad' : 'muted'">{{ groupCircuitText(item) }}</span></div>
-                      <div class="topology-upstream-keys"><div v-for="key in item.items.slice(0, 6)" :key="key.id" class="topology-upstream-key"><span class="topology-key-dot" :class="key.health_status === 'healthy' ? 'healthy' : key.health_status === 'open' ? 'open' : 'unknown'">{{ (key.name || `#${key.id}`).slice(0, 1).toUpperCase() }}</span><strong :title="key.name">{{ key.name || `上游 Key #${key.id}` }}</strong><span class="topology-key-priority">P{{ key.priority }}</span><span class="status" :class="statusTone(key.health_status)"><i></i>{{ statusText(key.health_status) }}</span></div><span v-if="item.total > 6" class="topology-more">+ {{ item.total - 6 }} 个 Key，点击查看全部</span></div>
-                      <div class="topology-upstream-meta"><span>{{ item.healthy }}/{{ item.enabled }} 健康</span><span>{{ fmtNumber(item.today_requests) }} 次 · {{ fmtNumber(item.today_tokens) }} Token</span></div>
+                      <div class="topology-upstream-keys"><div v-for="key in item.items.slice(0, 6)" :key="key.id" class="topology-upstream-key"><span class="topology-key-dot" :class="key.health_status === 'healthy' && !key.balance_suspended ? 'healthy' : key.health_status === 'open' ? 'open' : 'unknown'">{{ (key.name || `#${key.id}`).slice(0, 1).toUpperCase() }}</span><strong :title="key.name">{{ key.name || `上游 Key #${key.id}` }}</strong><span class="topology-key-priority">P{{ key.priority }}</span><span class="status" :class="upstreamRouteTone(key)"><i></i>{{ upstreamRouteText(key) }}</span></div><span v-if="item.total > 6" class="topology-more">+ {{ item.total - 6 }} 个 Key，点击查看全部</span></div>
+                      <div class="topology-upstream-meta"><span>{{ item.healthy }}/{{ item.available }} 可用{{ item.balance_suspended ? ` · ${item.balance_suspended} 个余额暂停` : '' }}</span><span>{{ fmtNumber(item.today_requests) }} 次 · {{ fmtNumber(item.today_tokens) }} Token</span></div>
                     </article>
                   </div>
                   <div v-else class="topology-empty-node"><Server :size="17" /><span>暂无上游集群</span></div>
@@ -1769,11 +1806,11 @@ onBeforeUnmount(() => {
               <template v-for="item in sortRows(upstreamGroups, 'upstreams')" :key="item.key">
               <tr :class="{ subdued: item.enabled === 0 }" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
                 <td><span class="priority">{{ item.priority }}</span></td>
-                <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.enabled }} 个启用<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
+                <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.available }} 个可路由<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
                 <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><small v-if="item.total > 1">点击查看各 Key 状态</small></td>
                 <td><div class="tag-row"><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></div><small>{{ item.models?.length || 0 }} 个模型</small></td>
                 <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small>{{ item.total > 1 ? '抽屉内分别展示' : fmtDate(item.items[0].balance?.updated_at) }}</small></td>
-                <td><small>{{ groupCircuitText(item) }}</small><small v-if="item.total > item.enabled">{{ item.total - item.enabled }} 个停用</small></td>
+                <td><small>{{ groupCircuitText(item) }}</small><small v-if="item.balance_suspended">{{ item.balance_suspended }} 个余额暂停</small><small v-else-if="item.total > item.enabled">{{ item.total - item.enabled }} 个停用</small></td>
                 <td class="menu-cell"><div class="row-actions">
                   <button class="icon" title="查看 Key" @click.stop="openUpstreamGroup(item)"><MoreHorizontal :size="16" /></button>
                 </div></td>
@@ -1934,6 +1971,8 @@ onBeforeUnmount(() => {
           <label>名称<input v-model.trim="upstreamForm.name" required autofocus placeholder="生产主线路" /></label>
           <label>类型<select v-model="upstreamForm.kind"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></select></label>
           <label class="span-2">Base URL<input v-model.trim="upstreamForm.base_url" type="url" required placeholder="https://api.example.com" /></label>
+          <label>User-Agent 策略<select v-model="upstreamForm.user_agent_mode"><option value="default">默认</option><option value="codex">Codex 兼容</option><option value="opencode">OpenCode 兼容</option><option value="custom">自定义</option></select></label>
+          <label v-if="upstreamForm.user_agent_mode === 'custom'">自定义 User-Agent<input v-model="upstreamForm.user_agent" maxlength="256" placeholder="client/1.0.0" /></label>
           <label>API Key<input v-model="upstreamForm.api_key" type="password" :required="!editingUpstream" :placeholder="editingUpstream ? '留空表示不修改' : 'sk-…'" autocomplete="off" /></label>
           <label>优先级<input v-model.number="upstreamForm.priority" type="number" min="0" required /></label>
           <label class="span-2">价格档案 <span>用于官方价格估算</span><select v-model.number="upstreamForm.pricing_profile_id"><option :value="0">未计价</option><option v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" :value="profile.id">{{ profile.name }}（{{ profile.prices?.length || 0 }} 个模型）</option></select></label>
@@ -1943,6 +1982,7 @@ onBeforeUnmount(() => {
             <label v-if="editingUpstream" class="switch span-2"><input v-model="upstreamForm.clear_balance_credentials" type="checkbox" /><span></span>清除已保存的 Access Token 与 User ID</label>
           </template>
           <label class="switch span-2"><input v-model="upstreamForm.enabled" type="checkbox" /><span></span>启用该上游</label>
+          <label class="switch span-2"><input v-model="upstreamForm.balance_protection_enabled" type="checkbox" /><span></span>余额耗尽时自动暂停路由</label>
         </div></div>
         <div class="form-section"><h3>能力与模型</h3><div class="form-grid">
           <fieldset class="span-2"><legend>协议 <span>新建时默认 Responses</span></legend><div class="check-row"><label v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol"><input v-model="upstreamForm.protocols" type="checkbox" :value="protocol" />{{ protocol }}</label></div></fieldset>
@@ -2009,7 +2049,8 @@ onBeforeUnmount(() => {
       <header><div><h2 id="upstream-group-title">{{ upstreamGroupDrawer.base_url }}</h2><p>{{ upstreamGroupDrawer.total }} 个 Key · 聚合展示，路由仍按各 Key 优先级</p></div><button class="icon" title="关闭" @click="upstreamGroupDrawer = null"><X :size="19" /></button></header>
       <div class="upstream-key-list">
         <article v-for="item in upstreamGroupDrawer.items" :key="item.id" class="upstream-key-card">
-          <dl><div><dt>今日请求</dt><dd>{{ fmtNumber(item.today_requests) }}</dd></div><div><dt>今日 Token</dt><dd>{{ fmtNumber(item.today_tokens) }}</dd></div><div><dt>余额</dt><dd>{{ fmtBalance(item) }}</dd></div><div><dt>价格档案</dt><dd>{{ pricingProfileName(item.pricing_profile_id) }}</dd></div><div><dt>熔断</dt><dd>{{ item.health_status === 'open' ? `开启 · ${item.consecutive_failures || 0} 次失败` : `未开启 · ${item.consecutive_failures || 0} 次失败` }}</dd></div></dl>
+          <div class="upstream-key-card-head"><div><strong :title="item.name">{{ item.name }}</strong><small>优先级 P{{ item.priority }} · {{ item.protocols?.join(' / ') }}</small></div><span class="status" :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</span></div>
+          <dl><div><dt>今日请求</dt><dd>{{ fmtNumber(item.today_requests) }}</dd></div><div><dt>今日 Token</dt><dd>{{ fmtNumber(item.today_tokens) }}</dd></div><div><dt>余额</dt><dd>{{ fmtBalance(item) }}</dd></div><div><dt>余额保护</dt><dd>{{ balanceProtectionText(item) }}</dd></div><div><dt>价格档案</dt><dd>{{ pricingProfileName(item.pricing_profile_id) }}</dd></div><div><dt>熔断</dt><dd>{{ item.health_status === 'open' ? `开启 · ${item.consecutive_failures || 0} 次失败` : `未开启 · ${item.consecutive_failures || 0} 次失败` }}</dd></div></dl>
           <div class="upstream-key-actions"><button class="secondary" @click="openUpstream(item)"><Pencil :size="15" />编辑 Key</button><button class="icon" title="检查连接" @click="upstreamAction(item, 'check')"><Activity :size="16" /></button><button class="icon" title="刷新余额" @click="upstreamAction(item, 'balance')"><CircleDollarSign :size="16" /></button><button class="icon" title="刷新模型" @click="upstreamAction(item, 'models')"><Download :size="16" /></button><button class="icon danger" title="删除上游" @click="removeUpstream(item)"><Trash2 :size="16" /></button></div>
         </article>
       </div>

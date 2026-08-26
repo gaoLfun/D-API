@@ -23,12 +23,15 @@ func TestHealthDiscoversModels(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
 			t.Errorf("authorization = %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got != "codex_cli_rs/0.101.0" {
+			t.Errorf("User-Agent = %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5"},{"id":"claude-sonnet"},{"id":"gpt-5"}]}`))
 	}))
 	defer server.Close()
 
-	result := NewProber(server.Client(), time.Second).CheckHealth(context.Background(), core.Upstream{BaseURL: server.URL + "/v1", APIKey: "secret"})
+	result := NewProber(server.Client(), time.Second).CheckHealth(context.Background(), core.Upstream{BaseURL: server.URL + "/v1", APIKey: "secret", UserAgent: "codex_cli_rs/0.101.0"})
 	if result.Status != "healthy" || len(result.Models) != 2 || result.Models[0] != "gpt-5" || result.Models[1] != "claude-sonnet" {
 		t.Fatalf("health = %#v", result)
 	}
@@ -50,6 +53,9 @@ func TestModelProtocols(t *testing.T) {
 	paths := make(chan string, 1)
 	pinged := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "opencode/1.0.0" {
+			t.Errorf("User-Agent = %q", got)
+		}
 		if r.Method == http.MethodHead {
 			pinged <- struct{}{}
 			w.WriteHeader(http.StatusNoContent)
@@ -90,6 +96,7 @@ func TestModelProtocols(t *testing.T) {
 
 	upstream := core.Upstream{
 		BaseURL: server.URL + "/v1", APIKey: "secret",
+		UserAgent:      "opencode/1.0.0",
 		Kind:           "sub2api",
 		Protocols:      []string{core.ProtocolMessages, core.ProtocolResponses, core.ProtocolChat},
 		ConnectTimeout: time.Second, FirstByteTimeout: time.Second,

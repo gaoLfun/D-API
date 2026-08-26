@@ -4,9 +4,9 @@ import path from 'node:path'
 const reviewDir = path.resolve('..', '.impeccable', 'review')
 
 const upstreams = [
-  { id: 1, name: '新加坡主线路', kind: 'newapi', base_url: 'https://sg-api.example.com', enabled: true, priority: 10, protocols: ['chat', 'responses'], models: ['gpt-5.6', 'claude-opus-4-6'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 0, today_requests: 1842, today_tokens: 2840150, last_check_at: '2026-08-25T15:28:00Z', balance: { status: 'ok', available: 82.47, used: 17.53, currency: '$', updated_at: '2026-08-25T15:25:00Z' } },
-  { id: 2, name: '东京备用线路', kind: 'sub2api', base_url: 'https://jp-api.example.com', enabled: true, priority: 20, protocols: ['chat', 'messages'], models: ['claude-opus-4-5'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 1, today_requests: 734, today_tokens: 912420, last_check_at: '2026-08-25T15:27:00Z', balance: { status: 'unsupported' } },
-  { id: 3, name: '美西应急线路', kind: 'newapi', base_url: 'https://us-api.example.com', enabled: true, priority: 30, protocols: ['chat', 'responses', 'messages'], models: ['gpt-5.6-mini'], model_aliases: {}, failure_threshold: 3, health_status: 'unhealthy', consecutive_failures: 3, today_requests: 81, today_tokens: 132900, last_check_at: '2026-08-25T15:21:00Z', last_error: 'upstream returned 502', circuit_open_until: '2026-08-25T15:31:00Z', balance: { status: 'ok', available: 16.2, used: 83.8, currency: '$', updated_at: '2026-08-25T15:20:00Z' } },
+  { id: 1, name: '新加坡主线路', kind: 'newapi', base_url: 'https://sg-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: false, zero_balance_checks: 0, priority: 10, protocols: ['chat', 'responses'], models: ['gpt-5.6', 'claude-opus-4-6'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 0, today_requests: 1842, today_tokens: 2840150, last_check_at: '2026-08-25T15:28:00Z', balance: { status: 'ok', available: 82.47, used: 17.53, currency: '$', updated_at: '2026-08-25T15:25:00Z' } },
+  { id: 2, name: '东京备用线路', kind: 'sub2api', base_url: 'https://jp-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: false, zero_balance_checks: 0, priority: 20, protocols: ['chat', 'messages'], models: ['claude-opus-4-5'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 1, today_requests: 734, today_tokens: 912420, last_check_at: '2026-08-25T15:27:00Z', balance: { status: 'unsupported' } },
+  { id: 3, name: '美西应急线路', kind: 'newapi', base_url: 'https://us-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: true, zero_balance_checks: 2, priority: 30, protocols: ['chat', 'responses', 'messages'], models: ['gpt-5.6-mini'], model_aliases: {}, failure_threshold: 3, health_status: 'unhealthy', consecutive_failures: 3, today_requests: 81, today_tokens: 132900, last_check_at: '2026-08-25T15:21:00Z', last_error: 'upstream returned 502', circuit_open_until: '2026-08-25T15:31:00Z', balance: { status: 'ok', available: 0, used: 100, currency: '$', updated_at: '2026-08-25T15:20:00Z' } },
 ]
 
 const keys = [
@@ -110,6 +110,7 @@ test('capture the operational surface across themes and viewports', async ({ pag
 
   await page.screenshot({ path: path.join(reviewDir, 'desktop-light-dashboard.png'), fullPage: true })
   await openView(page, '上游')
+  await expect(page.getByText(/余额暂停/).first()).toBeVisible()
   await page.screenshot({ path: path.join(reviewDir, 'desktop-light-upstreams.png'), fullPage: true })
   await page.locator('.upstream-table tbody tr.clickable').first().click()
   await page.locator('.upstream-group-drawer').getByRole('button', { name: '编辑 Key' }).first().click()
@@ -161,6 +162,7 @@ test('capture the operational surface across themes and viewports', async ({ pag
   await page.reload()
   await expect(page.locator('.topbar h1')).toHaveText('上游')
   await page.locator('.upstream-table tbody tr.clickable').first().click()
+  await page.waitForTimeout(250)
   await page.screenshot({ path: path.join(reviewDir, 'mobile-light-upstreams.png'), fullPage: true })
   await page.goto('/#logs')
   await page.reload()
@@ -348,6 +350,7 @@ test('new defaults, model discovery, and dashboard chart work together', async (
   await page.getByRole('button', { name: '添加上游' }).first().click()
   const upstreamDialog = page.getByRole('dialog', { name: '添加上游' })
   await expect(upstreamDialog.getByLabel('类型')).toHaveValue('sub2api')
+  await expect(upstreamDialog.getByLabel('余额耗尽时自动暂停路由')).toBeChecked()
   await expect(upstreamDialog.getByText('Access Token')).toHaveCount(0)
   await upstreamDialog.getByLabel('名称', { exact: true }).fill('模型探测线路')
   await upstreamDialog.getByLabel('Base URL').fill('https://models.example.com')

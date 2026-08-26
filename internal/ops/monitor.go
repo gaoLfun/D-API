@@ -24,7 +24,7 @@ type Event struct {
 type Repository interface {
 	ListUpstreams(context.Context) ([]core.Upstream, error)
 	SaveHealth(context.Context, int64, Health) (string, error)
-	SaveBalance(context.Context, int64, core.Balance) error
+	SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error)
 	SaveEvent(context.Context, Event) error
 }
 
@@ -45,7 +45,7 @@ type Monitor struct {
 	Notifier   Notifier
 	Config     MonitorConfig
 	pendingMu  sync.Mutex
-	pending    map[int64]Event
+	pending    map[int64][]Event
 }
 
 func NewMonitor(repository Repository, prober ProbeService, notifier Notifier, config MonitorConfig) *Monitor {
@@ -58,7 +58,7 @@ func NewMonitor(repository Repository, prober ProbeService, notifier Notifier, c
 	if config.Concurrency <= 0 {
 		config.Concurrency = 8
 	}
-	return &Monitor{Repository: repository, Prober: prober, Notifier: notifier, Config: config, pending: make(map[int64]Event)}
+	return &Monitor{Repository: repository, Prober: prober, Notifier: notifier, Config: config, pending: make(map[int64][]Event)}
 }
 
 func (m *Monitor) Run(ctx context.Context) error {
@@ -111,10 +111,13 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 			return errors.Join(pendingErr, err)
 		}
 		if m.Notifier != nil {
-			m.clearPending(upstream.ID)
+			if pendingErr != nil {
+				m.setPending(event)
+				return pendingErr
+			}
 			if err := m.Notifier.Notify(ctx, event); err != nil {
 				m.setPending(event)
-				return errors.Join(pendingErr, err)
+				return err
 			}
 		}
 		return pendingErr
@@ -126,27 +129,38 @@ func (m *Monitor) retryPending(ctx context.Context, upstreamID int64) error {
 		return nil
 	}
 	m.pendingMu.Lock()
-	event, ok := m.pending[upstreamID]
+	events := append([]Event(nil), m.pending[upstreamID]...)
 	m.pendingMu.Unlock()
-	if !ok {
+	if len(events) == 0 {
 		return nil
 	}
-	if err := m.Notifier.Notify(ctx, event); err != nil {
-		return fmt.Errorf("retry notification: %w", err)
+	for index, event := range events {
+		if err := m.Notifier.Notify(ctx, event); err != nil {
+			m.ackPending(upstreamID, index)
+			return fmt.Errorf("retry notification: %w", err)
+		}
 	}
-	m.clearPending(upstreamID)
+	m.ackPending(upstreamID, len(events))
 	return nil
 }
 
 func (m *Monitor) setPending(event Event) {
 	m.pendingMu.Lock()
-	m.pending[event.UpstreamID] = event
+	m.pending[event.UpstreamID] = append(m.pending[event.UpstreamID], event)
 	m.pendingMu.Unlock()
 }
 
-func (m *Monitor) clearPending(upstreamID int64) {
+func (m *Monitor) ackPending(upstreamID int64, count int) {
+	if count == 0 {
+		return
+	}
 	m.pendingMu.Lock()
-	delete(m.pending, upstreamID)
+	events := m.pending[upstreamID]
+	if count >= len(events) {
+		delete(m.pending, upstreamID)
+	} else {
+		m.pending[upstreamID] = append([]Event(nil), events[count:]...)
+	}
 	m.pendingMu.Unlock()
 }
 
@@ -156,8 +170,46 @@ func (m *Monitor) RunBalances(ctx context.Context) error {
 		return err
 	}
 	return m.parallel(ctx, upstreams, func(ctx context.Context, upstream core.Upstream) error {
-		return m.Repository.SaveBalance(ctx, upstream.ID, m.Prober.CheckBalance(ctx, upstream))
+		pendingErr := m.retryPending(ctx, upstream.ID)
+		balance := m.Prober.CheckBalance(ctx, upstream)
+		transition, err := m.Repository.SaveBalance(ctx, upstream.ID, balance, false)
+		if err != nil {
+			return errors.Join(pendingErr, err)
+		}
+		if transition == core.BalanceUnchanged {
+			return pendingErr
+		}
+		event := BalanceTransitionEvent(upstream, balance, transition)
+		if m.Notifier != nil {
+			if pendingErr != nil {
+				m.setPending(event)
+				return pendingErr
+			}
+			if err := m.Notifier.Notify(ctx, event); err != nil {
+				m.setPending(event)
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+func BalanceTransitionEvent(upstream core.Upstream, balance core.Balance, transition core.BalanceTransition) Event {
+	at := time.Now()
+	if balance.UpdatedAt != nil {
+		at = *balance.UpdatedAt
+	}
+	return Event{
+		Type: "upstream_balance_protection", State: string(transition), UpstreamID: upstream.ID,
+		UpstreamName: upstream.Name, Message: core.BalanceTransitionMessage(upstream.Name, transition, ""), At: at,
+	}
+}
+
+func BalanceProtectionDisabledEvent(upstream core.Upstream) Event {
+	return Event{
+		Type: "upstream_balance_protection", State: string(core.BalanceResumed), UpstreamID: upstream.ID,
+		UpstreamName: upstream.Name, Message: core.BalanceTransitionMessage(upstream.Name, core.BalanceResumed, core.BalanceReasonProtectionDisabled), At: time.Now(),
+	}
 }
 
 func (m *Monitor) parallel(ctx context.Context, upstreams []core.Upstream, work func(context.Context, core.Upstream) error) error {

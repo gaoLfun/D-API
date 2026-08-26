@@ -293,6 +293,7 @@ func (p *Prober) get(ctx context.Context, upstream core.Upstream, endpoint, cred
 		return nil, 0, errors.New("build request")
 	}
 	req.Header.Set("Accept", "application/json")
+	applyUserAgent(req, upstream)
 	if credential != "" {
 		req.Header.Set("Authorization", "Bearer "+credential)
 	}
@@ -331,6 +332,7 @@ func (p *Prober) post(ctx context.Context, upstream core.Upstream, endpoint stri
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	applyUserAgent(req, upstream)
 	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	if protocol == core.ProtocolMessages {
 		req.Header.Set("X-Api-Key", upstream.APIKey)
@@ -387,6 +389,7 @@ func (p *Prober) pingOrigin(ctx context.Context, upstream core.Upstream) (int64,
 	if err != nil {
 		return 0, false
 	}
+	applyUserAgent(request, upstream)
 	started := time.Now()
 	response, err := p.Client.Do(request)
 	if err != nil {
@@ -394,6 +397,12 @@ func (p *Prober) pingOrigin(ctx context.Context, upstream core.Upstream) (int64,
 	}
 	_ = response.Body.Close()
 	return time.Since(started).Milliseconds(), true
+}
+
+func applyUserAgent(request *http.Request, upstream core.Upstream) {
+	if upstream.UserAgent != "" {
+		request.Header.Set("User-Agent", upstream.UserAgent)
+	}
 }
 
 func (p *Prober) modelTimeouts(upstream core.Upstream) (time.Duration, time.Duration, time.Duration) {

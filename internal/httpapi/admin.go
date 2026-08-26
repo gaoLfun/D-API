@@ -40,7 +40,7 @@ type Operations interface {
 	Check(context.Context, int64) (ops.Health, error)
 	Probe(context.Context, core.Upstream) ops.Health
 	TestModel(context.Context, core.Upstream, string) ops.ModelTest
-	Balance(context.Context, int64) (core.Balance, error)
+	Balance(context.Context, int64) (core.Upstream, core.Balance, core.BalanceTransition, error)
 	Models(context.Context, int64) ([]string, error)
 }
 
@@ -246,11 +246,13 @@ type upstreamPayload struct {
 	Name                    string            `json:"name"`
 	Kind                    string            `json:"kind"`
 	BaseURL                 string            `json:"base_url"`
+	UserAgent               string            `json:"user_agent"`
 	APIKey                  string            `json:"api_key"`
 	AccessToken             string            `json:"access_token"`
 	UserID                  string            `json:"user_id"`
 	ClearBalanceCredentials bool              `json:"clear_balance_credentials"`
 	Enabled                 *bool             `json:"enabled"`
+	BalanceProtection       *bool             `json:"balance_protection_enabled"`
 	Priority                *int              `json:"priority"`
 	Protocols               []string          `json:"protocols"`
 	Models                  []string          `json:"models"`
@@ -269,10 +271,14 @@ type upstreamView struct {
 	Name                string            `json:"name"`
 	Kind                string            `json:"kind"`
 	BaseURL             string            `json:"base_url"`
+	UserAgent           string            `json:"user_agent"`
 	HasAPIKey           bool              `json:"has_api_key"`
 	HasAccessToken      bool              `json:"has_access_token"`
 	HasUserID           bool              `json:"has_user_id"`
 	Enabled             bool              `json:"enabled"`
+	BalanceProtection   bool              `json:"balance_protection_enabled"`
+	BalanceSuspended    bool              `json:"balance_suspended"`
+	ZeroBalanceChecks   int               `json:"zero_balance_checks"`
 	Priority            int               `json:"priority"`
 	Protocols           []string          `json:"protocols"`
 	Models              []string          `json:"models"`
@@ -370,12 +376,16 @@ func (s *Server) updateUpstream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_upstream", "上游地址不允许访问内网或无效地址")
 		return
 	}
-	if err := s.store.UpdateUpstream(r.Context(), upstream); err != nil {
+	transition, err := s.store.UpdateUpstream(r.Context(), upstream)
+	if err != nil {
 		slog.Error("update upstream failed", "upstream_id", id, "name", upstream.Name, "error", err)
 		writeStoreError(w, err)
 		return
 	}
 	s.audit(r, "upstream.update", "upstream", id, map[string]any{"name": upstream.Name})
+	if transition != core.BalanceUnchanged {
+		s.notifyPersistedEvent(ops.BalanceProtectionDisabledEvent(upstream))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id})
 }
 
@@ -550,10 +560,13 @@ func (s *Server) balanceUpstream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "probe_unavailable", "探测服务不可用")
 		return
 	}
-	balance, err := s.operations.Balance(r.Context(), id)
+	upstream, balance, transition, err := s.operations.Balance(r.Context(), id)
 	if err != nil {
 		writeStoreError(w, err)
 		return
+	}
+	if transition != core.BalanceUnchanged {
+		s.notifyPersistedEvent(ops.BalanceTransitionEvent(upstream, balance, transition))
 	}
 	writeJSON(w, http.StatusOK, balance)
 }
@@ -1289,9 +1302,21 @@ func (s *Server) audit(r *http.Request, action, targetType string, targetID int6
 }
 
 func (s *Server) notifySecurity(event ops.Event) {
-	if err := s.store.SaveAlertEvent(context.Background(), nil, event.Type, event.State, event.Message); err != nil {
-		slog.Error("security event write failed", "event", event.Type, "error", err)
+	s.notifyEvent(event)
+}
+
+func (s *Server) notifyEvent(event ops.Event) {
+	var upstreamID *int64
+	if event.UpstreamID > 0 {
+		upstreamID = &event.UpstreamID
 	}
+	if err := s.store.SaveAlertEvent(context.Background(), upstreamID, event.Type, event.State, event.Message); err != nil {
+		slog.Error("event write failed", "event", event.Type, "error", err)
+	}
+	s.notifyPersistedEvent(event)
+}
+
+func (s *Server) notifyPersistedEvent(event ops.Event) {
 	if s.notifier == nil {
 		return
 	}
@@ -1299,7 +1324,7 @@ func (s *Server) notifySecurity(event ops.Event) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := s.notifier.Notify(ctx, event); err != nil {
-			slog.Error("security notification failed", "event", event.Type, "error", err)
+			slog.Error("event notification failed", "event", event.Type, "error", err)
 		}
 	}()
 }
@@ -1307,6 +1332,7 @@ func (s *Server) notifySecurity(event ops.Event) {
 func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstream, error) {
 	name := strings.TrimSpace(p.Name)
 	base := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	userAgent := strings.TrimSpace(p.UserAgent)
 	if err := validateUpstreamPayload(p, name, base); err != nil {
 		return core.Upstream{}, err
 	}
@@ -1323,10 +1349,12 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 	}
 	apiKey, accessToken, userID := p.APIKey, p.AccessToken, p.UserID
 	priority := 100
+	balanceProtection := true
 	pricingProfileID := p.PricingProfileID
 	modelsLocked := false
 	if id != 0 {
 		priority = existing.Priority
+		balanceProtection = existing.BalanceProtection
 		modelsLocked = existing.ModelsLocked
 		if pricingProfileID == nil {
 			pricingProfileID = existing.PricingProfileID
@@ -1350,12 +1378,16 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 	if p.Priority != nil {
 		priority = *p.Priority
 	}
+	if p.BalanceProtection != nil {
+		balanceProtection = *p.BalanceProtection
+	}
 	if p.Kind == "sub2api" {
 		accessToken, userID = "", ""
 	}
 	return core.Upstream{
-		ID: id, Name: name, Kind: p.Kind, BaseURL: base, APIKey: apiKey, AccessToken: accessToken, UserID: userID,
-		Enabled: enabled, Priority: priority, Protocols: p.Protocols, Models: cleanStrings(p.Models),
+		ID: id, Name: name, Kind: p.Kind, BaseURL: base, UserAgent: userAgent, APIKey: apiKey, AccessToken: accessToken, UserID: userID,
+		Enabled: enabled, BalanceProtection: balanceProtection, BalanceSuspended: existing.BalanceSuspended, ZeroBalanceChecks: existing.ZeroBalanceChecks,
+		Priority: priority, Protocols: p.Protocols, Models: cleanStrings(p.Models),
 		ModelsLocked: modelsLocked, ModelAliases: p.ModelAliases, ConnectTimeout: time.Duration(defaultInt(p.ConnectTimeoutMS, 5000)) * time.Millisecond,
 		PricingProfileID: pricingProfileID,
 		FirstByteTimeout: time.Duration(defaultInt(p.FirstByteTimeoutMS, 60000)) * time.Millisecond,
@@ -1366,9 +1398,10 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 
 func viewUpstream(record store.UpstreamRecord) upstreamView {
 	return upstreamView{
-		ID: record.ID, Name: record.Name, Kind: record.Kind, BaseURL: record.BaseURL,
+		ID: record.ID, Name: record.Name, Kind: record.Kind, BaseURL: record.BaseURL, UserAgent: record.UserAgent,
 		HasAPIKey: record.APIKey != "", HasAccessToken: record.AccessToken != "", HasUserID: record.UserID != "",
-		Enabled: record.Enabled, Priority: record.Priority, Protocols: record.Protocols, Models: record.Models, ModelsLocked: record.ModelsLocked,
+		Enabled: record.Enabled, BalanceProtection: record.BalanceProtection, BalanceSuspended: record.BalanceSuspended, ZeroBalanceChecks: record.ZeroBalanceChecks,
+		Priority: record.Priority, Protocols: record.Protocols, Models: record.Models, ModelsLocked: record.ModelsLocked,
 		ModelAliases: record.ModelAliases, PricingProfileID: record.PricingProfileID, ConnectTimeoutMS: record.ConnectTimeout.Milliseconds(),
 		FirstByteTimeoutMS: record.FirstByteTimeout.Milliseconds(), IdleTimeoutMS: record.IdleTimeout.Milliseconds(),
 		FailureThreshold: record.FailureThreshold, CooldownSeconds: int64(record.Cooldown.Seconds()),
@@ -1417,6 +1450,9 @@ func validateUpstreamPayload(p upstreamPayload, name, base string) error {
 		if len(value) > 4096 {
 			return errors.New("上游凭据过长")
 		}
+	}
+	if len([]rune(strings.TrimSpace(p.UserAgent))) > 256 || strings.ContainsAny(p.UserAgent, "\r\n") {
+		return errors.New("User-Agent 不能包含换行且不能超过 256 个字符")
 	}
 	if !validProtocols(p.Protocols) {
 		return errors.New("协议无效")

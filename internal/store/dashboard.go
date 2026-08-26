@@ -100,8 +100,8 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 		), upstream_health AS (
 			SELECT `+usageBaseURLSQL("base_url")+` AS base_url_key,
 				bool_or(enabled) AS has_enabled,
-				bool_and(NOT enabled OR health_status='healthy') AS all_healthy,
-				bool_or(enabled AND health_status='unhealthy') AS any_unhealthy
+				bool_and(NOT enabled OR (NOT balance_suspended AND health_status='healthy')) AS all_healthy,
+				bool_or(enabled AND (balance_suspended OR health_status='unhealthy')) AS any_unhealthy
 			FROM upstreams GROUP BY 1
 		)
 		SELECT

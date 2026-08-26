@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -9,17 +10,39 @@ const (
 	ProtocolResponses = "responses"
 	ProtocolMessages  = "messages"
 	ProtocolChat      = "chat"
+
+	BalanceUnchanged BalanceTransition = ""
+	BalanceSuspended BalanceTransition = "suspended"
+	BalanceResumed   BalanceTransition = "resumed"
+
+	BalanceReasonProtectionDisabled = "protection_disabled"
 )
+
+type BalanceTransition string
+
+func BalanceTransitionMessage(name string, transition BalanceTransition, reason string) string {
+	if transition == BalanceSuspended {
+		return fmt.Sprintf("upstream %s paused because available balance is exhausted", name)
+	}
+	if reason == BalanceReasonProtectionDisabled {
+		return fmt.Sprintf("upstream %s resumed because balance protection was disabled", name)
+	}
+	return fmt.Sprintf("upstream %s resumed after balance recovery", name)
+}
 
 type Upstream struct {
 	ID                 int64             `json:"id"`
 	Name               string            `json:"name"`
 	Kind               string            `json:"kind"`
 	BaseURL            string            `json:"base_url"`
+	UserAgent          string            `json:"user_agent,omitempty"`
 	APIKey             string            `json:"-"`
 	AccessToken        string            `json:"-"`
 	UserID             string            `json:"-"`
 	Enabled            bool              `json:"enabled"`
+	BalanceProtection  bool              `json:"balance_protection_enabled"`
+	BalanceSuspended   bool              `json:"balance_suspended"`
+	ZeroBalanceChecks  int               `json:"zero_balance_checks"`
 	Priority           int               `json:"priority"`
 	Protocols          []string          `json:"protocols"`
 	Models             []string          `json:"models"`
@@ -39,7 +62,7 @@ type Upstream struct {
 }
 
 func (u Upstream) Supports(protocol, model string, now time.Time) bool {
-	if !u.Enabled || (u.CircuitOpenUntil != nil && u.CircuitOpenUntil.After(now)) {
+	if !u.Enabled || u.BalanceSuspended || (u.CircuitOpenUntil != nil && u.CircuitOpenUntil.After(now)) {
 		return false
 	}
 	if !contains(u.Protocols, protocol) {

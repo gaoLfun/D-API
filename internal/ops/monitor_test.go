@@ -11,10 +11,12 @@ import (
 )
 
 type monitorRepository struct {
-	upstreams []core.Upstream
-	health    []Health
-	events    []Event
-	status    string
+	upstreams         []core.Upstream
+	health            []Health
+	events            []Event
+	status            string
+	balanceTransition core.BalanceTransition
+	balanceImmediate  bool
 }
 
 type boundedMonitorRepository struct{ upstreams []core.Upstream }
@@ -25,8 +27,10 @@ func (r boundedMonitorRepository) ListUpstreams(context.Context) ([]core.Upstrea
 func (boundedMonitorRepository) SaveHealth(context.Context, int64, Health) (string, error) {
 	return "healthy", nil
 }
-func (boundedMonitorRepository) SaveBalance(context.Context, int64, core.Balance) error { return nil }
-func (boundedMonitorRepository) SaveEvent(context.Context, Event) error                 { return nil }
+func (boundedMonitorRepository) SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error) {
+	return core.BalanceUnchanged, nil
+}
+func (boundedMonitorRepository) SaveEvent(context.Context, Event) error { return nil }
 
 type boundedMonitorProber struct {
 	active int32
@@ -80,7 +84,10 @@ func (r *monitorRepository) SaveHealth(_ context.Context, id int64, health Healt
 	}
 	return status, nil
 }
-func (r *monitorRepository) SaveBalance(context.Context, int64, core.Balance) error { return nil }
+func (r *monitorRepository) SaveBalance(_ context.Context, _ int64, _ core.Balance, immediate bool) (core.BalanceTransition, error) {
+	r.balanceImmediate = immediate
+	return r.balanceTransition, nil
+}
 func (r *monitorRepository) SaveEvent(_ context.Context, event Event) error {
 	r.events = append(r.events, event)
 	return nil
@@ -136,5 +143,85 @@ func TestMonitorUsesPersistedHealthStateAndRetriesNotification(t *testing.T) {
 	}
 	if attempts != 2 || len(repository.events) != 1 {
 		t.Fatalf("attempts=%d events=%#v", attempts, repository.events)
+	}
+}
+
+func TestMonitorPublishesBalanceTransition(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:         []core.Upstream{{ID: 1, Name: "primary", Enabled: true}},
+		balanceTransition: core.BalanceSuspended,
+	}
+	notifications := 0
+	monitor := NewMonitor(repository, monitorProber{}, NotifierFunc(func(_ context.Context, event Event) error {
+		notifications++
+		if event.Type != "upstream_balance_protection" || event.State != "suspended" {
+			t.Fatalf("event = %#v", event)
+		}
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunBalances(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repository.balanceImmediate || len(repository.events) != 0 || notifications != 1 {
+		t.Fatalf("immediate=%t events=%#v notifications=%d", repository.balanceImmediate, repository.events, notifications)
+	}
+}
+
+func TestMonitorRetriesBalanceTransitionNotification(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:         []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "healthy"}},
+		balanceTransition: core.BalanceSuspended,
+	}
+	attempts := 0
+	monitor := NewMonitor(repository, monitorProber{health: Health{Status: "healthy", CheckedAt: time.Now()}}, NotifierFunc(func(context.Context, Event) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("notification unavailable")
+		}
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunBalances(context.Background()); err == nil {
+		t.Fatal("first balance notification should fail")
+	}
+	repository.balanceTransition = core.BalanceUnchanged
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || len(repository.events) != 0 {
+		t.Fatalf("attempts=%d events=%#v", attempts, repository.events)
+	}
+}
+
+func TestMonitorQueuesNewTransitionBehindFailedNotification(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:         []core.Upstream{{ID: 1, Name: "primary", Enabled: true}},
+		balanceTransition: core.BalanceSuspended,
+	}
+	failing := true
+	delivered := make([]string, 0, 2)
+	monitor := NewMonitor(repository, monitorProber{}, NotifierFunc(func(_ context.Context, event Event) error {
+		if failing {
+			return errors.New("notification unavailable")
+		}
+		delivered = append(delivered, event.Type)
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+	monitor.setPending(Event{Type: "upstream_health", UpstreamID: 1})
+
+	if err := monitor.RunBalances(context.Background()); err == nil {
+		t.Fatal("pending notification retry should fail")
+	}
+	if queued := monitor.pending[1]; len(queued) != 2 || queued[0].Type != "upstream_health" || queued[1].Type != "upstream_balance_protection" {
+		t.Fatalf("pending events = %#v", queued)
+	}
+
+	failing = false
+	if err := monitor.retryPending(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(monitor.pending[1]) != 0 || len(delivered) != 2 || delivered[0] != "upstream_health" || delivered[1] != "upstream_balance_protection" {
+		t.Fatalf("delivered=%#v pending=%#v", delivered, monitor.pending[1])
 	}
 }

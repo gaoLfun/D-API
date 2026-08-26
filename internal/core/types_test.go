@@ -22,8 +22,22 @@ func TestRouteEligibilityAndAlias(t *testing.T) {
 	if upstream.Supports(ProtocolResponses, "gpt-client", now) {
 		t.Fatal("open circuit accepted")
 	}
+	upstream.CircuitOpenUntil = nil
+	upstream.BalanceSuspended = true
+	if upstream.Supports(ProtocolResponses, "gpt-client", now) {
+		t.Fatal("balance-suspended upstream accepted")
+	}
 	key := APIKey{Enabled: true, Protocols: []string{ProtocolResponses}, Models: []string{"gpt-client"}}
 	if !key.Allows(ProtocolResponses, "gpt-client") || key.Allows(ProtocolChat, "gpt-client") {
 		t.Fatal("API key scope failed")
+	}
+}
+
+func TestBalanceTransitionMessages(t *testing.T) {
+	if got := BalanceTransitionMessage("primary", BalanceSuspended, ""); got != "upstream primary paused because available balance is exhausted" {
+		t.Fatalf("suspended message = %q", got)
+	}
+	if got := BalanceTransitionMessage("primary", BalanceResumed, BalanceReasonProtectionDisabled); got != "upstream primary resumed because balance protection was disabled" {
+		t.Fatalf("disabled message = %q", got)
 	}
 }

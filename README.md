@@ -19,7 +19,7 @@ management API may still change before v1.0.
 - Automatic failover, health checks, circuit breaking, and per-upstream timeouts
 - OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages endpoints
 - Model discovery, allowlists, and client-to-upstream model aliases
-- Upstream connectivity tests and best-effort balance discovery
+- Upstream connectivity tests with automatic pause/recovery on exhausted balances
 - Locally recorded request attempts and token usage
 - Group-scoped client API keys with protocol and model restrictions
 - Optional pricing profiles with estimated USD cost and coverage metrics

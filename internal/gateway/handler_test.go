@@ -75,6 +75,21 @@ func (f *fakeRepository) MarkUpstreamFailure(_ context.Context, id int64, _ int,
 	return nil
 }
 
+func TestUpstreamRequestUserAgentPolicy(t *testing.T) {
+	in := httptest.NewRequest(http.MethodPost, "http://dapi.local/v1/responses", strings.NewReader(`{}`))
+	in.Header.Set("User-Agent", "caller/1.0")
+
+	out, err := upstreamRequest(in, core.Upstream{BaseURL: "https://upstream.example/v1", APIKey: "secret", UserAgent: "codex_cli_rs/0.101.0"}, []byte(`{}`), core.ProtocolResponses)
+	if err != nil || out.Header.Get("User-Agent") != "codex_cli_rs/0.101.0" {
+		t.Fatalf("configured User-Agent = %q, %v", out.Header.Get("User-Agent"), err)
+	}
+
+	out, err = upstreamRequest(in, core.Upstream{BaseURL: "https://upstream.example/v1", APIKey: "secret"}, []byte(`{}`), core.ProtocolResponses)
+	if err != nil || out.Header.Get("User-Agent") != "caller/1.0" {
+		t.Fatalf("forwarded User-Agent = %q, %v", out.Header.Get("User-Agent"), err)
+	}
+}
+
 func TestProxySwitchesAndRewritesModel(t *testing.T) {
 	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "unavailable", http.StatusInternalServerError)

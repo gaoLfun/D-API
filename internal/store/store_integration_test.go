@@ -14,7 +14,6 @@ import (
 	"github.com/gaoLfun/dapi/internal/auth"
 	"github.com/gaoLfun/dapi/internal/core"
 	"github.com/gaoLfun/dapi/internal/cryptox"
-	"github.com/lib/pq"
 )
 
 func TestStoreLifecycle(t *testing.T) {
@@ -75,7 +74,8 @@ func TestStoreLifecycle(t *testing.T) {
 
 	upstreamID, err := database.CreateUpstream(ctx, core.Upstream{
 		Name: "primary", Kind: "newapi", BaseURL: "https://upstream.example", APIKey: "upstream-secret",
-		Enabled: true, Priority: 10, Protocols: []string{core.ProtocolChat}, Models: []string{"model"},
+		UserAgent: "codex_cli_rs/0.101.0",
+		Enabled:   true, BalanceProtection: true, Priority: 10, Protocols: []string{core.ProtocolChat}, Models: []string{"model"},
 		ConnectTimeout: time.Second, FirstByteTimeout: time.Second, IdleTimeout: time.Second,
 		FailureThreshold: 2, Cooldown: time.Minute,
 	})
@@ -83,11 +83,11 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, err := database.Upstream(ctx, upstreamID)
-	if err != nil || record.APIKey != "upstream-secret" || record.ModelsLocked {
+	if err != nil || record.APIKey != "upstream-secret" || record.UserAgent != "codex_cli_rs/0.101.0" || record.ModelsLocked {
 		t.Fatalf("upstream secret was not restored: %#v %v", record, err)
 	}
 	record.ModelsLocked = true
-	if err := database.UpdateUpstream(ctx, record.Upstream); err != nil {
+	if _, err := database.UpdateUpstream(ctx, record.Upstream); err != nil {
 		t.Fatal(err)
 	}
 	record, err = database.Upstream(ctx, upstreamID)
@@ -105,7 +105,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	record.PricingProfileID = &profileID
-	if err := database.UpdateUpstream(ctx, record.Upstream); err != nil {
+	if _, err := database.UpdateUpstream(ctx, record.Upstream); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.SavePricingProfile(ctx, PricingProfile{
@@ -142,12 +142,18 @@ func TestStoreLifecycle(t *testing.T) {
 	if err != nil || status != "unhealthy" {
 		t.Fatalf("second failure status=%q err=%v", status, err)
 	}
+	status, err = database.SaveHealth(ctx, upstreamID, true, "", false)
+	if err != nil || status != "healthy" {
+		t.Fatalf("health recovery status=%q err=%v", status, err)
+	}
 
-	var secondaryID int64
-	if err := database.DB().QueryRowContext(ctx, `
-		INSERT INTO upstreams(name,kind,base_url,api_key_encrypted,enabled,priority,protocols,models)
-		VALUES($1,'newapi','https://secondary.example',$2,TRUE,20,$3,$4) RETURNING id`,
-		"secondary", []byte("encrypted"), pq.Array([]string{core.ProtocolChat}), pq.Array([]string{"model"})).Scan(&secondaryID); err != nil {
+	secondaryID, err := database.CreateUpstream(ctx, core.Upstream{
+		Name: "secondary", Kind: "newapi", BaseURL: "https://secondary.example", APIKey: "secondary-secret",
+		Enabled: true, Priority: 20, Protocols: []string{core.ProtocolChat}, Models: []string{"model"},
+		ConnectTimeout: time.Second, FirstByteTimeout: time.Second, IdleTimeout: time.Second,
+		FailureThreshold: 2, Cooldown: time.Minute,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -170,6 +176,59 @@ func TestStoreLifecycle(t *testing.T) {
 	routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model")
 	if err != nil || len(routed) != 1 || routed[0].ID != upstreamID {
 		t.Fatalf("group route candidates=%#v err=%v", routed, err)
+	}
+	zero, positive := 0.0, 1.0
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &zero}, false); err != nil || transition != core.BalanceUnchanged {
+		t.Fatalf("first zero balance transition=%q err=%v", transition, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil || record.ZeroBalanceChecks != 1 {
+		t.Fatalf("first zero balance state=%#v err=%v", record, err)
+	}
+	record.APIKey = "replacement-secret"
+	if transition, err := database.UpdateUpstream(ctx, record.Upstream); err != nil || transition != core.BalanceUnchanged {
+		t.Fatalf("credential update transition=%q err=%v", transition, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil || record.ZeroBalanceChecks != 0 {
+		t.Fatalf("credential update did not reset zero checks: %#v err=%v", record, err)
+	}
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &zero}, false); err != nil || transition != core.BalanceUnchanged {
+		t.Fatalf("first zero after credential update transition=%q err=%v", transition, err)
+	}
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &zero}, false); err != nil || transition != core.BalanceSuspended {
+		t.Fatalf("second zero balance transition=%q err=%v", transition, err)
+	}
+	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model"); err != nil || len(routed) != 0 {
+		t.Fatalf("balance-suspended route candidates=%#v err=%v", routed, err)
+	}
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &positive}, false); err != nil || transition != core.BalanceResumed {
+		t.Fatalf("balance recovery transition=%q err=%v", transition, err)
+	}
+	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model"); err != nil || len(routed) != 1 {
+		t.Fatalf("balance-recovered route candidates=%#v err=%v", routed, err)
+	}
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &zero}, true); err != nil || transition != core.BalanceSuspended {
+		t.Fatalf("manual zero balance transition=%q err=%v", transition, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.BalanceProtection = false
+	if transition, err := database.UpdateUpstream(ctx, record.Upstream); err != nil || transition != core.BalanceResumed {
+		t.Fatalf("disable protection transition=%q err=%v", transition, err)
+	}
+	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model"); err != nil || len(routed) != 1 {
+		t.Fatalf("protection-disabled route candidates=%#v err=%v", routed, err)
+	}
+	var balanceAlertCount int
+	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM alert_events WHERE upstream_id=$1 AND event='upstream_balance_protection'`, upstreamID).Scan(&balanceAlertCount); err != nil || balanceAlertCount != 4 {
+		t.Fatalf("balance alert count=%d err=%v", balanceAlertCount, err)
+	}
+	var lastBalanceAlert string
+	if err := database.DB().QueryRowContext(ctx, `SELECT message FROM alert_events WHERE upstream_id=$1 AND event='upstream_balance_protection' ORDER BY id DESC LIMIT 1`, upstreamID).Scan(&lastBalanceAlert); err != nil || lastBalanceAlert != "upstream primary resumed because balance protection was disabled" {
+		t.Fatalf("last balance alert=%q err=%v", lastBalanceAlert, err)
 	}
 	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "other-model"); err != nil || len(routed) != 0 {
 		t.Fatalf("group model filter candidates=%#v err=%v", routed, err)

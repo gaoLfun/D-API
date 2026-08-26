@@ -70,9 +70,67 @@ func TestUpstreamPayloadPreservesPricingAndAcceptsZeroPriority(t *testing.T) {
 	}
 }
 
+func TestUpstreamPayloadBalanceProtectionDefaultsAndOverrides(t *testing.T) {
+	input := upstreamPayload{
+		Name: "primary", Kind: "newapi", BaseURL: "https://example.com",
+		Protocols: []string{core.ProtocolResponses},
+	}
+	created, err := input.upstream(0, core.Upstream{})
+	if err != nil || !created.BalanceProtection {
+		t.Fatalf("created balance protection = %t, %v", created.BalanceProtection, err)
+	}
+
+	existing := core.Upstream{APIKey: "saved-key", BalanceProtection: true, BalanceSuspended: true, ZeroBalanceChecks: 2}
+	updated, err := input.upstream(7, existing)
+	if err != nil || !updated.BalanceProtection || !updated.BalanceSuspended || updated.ZeroBalanceChecks != 2 {
+		t.Fatalf("preserved balance protection = %#v, %v", updated, err)
+	}
+
+	disabled := false
+	input.BalanceProtection = &disabled
+	updated, err = input.upstream(7, existing)
+	if err != nil || updated.BalanceProtection {
+		t.Fatalf("disabled balance protection = %#v, %v", updated, err)
+	}
+}
+
+func TestUpstreamPayloadValidatesUserAgent(t *testing.T) {
+	input := upstreamPayload{
+		Name: "primary", Kind: "newapi", BaseURL: "https://example.com",
+		UserAgent: "  codex_cli_rs/0.101.0  ", Protocols: []string{core.ProtocolResponses},
+	}
+	upstream, err := input.upstream(0, core.Upstream{})
+	if err != nil || upstream.UserAgent != "codex_cli_rs/0.101.0" {
+		t.Fatalf("user agent = %q, %v", upstream.UserAgent, err)
+	}
+
+	input.UserAgent = "valid\r\ninjected"
+	if _, err := input.upstream(0, core.Upstream{}); err == nil {
+		t.Fatal("User-Agent with line breaks was accepted")
+	}
+
+	input.UserAgent = strings.Repeat("a", 257)
+	if _, err := input.upstream(0, core.Upstream{}); err == nil {
+		t.Fatal("oversized User-Agent was accepted")
+	}
+}
+
+func TestUpstreamPayloadCanClearUserAgent(t *testing.T) {
+	input := upstreamPayload{
+		Name: "primary", Kind: "newapi", BaseURL: "https://example.com",
+		Protocols: []string{core.ProtocolResponses},
+	}
+	upstream, err := input.upstream(7, core.Upstream{APIKey: "saved-key", UserAgent: "old-client/1"})
+	if err != nil || upstream.UserAgent != "" {
+		t.Fatalf("cleared user agent = %q, %v", upstream.UserAgent, err)
+	}
+}
+
 type modelTestOperations struct {
-	upstream core.Upstream
-	model    string
+	upstream          core.Upstream
+	model             string
+	balance           core.Balance
+	balanceTransition core.BalanceTransition
 }
 
 func (o *modelTestOperations) Check(context.Context, int64) (ops.Health, error) {
@@ -88,8 +146,8 @@ func (o *modelTestOperations) TestModel(_ context.Context, upstream core.Upstrea
 	return ops.ModelTest{Model: model, Status: "available", Results: []ops.ModelProbe{{Protocol: core.ProtocolChat, Status: "success", StatusCode: 200}}}
 }
 
-func (o *modelTestOperations) Balance(context.Context, int64) (core.Balance, error) {
-	return core.Balance{}, nil
+func (o *modelTestOperations) Balance(context.Context, int64) (core.Upstream, core.Balance, core.BalanceTransition, error) {
+	return o.upstream, o.balance, o.balanceTransition, nil
 }
 
 func (o *modelTestOperations) Models(context.Context, int64) ([]string, error) {
@@ -101,15 +159,34 @@ func TestModelEndpointUsesDraftCredentials(t *testing.T) {
 	server := &Server{operations: operations}
 	request := httptest.NewRequest(http.MethodPost, "/api/admin/upstreams/test-model", strings.NewReader(`{
 		"name":"draft","kind":"newapi","base_url":"https://example.com/v1","api_key":"draft-secret",
-		"protocols":["chat"],"model":"model-a","audit":false
+		"user_agent":"codex_cli_rs/0.101.0","protocols":["chat"],"model":"model-a","audit":false
 	}`))
 	recorder := httptest.NewRecorder()
 	server.testModel(recorder, request)
-	if recorder.Code != http.StatusOK || operations.model != "model-a" || operations.upstream.APIKey != "draft-secret" {
+	if recorder.Code != http.StatusOK || operations.model != "model-a" || operations.upstream.APIKey != "draft-secret" || operations.upstream.UserAgent != "codex_cli_rs/0.101.0" {
 		t.Fatalf("code=%d model=%q upstream=%#v body=%s", recorder.Code, operations.model, operations.upstream, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "draft-secret") || strings.Contains(recorder.Body.String(), "OK") {
 		t.Fatalf("secret or generated content leaked: %s", recorder.Body.String())
+	}
+}
+
+func TestManualBalanceTransitionDoesNotReloadUpstream(t *testing.T) {
+	available := 0.0
+	operations := &modelTestOperations{
+		upstream:          core.Upstream{ID: 7, Name: "primary"},
+		balance:           core.Balance{Status: "ok", Available: &available},
+		balanceTransition: core.BalanceSuspended,
+	}
+	server := &Server{operations: operations}
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/upstreams/7/balance", nil)
+	request.SetPathValue("id", "7")
+	recorder := httptest.NewRecorder()
+
+	server.balanceUpstream(recorder, request)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"status":"ok"`) {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

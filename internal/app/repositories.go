@@ -72,8 +72,8 @@ func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Heal
 	return status, nil
 }
 
-func (r OpsRepository) SaveBalance(ctx context.Context, id int64, balance core.Balance) error {
-	return r.Store.SaveBalance(ctx, id, balance)
+func (r OpsRepository) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
+	return r.Store.SaveBalance(ctx, id, balance, immediate)
 }
 
 func (r OpsRepository) SaveEvent(ctx context.Context, event ops.Event) error {
@@ -109,16 +109,17 @@ func (o Operations) TestModel(ctx context.Context, upstream core.Upstream, model
 	return o.Prober.TestModel(ctx, upstream, model)
 }
 
-func (o Operations) Balance(ctx context.Context, id int64) (core.Balance, error) {
+func (o Operations) Balance(ctx context.Context, id int64) (core.Upstream, core.Balance, core.BalanceTransition, error) {
 	upstream, err := o.Store.Upstream(ctx, id)
 	if err != nil {
-		return core.Balance{}, err
+		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, err
 	}
 	balance := o.Prober.CheckBalance(ctx, upstream.Upstream)
-	if err := o.Store.SaveBalance(ctx, id, balance); err != nil {
-		return core.Balance{}, err
+	transition, err := o.Store.SaveBalance(ctx, id, balance, true)
+	if err != nil {
+		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, err
 	}
-	return balance, nil
+	return upstream.Upstream, balance, transition, nil
 }
 
 func (o Operations) Models(ctx context.Context, id int64) ([]string, error) {

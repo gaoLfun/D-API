@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  COMMON_UPSTREAM_MODELS, DEFAULT_UPSTREAM_PROTOCOLS, UPSTREAM_PROTOCOLS, bulkSetModels, connectionTestText, modelBatchSelection, modelsForPayload, parseModelList, setModelSelected, usesNewAPICredentials,
+  COMMON_UPSTREAM_MODELS, DEFAULT_UPSTREAM_PROTOCOLS, UPSTREAM_PROTOCOLS, bulkSetModels, connectionTestText, modelBatchSelection, modelsForPayload, parseModelList, setModelSelected, userAgentMode, userAgentValue, usesNewAPICredentials,
 } from './upstream-form'
 
 describe('upstream form', () => {
@@ -12,6 +12,14 @@ describe('upstream form', () => {
   it('只为 NewAPI 显示余额凭据', () => {
     expect(usesNewAPICredentials('newapi')).toBe(true)
     expect(usesNewAPICredentials('sub2api')).toBe(false)
+  })
+
+  it('映射 User-Agent 预设与自定义值', () => {
+    expect(userAgentMode('')).toBe('default')
+    expect(userAgentMode('codex_cli_rs/0.101.0')).toBe('codex')
+    expect(userAgentMode('custom-client/2')).toBe('custom')
+    expect(userAgentValue('opencode', '')).toBe('opencode/1.0.0')
+    expect(userAgentValue('custom', ' custom-client/2 ')).toBe('custom-client/2')
   })
 
   it('整理模型并支持快捷选择', () => {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
@@ -20,8 +21,9 @@ type UpstreamRecord struct {
 }
 
 const upstreamColumns = `
-	id, name, kind, base_url, api_key_encrypted, access_token_encrypted, user_id_encrypted,
-	enabled, priority, protocols, models, models_locked, model_aliases, connect_timeout_ms,
+	id, name, kind, base_url, user_agent, api_key_encrypted, access_token_encrypted, user_id_encrypted,
+	enabled, balance_protection_enabled, balance_suspended, zero_balance_checks,
+	priority, protocols, models, models_locked, model_aliases, connect_timeout_ms,
 	first_byte_timeout_ms, idle_timeout_ms, failure_threshold, cooldown_seconds,
 	health_status, consecutive_failures, circuit_open_until, last_check_at, last_error,
 	balance, created_at, updated_at, pricing_profile_id`
@@ -45,7 +47,7 @@ func (s *Store) ListRouteUpstreams(ctx context.Context, groupID int64, protocol,
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT u.*
 		FROM (SELECT `+upstreamColumns+` FROM upstreams
-			WHERE enabled
+			WHERE enabled AND NOT balance_suspended
 			  AND ($2='' OR $2 = ANY(protocols))
 			  AND ($3='' OR (cardinality(models)=0 OR $3 = ANY(models) OR model_aliases ? $3))
 			  AND (circuit_open_until IS NULL OR circuit_open_until <= now())) u
@@ -101,13 +103,13 @@ func (s *Store) CreateUpstream(ctx context.Context, upstream core.Upstream) (int
 	var id int64
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO upstreams(
-			name,kind,base_url,api_key_encrypted,access_token_encrypted,user_id_encrypted,
-			enabled,priority,protocols,models,models_locked,model_aliases,connect_timeout_ms,
+			name,kind,base_url,user_agent,api_key_encrypted,access_token_encrypted,user_id_encrypted,
+			enabled,balance_protection_enabled,priority,protocols,models,models_locked,model_aliases,connect_timeout_ms,
 			first_byte_timeout_ms,idle_timeout_ms,failure_threshold,cooldown_seconds,pricing_profile_id
-		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		RETURNING id`,
-		upstream.Name, upstream.Kind, upstream.BaseURL, apiKey, accessToken, userID,
-		upstream.Enabled, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
+		upstream.Name, upstream.Kind, upstream.BaseURL, upstream.UserAgent, apiKey, accessToken, userID,
+		upstream.Enabled, upstream.BalanceProtection, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
 		upstream.ConnectTimeout.Milliseconds(), upstream.FirstByteTimeout.Milliseconds(),
 		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), pricingProfileIDArg(upstream.PricingProfileID),
 	).Scan(&id)
@@ -117,32 +119,77 @@ func (s *Store) CreateUpstream(ctx context.Context, upstream core.Upstream) (int
 	return id, err
 }
 
-func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) error {
+func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) (core.BalanceTransition, error) {
 	apiKey, accessToken, userID, aliases, err := s.encryptUpstream(upstream)
 	if err != nil {
-		return err
+		return core.BalanceUnchanged, err
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	defer tx.Rollback()
+	var wasSuspended bool
+	var oldBaseURL, oldKind string
+	var oldAPIKeyEncrypted, oldAccessTokenEncrypted, oldUserIDEncrypted []byte
+	if err := tx.QueryRowContext(ctx, `
+		SELECT balance_suspended,base_url,kind,api_key_encrypted,access_token_encrypted,user_id_encrypted
+		FROM upstreams WHERE id=$1 FOR UPDATE`, upstream.ID,
+	).Scan(&wasSuspended, &oldBaseURL, &oldKind, &oldAPIKeyEncrypted, &oldAccessTokenEncrypted, &oldUserIDEncrypted); errors.Is(err, sql.ErrNoRows) {
+		return core.BalanceUnchanged, ErrNotFound
+	} else if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	oldAPIKey, err := s.box.Decrypt(oldAPIKeyEncrypted)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	oldAccessToken, err := s.box.Decrypt(oldAccessTokenEncrypted)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	oldUserID, err := s.box.Decrypt(oldUserIDEncrypted)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	balanceConfigChanged := oldBaseURL != upstream.BaseURL || oldKind != upstream.Kind || oldAPIKey != upstream.APIKey || oldAccessToken != upstream.AccessToken || oldUserID != upstream.UserID
+	result, err := tx.ExecContext(ctx, `
 		UPDATE upstreams SET
-			name=$1,kind=$2,base_url=$3,api_key_encrypted=$4,access_token_encrypted=$5,
-			user_id_encrypted=$6,enabled=$7,priority=$8,protocols=$9,models=$10,models_locked=$11,
-			model_aliases=$12,connect_timeout_ms=$13,first_byte_timeout_ms=$14,
-			idle_timeout_ms=$15,failure_threshold=$16,cooldown_seconds=$17,pricing_profile_id=$18,updated_at=now()
-		WHERE id=$19`,
-		upstream.Name, upstream.Kind, upstream.BaseURL, apiKey, accessToken, userID,
-		upstream.Enabled, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
+			name=$1,kind=$2,base_url=$3,user_agent=$4,api_key_encrypted=$5,access_token_encrypted=$6,
+			user_id_encrypted=$7,enabled=$8,balance_protection_enabled=$9,
+			balance_suspended=CASE WHEN $9 THEN balance_suspended ELSE FALSE END,
+			zero_balance_checks=CASE WHEN $9 AND NOT $10 THEN zero_balance_checks ELSE 0 END,
+			priority=$11,protocols=$12,models=$13,models_locked=$14,
+			model_aliases=$15,connect_timeout_ms=$16,first_byte_timeout_ms=$17,
+			idle_timeout_ms=$18,failure_threshold=$19,cooldown_seconds=$20,pricing_profile_id=$21,updated_at=now()
+		WHERE id=$22`,
+		upstream.Name, upstream.Kind, upstream.BaseURL, upstream.UserAgent, apiKey, accessToken, userID,
+		upstream.Enabled, upstream.BalanceProtection, balanceConfigChanged, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
 		upstream.ConnectTimeout.Milliseconds(), upstream.FirstByteTimeout.Milliseconds(),
 		upstream.IdleTimeout.Milliseconds(), upstream.FailureThreshold, int(upstream.Cooldown.Seconds()), pricingProfileIDArg(upstream.PricingProfileID), upstream.ID,
 	)
 	if err != nil {
-		return err
+		return core.BalanceUnchanged, err
 	}
 	count, _ := result.RowsAffected()
 	if count == 0 {
-		return ErrNotFound
+		return core.BalanceUnchanged, ErrNotFound
+	}
+	transition := core.BalanceUnchanged
+	if wasSuspended && !upstream.BalanceProtection {
+		transition = core.BalanceResumed
+		if err := writeBalanceAudit(ctx, tx, upstream.ID, transition, map[string]any{"reason": core.BalanceReasonProtectionDisabled}); err != nil {
+			return core.BalanceUnchanged, err
+		}
+		if err := writeBalanceAlertEvent(ctx, tx, upstream.ID, upstream.Name, transition, core.BalanceReasonProtectionDisabled); err != nil {
+			return core.BalanceUnchanged, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return core.BalanceUnchanged, err
 	}
 	s.invalidatePricingCache()
-	return nil
+	return transition, nil
 }
 
 func pricingProfileIDArg(id *int64) any {
@@ -186,12 +233,96 @@ func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []str
 	return err
 }
 
-func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance) error {
+func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
 	value, err := json.Marshal(balance)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	defer tx.Rollback()
+	var name string
+	var protection, suspended bool
+	var zeroChecks int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT name,balance_protection_enabled,balance_suspended,zero_balance_checks
+		FROM upstreams WHERE id=$1 FOR UPDATE`, id,
+	).Scan(&name, &protection, &suspended, &zeroChecks); errors.Is(err, sql.ErrNoRows) {
+		return core.BalanceUnchanged, ErrNotFound
+	} else if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	nextSuspended, nextChecks, transition := balanceProtectionState(protection, suspended, zeroChecks, balance, immediate)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upstreams SET balance=$1,balance_updated_at=now(),balance_suspended=$2,
+			zero_balance_checks=$3,updated_at=now() WHERE id=$4`, value, nextSuspended, nextChecks, id,
+	); err != nil {
+		return core.BalanceUnchanged, err
+	}
+	if transition != core.BalanceUnchanged {
+		if err := writeBalanceAudit(ctx, tx, id, transition, map[string]any{
+			"available": balance.Available, "currency": balance.Currency, "manual": immediate,
+		}); err != nil {
+			return core.BalanceUnchanged, err
+		}
+		if err := writeBalanceAlertEvent(ctx, tx, id, name, transition, ""); err != nil {
+			return core.BalanceUnchanged, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return core.BalanceUnchanged, err
+	}
+	return transition, nil
+}
+
+func balanceProtectionState(enabled, suspended bool, zeroChecks int, balance core.Balance, immediate bool) (bool, int, core.BalanceTransition) {
+	nextSuspended, nextChecks := suspended, zeroChecks
+	zero := enabled && balance.Status == "ok" && !balance.Unlimited && balance.Available != nil && *balance.Available <= 0
+	usable := enabled && balance.Status == "ok" && (balance.Unlimited || balance.Available != nil && *balance.Available > 0)
+	switch {
+	case !enabled:
+		nextSuspended, nextChecks = false, 0
+	case zero:
+		if immediate {
+			nextChecks = 2
+		} else {
+			nextChecks++
+		}
+		if nextChecks >= 2 {
+			nextSuspended = true
+		}
+	case usable:
+		nextSuspended, nextChecks = false, 0
+	default:
+		nextChecks = 0
+	}
+	transition := core.BalanceUnchanged
+	if !suspended && nextSuspended {
+		transition = core.BalanceSuspended
+	} else if suspended && !nextSuspended {
+		transition = core.BalanceResumed
+	}
+	return nextSuspended, nextChecks, transition
+}
+
+func writeBalanceAudit(ctx context.Context, tx *sql.Tx, id int64, transition core.BalanceTransition, detail map[string]any) error {
+	detail["transition"] = transition
+	value, err := json.Marshal(detail)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE upstreams SET balance=$1, balance_updated_at=now(), updated_at=now() WHERE id=$2`, value, id)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO audit_logs(action,target_type,target_id,detail)
+		VALUES($1,'upstream',$2,$3)`, "upstream.balance_"+string(transition), strconv.FormatInt(id, 10), value)
+	return err
+}
+
+func writeBalanceAlertEvent(ctx context.Context, tx *sql.Tx, id int64, name string, transition core.BalanceTransition, reason string) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO alert_events(upstream_id,event,state,message)
+		VALUES($1,'upstream_balance_protection',$2,$3)`, id, transition, core.BalanceTransitionMessage(name, transition, reason))
 	return err
 }
 
@@ -247,8 +378,9 @@ func (s *Store) scanUpstream(row scanner) (UpstreamRecord, error) {
 	var apiKey, accessToken, userID, aliases, balance []byte
 	var connectMS, firstByteMS, idleMS, cooldownSeconds int64
 	err := row.Scan(
-		&record.ID, &record.Name, &record.Kind, &record.BaseURL, &apiKey, &accessToken, &userID,
-		&record.Enabled, &record.Priority, pq.Array(&record.Protocols), pq.Array(&record.Models), &record.ModelsLocked, &aliases,
+		&record.ID, &record.Name, &record.Kind, &record.BaseURL, &record.UserAgent, &apiKey, &accessToken, &userID,
+		&record.Enabled, &record.BalanceProtection, &record.BalanceSuspended, &record.ZeroBalanceChecks,
+		&record.Priority, pq.Array(&record.Protocols), pq.Array(&record.Models), &record.ModelsLocked, &aliases,
 		&connectMS, &firstByteMS, &idleMS, &record.FailureThreshold, &cooldownSeconds,
 		&record.HealthStatus, &record.ConsecutiveFailure, &record.CircuitOpenUntil, &record.LastCheckAt,
 		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt, &record.PricingProfileID,

@@ -47,6 +47,10 @@ while hop-by-hop headers and client authentication headers are replaced with the
 selected upstream API key. For Messages requests, the upstream receives both
 Bearer authorization and `X-Api-Key`.
 
+An upstream may define a fixed User-Agent. When configured, it replaces the
+client User-Agent for forwarded requests and is also used by probes; otherwise
+the client User-Agent is retained.
+
 An upstream Base URL may end at the host or include `/v1`; D-API avoids adding a
 second `/v1`. Redirects from upstream API and probe requests are not followed.
 
@@ -87,7 +91,8 @@ D-API tries the next upstream after:
 
 Other HTTP statuses, including most 4xx responses, are returned without another
 attempt. Repeated failures can open the upstream circuit; 401 and 403 open it
-immediately. Disabled and currently circuit-open upstreams are not candidates.
+immediately. Disabled, balance-suspended, and currently circuit-open upstreams
+are not candidates.
 
 When every attempted upstream is rate-limited, D-API returns 429. When every
 attempt times out, it returns 504. Other exhausted failover paths return 502.

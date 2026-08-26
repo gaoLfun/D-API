@@ -21,10 +21,14 @@ CREATE TABLE IF NOT EXISTS upstreams (
     name TEXT NOT NULL UNIQUE,
     kind TEXT NOT NULL CHECK (kind IN ('newapi', 'sub2api')),
     base_url TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
     api_key_encrypted BYTEA NOT NULL,
     access_token_encrypted BYTEA,
     user_id_encrypted BYTEA,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    balance_protection_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    balance_suspended BOOLEAN NOT NULL DEFAULT FALSE,
+    zero_balance_checks INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL DEFAULT 100,
     protocols TEXT[] NOT NULL DEFAULT '{}',
     models TEXT[] NOT NULL DEFAULT '{}',
@@ -49,6 +53,10 @@ CREATE INDEX IF NOT EXISTS upstreams_route_idx ON upstreams(enabled, priority, i
 CREATE INDEX IF NOT EXISTS upstreams_protocols_idx ON upstreams USING GIN(protocols);
 CREATE INDEX IF NOT EXISTS upstreams_models_idx ON upstreams USING GIN(models);
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS models_locked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT '';
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_protection_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS zero_balance_checks INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS pricing_profiles (
     id BIGSERIAL PRIMARY KEY,

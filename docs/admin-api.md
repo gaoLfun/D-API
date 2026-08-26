@@ -68,12 +68,23 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 `responses`、`chat`、`messages`。后台新建表单默认 Sub2API，协议默认
 Responses，但直接调用 API 时仍应显式传值。
 
-可选字段：`enabled`、`priority`、`models_locked`、`model_aliases`、
-`access_token`、`user_id`、`connect_timeout_ms`、`first_byte_timeout_ms`、
-`idle_timeout_ms`、`failure_threshold`、`cooldown_seconds`。默认值分别为
+可选字段：`enabled`、`balance_protection_enabled`、`user_agent`、`priority`、
+`models_locked`、`model_aliases`、`access_token`、`user_id`、
+`connect_timeout_ms`、`first_byte_timeout_ms`、`idle_timeout_ms`、
+`failure_threshold`、`cooldown_seconds`。默认值分别为
 优先级 100、连接 5000 ms、首包 60000 ms、空闲 300000 ms、失败阈值 3、
 冷却 60 s。仅 NewAPI 使用 `access_token` 和 `user_id` 做兼容的余额查询；
 Sub2API 会忽略这两个字段。
+
+`balance_protection_enabled` 默认开启。后台自动余额检查连续两次确认
+`status=ok`、非无限额度且 `available<=0` 后，会把该上游标记为
+`balance_suspended` 并停止路由；手动刷新余额只需一次确认。余额恢复为正数或无限
+额度时自动恢复，查询失败会打断连续计数但不会解除已有暂停。列表响应同时包含
+`balance_suspended` 和 `zero_balance_checks`。
+
+`user_agent` 为空时保留客户端请求的 User-Agent；设置后，网关转发、健康检查、
+余额查询、模型发现和模型测试都会使用该值。字段最多 256 个字符且不能包含换行。
+后台提供默认、Codex 兼容、OpenCode 兼容和自定义四种策略。
 
 更新时，空的凭据字段表示保留已有值；需要清除 NewAPI 余额凭据时传
 `clear_balance_credentials: true`。服务会拒绝无效协议、超长字段、非
@@ -206,6 +217,10 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 `latency`。规则的窗口至少 60 秒，冷却至少 60 秒；每条规则可绑定一个
 上游。`max_attempts` 位于 1-5，默认 3，控制一次客户端请求最多尝试几个
 候选上游。
+
+余额保护暂停、恢复以及关闭保护导致的恢复会记录为
+`upstream_balance_protection` 事件，并发送到已启用通知渠道。这类状态转换由
+上游自身状态触发，不需要单独创建告警规则。
 
 ## 限制与兼容性
 
