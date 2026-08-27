@@ -86,12 +86,22 @@ Sub2API 会忽略这两个字段。
 余额查询、模型发现和模型测试都会使用该值。字段最多 256 个字符且不能包含换行。
 后台提供默认、Codex 兼容、OpenCode 兼容和自定义四种策略。
 
+余额查询成功后会保留 `used`、`currency` 和 `last_success_at`。后续查询失败或
+返回不完整字段时，管理界面仍显示最近一次成功结果，并将当前状态标为未知或不可用；
+这不会恢复已暂停的上游，也不会伪造新的成功时间。
+
 更新时，空的凭据字段表示保留已有值；需要清除 NewAPI 余额凭据时传
 `clear_balance_credentials: true`。服务会拒绝无效协议、超长字段、非
 HTTP(S) URL 和指向回环、私网、链路本地、组播、CGNAT 或云元数据地址的 URL。
 
 成功创建返回 `201 {"id":123}`。列表只返回 `has_api_key`、
 `has_access_token`、`has_user_id` 等存在性标记，不返回明文凭据。
+
+上游列表还会返回今日及生命周期的 `today_requests`、`today_tokens`、
+`today_cost_usd`、`today_cost_coverage`、`lifetime_requests`、
+`lifetime_cost_usd` 和 `lifetime_cost_coverage`。成本仅统计已匹配价格档案且
+包含 Token 用量的请求；多个账号聚合展示时，账号扣费和官方估算会在详情抽屉中
+分别列出，不会把不同账号的余额或成本混为一项。
 
 模型测试会发送真实的最小请求，可能消耗上游额度。NewAPI 按模型选择
 Chat 或 Responses；Sub2API 先做源站 HEAD，再发送带算术 challenge 的模型请求。

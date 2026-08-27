@@ -267,39 +267,44 @@ type upstreamPayload struct {
 }
 
 type upstreamView struct {
-	ID                  int64             `json:"id"`
-	Name                string            `json:"name"`
-	Kind                string            `json:"kind"`
-	BaseURL             string            `json:"base_url"`
-	UserAgent           string            `json:"user_agent"`
-	HasAPIKey           bool              `json:"has_api_key"`
-	HasAccessToken      bool              `json:"has_access_token"`
-	HasUserID           bool              `json:"has_user_id"`
-	Enabled             bool              `json:"enabled"`
-	BalanceProtection   bool              `json:"balance_protection_enabled"`
-	BalanceSuspended    bool              `json:"balance_suspended"`
-	ZeroBalanceChecks   int               `json:"zero_balance_checks"`
-	Priority            int               `json:"priority"`
-	Protocols           []string          `json:"protocols"`
-	Models              []string          `json:"models"`
-	ModelsLocked        bool              `json:"models_locked"`
-	ModelAliases        map[string]string `json:"model_aliases"`
-	PricingProfileID    *int64            `json:"pricing_profile_id,omitempty"`
-	ConnectTimeoutMS    int64             `json:"connect_timeout_ms"`
-	FirstByteTimeoutMS  int64             `json:"first_byte_timeout_ms"`
-	IdleTimeoutMS       int64             `json:"idle_timeout_ms"`
-	FailureThreshold    int               `json:"failure_threshold"`
-	CooldownSeconds     int64             `json:"cooldown_seconds"`
-	HealthStatus        string            `json:"health_status"`
-	ConsecutiveFailures int               `json:"consecutive_failures"`
-	CircuitOpenUntil    *time.Time        `json:"circuit_open_until,omitempty"`
-	LastCheckAt         *time.Time        `json:"last_check_at,omitempty"`
-	LastError           string            `json:"last_error,omitempty"`
-	TodayRequests       int64             `json:"today_requests"`
-	TodayTokens         int64             `json:"today_tokens"`
-	Balance             core.Balance      `json:"balance"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	ID                   int64             `json:"id"`
+	Name                 string            `json:"name"`
+	Kind                 string            `json:"kind"`
+	BaseURL              string            `json:"base_url"`
+	UserAgent            string            `json:"user_agent"`
+	HasAPIKey            bool              `json:"has_api_key"`
+	HasAccessToken       bool              `json:"has_access_token"`
+	HasUserID            bool              `json:"has_user_id"`
+	Enabled              bool              `json:"enabled"`
+	BalanceProtection    bool              `json:"balance_protection_enabled"`
+	BalanceSuspended     bool              `json:"balance_suspended"`
+	ZeroBalanceChecks    int               `json:"zero_balance_checks"`
+	Priority             int               `json:"priority"`
+	Protocols            []string          `json:"protocols"`
+	Models               []string          `json:"models"`
+	ModelsLocked         bool              `json:"models_locked"`
+	ModelAliases         map[string]string `json:"model_aliases"`
+	PricingProfileID     *int64            `json:"pricing_profile_id,omitempty"`
+	ConnectTimeoutMS     int64             `json:"connect_timeout_ms"`
+	FirstByteTimeoutMS   int64             `json:"first_byte_timeout_ms"`
+	IdleTimeoutMS        int64             `json:"idle_timeout_ms"`
+	FailureThreshold     int               `json:"failure_threshold"`
+	CooldownSeconds      int64             `json:"cooldown_seconds"`
+	HealthStatus         string            `json:"health_status"`
+	ConsecutiveFailures  int               `json:"consecutive_failures"`
+	CircuitOpenUntil     *time.Time        `json:"circuit_open_until,omitempty"`
+	LastCheckAt          *time.Time        `json:"last_check_at,omitempty"`
+	LastError            string            `json:"last_error,omitempty"`
+	TodayRequests        int64             `json:"today_requests"`
+	TodayTokens          int64             `json:"today_tokens"`
+	TodayCostUSD         float64           `json:"today_cost_usd"`
+	TodayCostCoverage    *float64          `json:"today_cost_coverage"`
+	LifetimeRequests     int64             `json:"lifetime_requests"`
+	LifetimeCostUSD      float64           `json:"lifetime_cost_usd"`
+	LifetimeCostCoverage *float64          `json:"lifetime_cost_coverage"`
+	Balance              core.Balance      `json:"balance"`
+	CreatedAt            time.Time         `json:"created_at"`
+	UpdatedAt            time.Time         `json:"updated_at"`
 }
 
 func (s *Server) listUpstreams(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +323,17 @@ func (s *Server) listUpstreams(w http.ResponseWriter, r *http.Request) {
 		view := viewUpstream(record)
 		view.TodayRequests = todayUsage[record.ID].Requests
 		view.TodayTokens = todayUsage[record.ID].Tokens
+		view.TodayCostUSD = todayUsage[record.ID].CostUSD
+		view.LifetimeRequests = todayUsage[record.ID].LifetimeRequests
+		view.LifetimeCostUSD = todayUsage[record.ID].LifetimeCostUSD
+		if view.TodayRequests > 0 {
+			coverage := float64(todayUsage[record.ID].CostKnownRequests) / float64(view.TodayRequests)
+			view.TodayCostCoverage = &coverage
+		}
+		if view.LifetimeRequests > 0 {
+			coverage := float64(todayUsage[record.ID].LifetimeKnownRequests) / float64(view.LifetimeRequests)
+			view.LifetimeCostCoverage = &coverage
+		}
 		views = append(views, view)
 	}
 	writeJSON(w, http.StatusOK, views)

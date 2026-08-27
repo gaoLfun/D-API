@@ -202,8 +202,16 @@ func TestStoreLifecycle(t *testing.T) {
 	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model"); err != nil || len(routed) != 0 {
 		t.Fatalf("balance-suspended route candidates=%#v err=%v", routed, err)
 	}
-	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &positive}, false); err != nil || transition != core.BalanceResumed {
+	used := 2.5
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "ok", Available: &positive, Used: &used, Currency: "USD"}, false); err != nil || transition != core.BalanceResumed {
 		t.Fatalf("balance recovery transition=%q err=%v", transition, err)
+	}
+	if transition, err := database.SaveBalance(ctx, upstreamID, core.Balance{Status: "unknown", Error: "temporary failure"}, false); err != nil || transition != core.BalanceUnchanged {
+		t.Fatalf("failed balance refresh transition=%q err=%v", transition, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil || record.Balance.Used == nil || *record.Balance.Used != used || record.Balance.Currency != "USD" || record.Balance.LastSuccess == nil {
+		t.Fatalf("last successful balance usage was not retained: %#v err=%v", record.Balance, err)
 	}
 	if routed, err := database.ListRouteUpstreams(ctx, groupID, core.ProtocolChat, "model"); err != nil || len(routed) != 1 {
 		t.Fatalf("balance-recovered route candidates=%#v err=%v", routed, err)
@@ -274,8 +282,33 @@ func TestStoreLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := todayUsage[upstreamID]; got.Requests != 1 || got.Tokens != 15 {
+	if got := todayUsage[upstreamID]; got.Requests != 1 || got.Tokens != 15 || got.CostKnownRequests != 1 || got.LifetimeRequests != 1 || got.LifetimeKnownRequests != 1 || got.CostUSD != 0.000012 || got.LifetimeCostUSD != 0.000012 {
 		t.Fatalf("today upstream usage=%#v", got)
+	}
+	backfillAt := time.Now().Add(time.Second)
+	if err := database.RecordRequest(ctx, core.RequestLog{
+		RequestID: "request-backfill", APIKeyID: keyID, UpstreamID: &secondaryID, Protocol: core.ProtocolChat,
+		Model: "model", StatusCode: 200, DurationMS: 10, Usage: core.Usage{InputTokens: &oneMillion}, CreatedAt: backfillAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := database.Upstream(ctx, secondaryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary.PricingProfileID = &profileID
+	if _, err := database.UpdateUpstream(ctx, secondary.Upstream); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := database.BackfillPricingCosts(ctx, backfillAt, time.Now()); err != nil || result.LogsUpdated != 1 {
+		t.Fatalf("pricing backfill=%#v err=%v", result, err)
+	}
+	todayUsage, err = database.TodayUpstreamUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := todayUsage[secondaryID]; got.Requests != 1 || got.CostKnownRequests != 1 || got.LifetimeRequests != 1 || got.LifetimeKnownRequests != 1 || got.CostUSD != 1 || got.LifetimeCostUSD != 1 {
+		t.Fatalf("backfilled upstream usage=%#v", got)
 	}
 
 	groupedRawKey := "dapi_test_grouped_key"
@@ -305,7 +338,7 @@ func TestStoreLifecycle(t *testing.T) {
 	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&totalRows); err != nil {
 		t.Fatal(err)
 	}
-	if groupedRows != 1 || totalRows != 2 {
+	if groupedRows != 1 || totalRows != 3 {
 		t.Fatalf("daily usage rows grouped=%d total=%d", groupedRows, totalRows)
 	}
 	if err := database.DeleteAPIKey(ctx, keyID); err != nil {
@@ -330,7 +363,7 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var usageRows int
-	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&usageRows); err != nil || usageRows != 2 {
+	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&usageRows); err != nil || usageRows != 3 {
 		t.Fatalf("historical usage rows=%d err=%v", usageRows, err)
 	}
 

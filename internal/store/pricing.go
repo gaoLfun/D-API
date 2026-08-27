@@ -456,6 +456,15 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 		) SELECT count(*) FROM updated`).Scan(&result.HourlyUpdated); err != nil {
 		return PricingBackfillResult{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO upstream_lifetime_usage(upstream_id,requests,cost_known_requests,cost_usd,updated_at)
+		SELECT upstream_id,0,count(*),sum(cost_usd),now() FROM pricing_backfill GROUP BY upstream_id
+		ON CONFLICT(upstream_id) DO UPDATE SET
+			cost_known_requests=upstream_lifetime_usage.cost_known_requests+EXCLUDED.cost_known_requests,
+			cost_usd=upstream_lifetime_usage.cost_usd+EXCLUDED.cost_usd,
+			updated_at=now()`); err != nil {
+		return PricingBackfillResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return PricingBackfillResult{}, err
 	}

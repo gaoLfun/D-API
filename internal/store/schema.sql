@@ -185,6 +185,14 @@ ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cost_known_requests BIGINT NOT 
 ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_api_key_id_fkey;
 ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_upstream_id_fkey;
 
+CREATE TABLE IF NOT EXISTS upstream_lifetime_usage (
+    upstream_id BIGINT PRIMARY KEY,
+    requests BIGINT NOT NULL DEFAULT 0,
+    cost_known_requests BIGINT NOT NULL DEFAULT 0,
+    cost_usd NUMERIC(20,8) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS hourly_usage (
     hour TIMESTAMPTZ NOT NULL,
     api_key_id BIGINT NOT NULL,
@@ -290,6 +298,13 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 INSERT INTO settings(key,value) VALUES('usd_cny_rate','7.2'::jsonb) ON CONFLICT(key) DO NOTHING;
+INSERT INTO upstream_lifetime_usage(upstream_id, requests, cost_known_requests, cost_usd, updated_at)
+SELECT upstream_id, sum(requests), sum(cost_known_requests), sum(cost_usd), now()
+FROM daily_usage
+WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='upstream_lifetime_usage_migrated_v1')
+GROUP BY upstream_id
+ON CONFLICT(upstream_id) DO NOTHING;
+INSERT INTO settings(key,value) VALUES('upstream_lifetime_usage_migrated_v1','true') ON CONFLICT(key) DO NOTHING;
 
 INSERT INTO pricing_profiles(name,provider,source_url,source_version)
 VALUES

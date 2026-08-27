@@ -27,6 +27,8 @@ All notable changes to D-API will be documented in this file. The format is base
   resumes recovered balances, and emits persisted notification events.
 - Per-upstream User-Agent policies shared by gateway forwarding and operational
   probes, including Codex/OpenCode presets and custom values.
+- Upstream dashboard cost details for today and lifetime, plus a transactional
+  lifetime usage aggregate and retention of last successful balance metadata.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

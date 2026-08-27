@@ -78,6 +78,16 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 			cost_usd=daily_usage.cost_usd+EXCLUDED.cost_usd,
 			cost_known_requests=daily_usage.cost_known_requests+EXCLUDED.cost_known_requests
 		RETURNING 1
+		), lifetime AS (
+			INSERT INTO upstream_lifetime_usage(upstream_id,requests,cost_known_requests,cost_usd,updated_at)
+			SELECT upstream_id,1,CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END,COALESCE(cost_usd,0),now()
+			FROM inserted WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
+			ON CONFLICT(upstream_id) DO UPDATE SET
+			requests=upstream_lifetime_usage.requests+1,
+			cost_known_requests=upstream_lifetime_usage.cost_known_requests+EXCLUDED.cost_known_requests,
+			cost_usd=upstream_lifetime_usage.cost_usd+EXCLUDED.cost_usd,
+			updated_at=now()
+			RETURNING 1
 		)
 		INSERT INTO hourly_usage(
 			hour,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,

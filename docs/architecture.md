@@ -99,6 +99,10 @@ but the committed stream cannot be replayed safely.
 - Request logs older than the configured retention are removed once per day.
   Daily usage aggregates, audit entries, and alert events are retained for the
   configured `DAPI_LOG_RETENTION` window and removed in bounded batches.
+- A separate `upstream_lifetime_usage` aggregate keeps per-upstream request and
+  estimated-cost totals beyond daily-log retention. It is updated transactionally
+  with request recording and historical cost backfill, so the dashboard can show
+  lifetime totals without scanning or retaining every request log.
 
 Only enabled upstreams are probed by background jobs.
 
@@ -136,6 +140,9 @@ explicit model tests so compatibility behavior stays consistent across paths.
 - Pricing profiles and per-upstream assignments are stored in PostgreSQL. Costs
   are estimates derived from recorded Token usage and matching profile prices;
   D-API has no billing or quota-charging subsystem.
+- Balance records retain the last successful usage fields (`used`, currency, and
+  success timestamp) when a later probe is unavailable or incomplete; probe status
+  remains separate from the last known successful values.
 - Client API keys use SHA-256 hashes for authentication and an AES-256-GCM
   encrypted copy for administrator copy/CCSwitch import. Existing keys created
   before this encrypted copy was introduced cannot be recovered and must be

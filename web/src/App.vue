@@ -48,7 +48,12 @@ interface Upstream {
   last_error?: string
   today_requests?: number
   today_tokens?: number
-  balance?: { status?: string; available?: number; used?: number; currency?: string; unlimited?: boolean; updated_at?: string }
+  today_cost_usd?: number
+  today_cost_coverage?: number
+  lifetime_requests?: number
+  lifetime_cost_usd?: number
+  lifetime_cost_coverage?: number
+  balance?: { status?: string; available?: number; used?: number; currency?: string; unlimited?: boolean; updated_at?: string; last_success_at?: string }
 }
 
 interface UpstreamGroup {
@@ -1566,7 +1571,17 @@ function fmtBalance(upstream: Upstream) {
 
 function fmtBalanceUsed(upstream: Upstream) {
   const balance = upstream.balance
-  return balance?.used == null ? '' : `${balance.currency || '$'} ${balance.used.toFixed(2)}`
+  return balance?.used == null ? '暂无数据' : `${balance.currency || '$'} ${balance.used.toFixed(2)}`
+}
+
+function balanceUsedUpdatedAt(upstream: Upstream) {
+  return upstream.balance?.last_success_at || upstream.balance?.updated_at
+}
+
+function officialCostDetail(upstream: Upstream, period: 'today' | 'lifetime') {
+  const cost = Number(period === 'today' ? upstream.today_cost_usd : upstream.lifetime_cost_usd || 0)
+  const coverage = period === 'today' ? upstream.today_cost_coverage : upstream.lifetime_cost_coverage
+  return `${fmtCurrency(cost, 'USD')} / ${fmtCurrency(cost * Number(pricing.value.usd_cny_rate || 7.2), 'CNY')} · 覆盖 ${fmtPercent(coverage)}`
 }
 
 onMounted(async () => {
@@ -1703,18 +1718,20 @@ onBeforeUnmount(() => {
             </div>
             <div v-if="dashboardRouteView === 'current'" class="table-wrap">
               <table class="dashboard-upstream-table">
-                <thead><tr><th>优先级</th><th>上游</th><th>状态</th><th>今日用量</th><th>余额</th><th>协议</th><th>最后检查</th></tr></thead>
+                <thead><tr><th>优先级</th><th>上游</th><th>状态</th><th>今日用量</th><th>账号扣费总额</th><th>官方价格估算</th><th>余额</th><th>协议</th><th>最后检查</th></tr></thead>
                 <tbody>
                   <tr v-for="item in shownDashUpstreams" :key="item.key" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
                     <td><span class="priority">{{ item.priority }}</span></td>
                     <td><strong>{{ item.base_url }}</strong><small>{{ item.total }} 个 Key · {{ item.available }} 个可路由</small></td>
                     <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span></td>
                   <td><strong class="usage-value">{{ fmtNumber(item.today_tokens) }} Token</strong><small>{{ fmtNumber(item.today_requests) }} 次请求</small></td>
+                    <td><strong>{{ item.total > 1 ? '多账号' : fmtBalanceUsed(item.items[0]) }}</strong><small>{{ item.total > 1 ? '展开后按 Key 查看' : fmtDate(balanceUsedUpdatedAt(item.items[0])) }}</small></td>
+                    <td><strong>{{ item.total > 1 ? '多账号' : officialCostDetail(item.items[0], 'today') }}</strong><small>{{ item.total > 1 ? '不聚合不同账号' : `历史 ${officialCostDetail(item.items[0], 'lifetime')}` }}</small></td>
                     <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small v-if="item.total > 1">展开查看余额</small></td>
                     <td><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></td>
                     <td class="muted nowrap">{{ fmtDate(item.last_check_at) }}</td>
                   </tr>
-              <tr v-if="!shownDashUpstreams.length"><td colspan="7"><div class="empty"><Server :size="22" /><strong>暂无上游</strong><span>创建路由目标后，这里会显示健康与余额状态。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
+              <tr v-if="!shownDashUpstreams.length"><td colspan="9"><div class="empty"><Server :size="22" /><strong>暂无上游</strong><span>创建路由目标后，这里会显示健康与余额状态。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
                 </tbody>
               </table>
             </div>
@@ -1799,6 +1816,7 @@ onBeforeUnmount(() => {
               <th :aria-sort="ariaSort('upstreams', 'name')"><button class="sort-button" @click="toggleSort('upstreams', 'name')">上游<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('upstreams', 'health_status')"><button class="sort-button" @click="toggleSort('upstreams', 'health_status')">连接<ArrowUpDown :size="12" /></button></th>
               <th>能力</th>
+              <th>账号扣费总额</th><th>官方价格估算</th>
               <th :aria-sort="ariaSort('upstreams', 'balance')"><button class="sort-button" @click="toggleSort('upstreams', 'balance')">余额<ArrowUpDown :size="12" /></button></th>
               <th>熔断</th><th class="right">操作</th>
             </tr></thead>
@@ -1809,15 +1827,17 @@ onBeforeUnmount(() => {
                 <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.available }} 个可路由<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
                 <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><small v-if="item.total > 1">点击查看各 Key 状态</small></td>
                 <td><div class="tag-row"><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></div><small>{{ item.models?.length || 0 }} 个模型</small></td>
+                <td><strong>{{ item.total > 1 ? '多账号' : fmtBalanceUsed(item.items[0]) }}</strong><small>{{ item.total > 1 ? '抽屉内分别展示' : fmtDate(balanceUsedUpdatedAt(item.items[0])) }}</small></td>
+                <td><strong>{{ item.total > 1 ? '多账号' : officialCostDetail(item.items[0], 'today') }}</strong><small>{{ item.total > 1 ? '不聚合不同账号' : `历史 ${officialCostDetail(item.items[0], 'lifetime')}` }}</small></td>
                 <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small>{{ item.total > 1 ? '抽屉内分别展示' : fmtDate(item.items[0].balance?.updated_at) }}</small></td>
                 <td><small>{{ groupCircuitText(item) }}</small><small v-if="item.balance_suspended">{{ item.balance_suspended }} 个余额暂停</small><small v-else-if="item.total > item.enabled">{{ item.total - item.enabled }} 个停用</small></td>
                 <td class="menu-cell"><div class="row-actions">
                   <button class="icon" title="查看 Key" @click.stop="openUpstreamGroup(item)"><MoreHorizontal :size="16" /></button>
                 </div></td>
               </tr>
-              <tr v-if="expandedMobileRow === `upstream-${item.key}`" class="mobile-detail-row"><td colspan="7"><dl><div><dt>连接</dt><dd>{{ groupStatusText(item) }}</dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型</dt><dd>{{ item.models?.length || 0 }} 个</dd></div><div><dt>Key 数量</dt><dd>{{ item.total }}</dd></div></dl></td></tr>
+              <tr v-if="expandedMobileRow === `upstream-${item.key}`" class="mobile-detail-row"><td colspan="9"><dl><div><dt>连接</dt><dd>{{ groupStatusText(item) }}</dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型</dt><dd>{{ item.models?.length || 0 }} 个</dd></div><div><dt>Key 数量</dt><dd>{{ item.total }}</dd></div></dl></td></tr>
               </template>
-              <tr v-if="!upstreamGroups.length"><td colspan="7"><div class="empty"><Server :size="22" /><strong>还没有配置上游</strong><span>添加第一个 NewAPI 或 Sub2API 路由目标。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
+              <tr v-if="!upstreamGroups.length"><td colspan="9"><div class="empty"><Server :size="22" /><strong>还没有配置上游</strong><span>添加第一个 NewAPI 或 Sub2API 路由目标。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
             </tbody>
           </table></div></section>
         </section>
@@ -2050,7 +2070,7 @@ onBeforeUnmount(() => {
       <div class="upstream-key-list">
         <article v-for="item in upstreamGroupDrawer.items" :key="item.id" class="upstream-key-card">
           <div class="upstream-key-card-head"><div><strong :title="item.name">{{ item.name }}</strong><small>优先级 P{{ item.priority }} · {{ item.protocols?.join(' / ') }}</small></div><span class="status" :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</span></div>
-          <dl><div><dt>今日请求</dt><dd>{{ fmtNumber(item.today_requests) }}</dd></div><div><dt>今日 Token</dt><dd>{{ fmtNumber(item.today_tokens) }}</dd></div><div><dt>余额</dt><dd>{{ fmtBalance(item) }}</dd></div><div><dt>余额保护</dt><dd>{{ balanceProtectionText(item) }}</dd></div><div><dt>价格档案</dt><dd>{{ pricingProfileName(item.pricing_profile_id) }}</dd></div><div><dt>熔断</dt><dd>{{ item.health_status === 'open' ? `开启 · ${item.consecutive_failures || 0} 次失败` : `未开启 · ${item.consecutive_failures || 0} 次失败` }}</dd></div></dl>
+          <dl><div><dt>今日请求</dt><dd>{{ fmtNumber(item.today_requests) }}</dd></div><div><dt>今日 Token</dt><dd>{{ fmtNumber(item.today_tokens) }}</dd></div><div><dt>账号扣费总额</dt><dd>{{ fmtBalanceUsed(item) }}<small>{{ fmtDate(balanceUsedUpdatedAt(item)) }}</small></dd></div><div><dt>今日官方估算</dt><dd>{{ officialCostDetail(item, 'today') }}</dd></div><div><dt>历史官方估算</dt><dd>{{ officialCostDetail(item, 'lifetime') }}</dd></div><div><dt>余额</dt><dd>{{ fmtBalance(item) }}</dd></div><div><dt>余额保护</dt><dd>{{ balanceProtectionText(item) }}</dd></div><div><dt>价格档案</dt><dd>{{ pricingProfileName(item.pricing_profile_id) }}</dd></div><div><dt>熔断</dt><dd>{{ item.health_status === 'open' ? `开启 · ${item.consecutive_failures || 0} 次失败` : `未开启 · ${item.consecutive_failures || 0} 次失败` }}</dd></div></dl>
           <div class="upstream-key-actions"><button class="secondary" @click="openUpstream(item)"><Pencil :size="15" />编辑 Key</button><button class="icon" title="检查连接" @click="upstreamAction(item, 'check')"><Activity :size="16" /></button><button class="icon" title="刷新余额" @click="upstreamAction(item, 'balance')"><CircleDollarSign :size="16" /></button><button class="icon" title="刷新模型" @click="upstreamAction(item, 'models')"><Download :size="16" /></button><button class="icon danger" title="删除上游" @click="removeUpstream(item)"><Trash2 :size="16" /></button></div>
         </article>
       </div>

@@ -339,6 +339,7 @@ tr:hover .copy-button, .cell-copy:focus-within .copy-button { opacity: 1; }
 .upstream-key-card dl { margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .upstream-key-card dt { margin-bottom: 4px; color: var(--text-faint); font-size: 10px; }
 .upstream-key-card dd { margin: 0; overflow: hidden; color: var(--text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.upstream-key-card dd small { display: block; margin-top: 3px; color: var(--text-faint); font-size: 9px; }
 .upstream-key-actions { display: flex; justify-content: flex-end; align-items: center; gap: 5px; }
 .chart-summary { display: flex; align-items: center; gap: 20px; }
 .chart-summary span { display: grid; grid-template-columns: 8px auto; align-items: center; column-gap: 7px; }

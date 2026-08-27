@@ -234,10 +234,6 @@ func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []str
 }
 
 func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
-	value, err := json.Marshal(balance)
-	if err != nil {
-		return core.BalanceUnchanged, err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return core.BalanceUnchanged, err
@@ -246,12 +242,39 @@ func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance,
 	var name string
 	var protection, suspended bool
 	var zeroChecks int
+	var previousBalance []byte
 	if err := tx.QueryRowContext(ctx, `
-		SELECT name,balance_protection_enabled,balance_suspended,zero_balance_checks
+		SELECT name,balance_protection_enabled,balance_suspended,zero_balance_checks,balance
 		FROM upstreams WHERE id=$1 FOR UPDATE`, id,
-	).Scan(&name, &protection, &suspended, &zeroChecks); errors.Is(err, sql.ErrNoRows) {
+	).Scan(&name, &protection, &suspended, &zeroChecks, &previousBalance); errors.Is(err, sql.ErrNoRows) {
 		return core.BalanceUnchanged, ErrNotFound
 	} else if err != nil {
+		return core.BalanceUnchanged, err
+	}
+	var previous core.Balance
+	if len(previousBalance) > 0 {
+		if err := json.Unmarshal(previousBalance, &previous); err != nil {
+			return core.BalanceUnchanged, fmt.Errorf("decode previous balance: %w", err)
+		}
+	}
+	if balance.Used == nil {
+		balance.Used = previous.Used
+	}
+	if balance.Currency == "" {
+		balance.Currency = previous.Currency
+	}
+	if balance.LastSuccess == nil && balance.Status == "ok" {
+		now := time.Now().UTC()
+		balance.LastSuccess = &now
+	}
+	if balance.LastSuccess == nil {
+		balance.LastSuccess = previous.LastSuccess
+		if balance.LastSuccess == nil && previous.Status == "ok" {
+			balance.LastSuccess = previous.UpdatedAt
+		}
+	}
+	value, err := json.Marshal(balance)
+	if err != nil {
 		return core.BalanceUnchanged, err
 	}
 	nextSuspended, nextChecks, transition := balanceProtectionState(protection, suspended, zeroChecks, balance, immediate)

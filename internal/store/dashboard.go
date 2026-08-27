@@ -56,14 +56,26 @@ type HourlyStat struct {
 }
 
 type UpstreamUsageToday struct {
-	Requests int64 `json:"requests"`
-	Tokens   int64 `json:"tokens"`
+	Requests              int64   `json:"requests"`
+	Tokens                int64   `json:"tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	CostKnownRequests     int64   `json:"cost_known_requests"`
+	LifetimeRequests      int64   `json:"lifetime_requests"`
+	LifetimeCostUSD       float64 `json:"lifetime_cost_usd"`
+	LifetimeKnownRequests int64   `json:"lifetime_cost_known_requests"`
 }
 
 func (s *Store) TodayUpstreamUsage(ctx context.Context) (map[int64]UpstreamUsageToday, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT upstream_id,sum(requests),sum(input_tokens+output_tokens)
-		FROM daily_usage WHERE day=(now() AT TIME ZONE 'UTC')::date GROUP BY upstream_id`)
+		WITH today AS (
+			SELECT upstream_id,sum(requests) AS requests,sum(input_tokens+output_tokens) AS tokens,
+				sum(cost_usd) AS cost_usd,sum(cost_known_requests) AS cost_known_requests
+			FROM daily_usage WHERE day=(now() AT TIME ZONE 'UTC')::date GROUP BY upstream_id
+		)
+		SELECT u.id,COALESCE(t.requests,0),COALESCE(t.tokens,0),COALESCE(t.cost_usd,0),COALESCE(t.cost_known_requests,0),
+			COALESCE(l.requests,0),COALESCE(l.cost_usd,0),COALESCE(l.cost_known_requests,0)
+		FROM upstreams u LEFT JOIN today t ON t.upstream_id=u.id
+		LEFT JOIN upstream_lifetime_usage l ON l.upstream_id=u.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +84,8 @@ func (s *Store) TodayUpstreamUsage(ctx context.Context) (map[int64]UpstreamUsage
 	for rows.Next() {
 		var upstreamID int64
 		var usage UpstreamUsageToday
-		if err := rows.Scan(&upstreamID, &usage.Requests, &usage.Tokens); err != nil {
+		if err := rows.Scan(&upstreamID, &usage.Requests, &usage.Tokens, &usage.CostUSD, &usage.CostKnownRequests,
+			&usage.LifetimeRequests, &usage.LifetimeCostUSD, &usage.LifetimeKnownRequests); err != nil {
 			return nil, err
 		}
 		result[upstreamID] = usage
