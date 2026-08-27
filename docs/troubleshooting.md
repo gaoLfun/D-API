@@ -1,5 +1,7 @@
 # 故障排查
 
+[返回文档索引](README.md)
+
 先确认运行目录是包含 `compose.yaml` 的项目目录。命令默认使用 Docker
 Compose v2。
 

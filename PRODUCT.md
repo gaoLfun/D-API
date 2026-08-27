@@ -50,7 +50,7 @@ The primary environment is a desktop browser used for routine administration. Mo
 
 - Product behavior and Chinese interface copy live in `web/src/App.vue`.
 - Existing visual rules live in `web/src/styles.css`.
-- Product and deployment facts live in `README.zh-CN.md` and `docs/`.
+- Product and deployment facts live in `README.md` and `docs/`.
 - API behavior and security limits live in `docs/api-compatibility.md`,
   `docs/admin-api.md`, and `SECURITY.md`.
 - No approved screenshots, customer claims, or production usage-scale measurements are available.

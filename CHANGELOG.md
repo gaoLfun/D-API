@@ -36,6 +36,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Changed
 
+- Reorganized the repository documentation around a Chinese default README,
+  retained English reference documents, and added sanitized dashboard screenshots.
 - Documented Responses, Chat Completions, and Anthropic Messages compatibility,
   model probes, usage dimensions, cache metrics, and failover semantics.
 - Documented the default security boundary: loopback port 18083, explicit proxy

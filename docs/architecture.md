@@ -1,185 +1,117 @@
-# Architecture
+# 架构与路由
 
-This document describes D-API v0.1.0 as implemented. It is not a roadmap or a
-stability guarantee.
+[English](architecture.en.md)
 
-## Components
+本文描述 D-API 当前 `main` 分支的实现，而非未来路线图或稳定性承诺。
+
+## 组件
 
 ```text
-                              +----------------------+
-Client ---- HTTPS ---- Caddy ->| D-API Go process     |
-Admin ---- HTTPS -------------| - API gateway        |
-                              | - Admin API and SPA  |
-                              | - Health/balance jobs|
-                              | - Alert evaluator    |
-                              +----------+-----------+
-                                         |
-                                      PostgreSQL
-                                         |
-                        NewAPI/Sub2API <- routing/probes
+客户端 ---- HTTPS ---- Caddy ----> D-API Go 进程 ----> NewAPI / Sub2API 上游
+管理员 ---- HTTPS ---------------->  |  API 网关
+                                     |  管理 API 与 Vue SPA
+                                     |  健康/余额/价格/告警任务
+                                     +------ PostgreSQL
 ```
 
-- **Caddy** terminates TLS and proxies to D-API in the Compose deployment.
-- **D-API** is one stateless Go process apart from in-memory connection pools,
-  notification cooldowns, and login rate-limit counters.
-- **PostgreSQL** stores configuration, encrypted secrets, sessions, health and
-  circuit state, request metadata, usage aggregates, audit entries, and alerts.
-- **Vue SPA** is built into static files and served by the Go process.
+- **Caddy**：在 Compose 部署中终止 TLS 并反向代理到 D-API。
+- **D-API**：同一个 Go 进程提供客户端 API、管理 API、后台静态文件和后台任务。
+- **PostgreSQL**：保存配置、加密凭据、会话、健康/熔断状态、请求元数据、用量、审计和告警。
+- **Vue SPA**：构建后由 Go 进程同源提供。
 
-Running multiple D-API replicas is not an officially supported v0.1.0 topology.
-Some rate-limit and notification cooldown state is process-local.
+当前正式支持单实例部署。并发计数、登录限流和部分通知冷却状态位于进程内，
+因此多副本不是当前承诺的运行拓扑。
 
-The browser uses the same origin for the SPA and management API. The management
-surface uses a session cookie; client traffic uses independently created `dapi_`
-API keys. These authentication paths do not share credentials or permissions.
+## 请求路由流程
 
-## Request Flow
+1. 对客户端提交的 `dapi_` Key 做哈希认证，并确认 Key 已启用。
+2. 校验 Key 允许的协议、模型和所属分组。
+3. 只加载该分组内已启用的上游，按数字优先级从小到大排序。
+4. 排除已停用、余额暂停、熔断中、协议不兼容或模型不兼容的候选。
+5. 在 `max_attempts` 范围内依次尝试；默认 3，允许范围 1～5。
+6. 如果配置模型别名，只重写 JSON 顶层的 `model` 字段。
+7. 返回响应，并记录请求 ID、尝试链、状态、延迟和可获得的 Token 用量。
 
-1. D-API hashes the presented client API key and looks up an enabled key.
-2. It validates the key's protocol and model restrictions.
-3. It loads only the key's enabled group members, ordered by numeric priority,
-   then excludes disabled, circuit-open, protocol-incompatible, and
-   model-incompatible entries.
-4. It tries up to the configured maximum attempts within that group, which
-   defaults to 3 and is constrained to 1 through 5.
-5. For a model alias, only the request's top-level `model` value is rewritten.
-6. The response is returned with D-API request, upstream, and attempt headers.
-7. Request metadata, attempts, result, total/first-byte/first-token latency,
-   client IP, and available token usage are recorded. The request and response
-   bodies are not persisted.
+相同优先级按数据库顺序处理。当前不实现权重、随机、成本优先或最低延迟负载均衡。
 
-Upstreams with the same priority retain database order. There is no weighted,
-random, cost-aware, or least-latency load balancing in v0.1.0.
+## 分组、优先级与 Base URL 聚合
 
-## Failover and Circuit State
+客户端 Key 必须绑定一个分组，分组绑定一个或多个上游。优先级始终属于具体上游 Key：
+请求先进入 Key 的分组，再在该分组成员中按 Key 优先级路由，不会回退到其他分组或
+全局池。
 
-D-API retries another eligible upstream on transport errors, configured
-timeouts, HTTP 401, 403, 404, 429, and 5xx responses. Other HTTP responses are
-returned directly.
+管理界面会把规范化后相同 Base URL 的多个 Key 聚合成一个上游集群，方便查看同一服务
+下的多账号状态。该聚合只影响界面与集群数量统计：
 
-Each upstream has connect, first-byte, and response-idle timeouts. A successful
-attempt clears its consecutive failure count. Failures move health from unknown
-or healthy to degraded, then unhealthy once the failure threshold is reached.
-An unhealthy upstream is excluded until its cooldown expires. Authentication
-failures (401 or 403) open the circuit immediately.
+- 路由仍按每个 Key 的优先级、健康、模型和协议判断。
+- 余额、账号扣费和官方价格估算不会在聚合行相加，而是在抽屉中分别展示。
+- 拓扑视图是运维摘要，不改变实际 SQL 候选筛选规则。
 
-For streaming requests, D-API can switch upstreams only before it has written
-the first response byte to the client. A failure after that point is recorded,
-but the committed stream cannot be replayed safely.
+## 故障切换与熔断
 
-## Background Work
+D-API 在以下情况尝试下一个候选上游：
 
-- Health probes call the upstream `GET /v1/models` endpoint. The default
-  interval is 30 seconds.
-- Successful health probes update discovered models unless the administrator
-  has locked the model list.
-- The admin upstream form also provides an explicit model probe. NewAPI probes
-  follow its endpoint selection convention: regular models use Chat and
-  Responses/Codex models use Responses, with the configured protocol list
-  constraining what is tested. Sub2API probes first send one HEAD request to
-  the endpoint origin, then send a small arithmetic challenge through the
-  selected protocol; the expected number is generated per run. Sub2API model
-  responses slower than six seconds are marked degraded. Model probes are
-  foreground admin actions, are not part of the 30-second health loop, and can
-  consume upstream quota.
-- Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
-  is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
-  Per-upstream balance protection pauses routing after two consecutive automatic
-  zero-balance results (or one manual refresh), persists that state in PostgreSQL,
-  and resumes after the first positive or unlimited balance result. Failed balance
-  queries break the confirmation sequence without resuming a paused upstream.
-  Pause/resume transitions are persisted as operational events and delivered to
-  enabled notification channels without requiring an alert rule.
-- The pricing refresh job downloads the structured LiteLLM model price file once
-  per day and updates the managed OpenAI, Anthropic, and Google Gemini profiles
-  atomically. Custom profiles remain user-managed and provide the fallback for
-  models not covered by LiteLLM.
-- Alert rules are evaluated once per minute and can deliver email or webhook
-  notifications.
-- Request logs older than the configured retention are removed once per day.
-  Daily usage aggregates, audit entries, and alert events are retained for the
-  configured `DAPI_LOG_RETENTION` window and removed in bounded batches.
-- A separate `upstream_lifetime_usage` aggregate keeps per-upstream request and
-  estimated-cost totals beyond daily-log retention. It is updated transactionally
-  with request recording and historical cost backfill, so the dashboard can show
-  lifetime totals without scanning or retaining every request log.
+- 连接、首包或响应空闲超时；
+- 首字节发出前的传输、读取错误；
+- HTTP 401、403、404、429 或 5xx。
 
-Only enabled upstreams are probed by background jobs.
+其他 HTTP 状态直接返回。401/403 会立即打开熔断；普通失败累积到阈值后进入不健康状态，
+冷却结束后重新允许尝试。成功请求会清除连续失败计数。
 
-## Observability and Failure Isolation
+流式响应只有在首字节发出前才能安全切换上游；一旦响应已提交，中途断流只能记录失败，
+不能重放或拼接流。
 
-Every proxied request receives a request ID and records an ordered attempt chain.
-The record includes status, total duration, time to first byte, streaming time to
-first token when observable, token metadata, and the client IP. Bodies are
-deliberately excluded. Health failures update the upstream circuit in
-PostgreSQL, while gateway concurrency and login limits remain in process memory.
+## 后台任务
 
-The admin dashboard's upstream panel provides a tabular view and a topology view.
-The topology groups upstream entries by normalized base URL and shows the
-client-key to group-decision to upstream-cluster path, while preserving the
-priority, health, and balance-pause state used by the gateway. It is an
-operational summary; actual routing still follows the persisted group membership
-and SQL eligibility filters described above.
+- **健康检查**：默认每 30 秒请求上游 `/v1/models`，并在模型列表未锁定时更新模型。
+- **余额检查**：默认每 10 分钟探测兼容的 NewAPI/Sub2API 余额接口；已停用上游也会被探测，
+  以便余额恢复后及时清除暂停状态。
+- **余额保护**：自动检查连续两次为零（手动刷新一次）后暂停，恢复为正数或无限额度后恢复。
+- **价格同步**：每天从 LiteLLM 结构化价格文件更新受管价格档案；自定义档案不被覆盖。
+- **告警评估**：默认每分钟评估规则并发送邮件或 Webhook。
+- **数据清理**：按 `DAPI_LOG_RETENTION` 分批清理日志和时序聚合。
 
-An upstream request is bounded by the global request lifetime, per-upstream
-connect/first-byte/idle timeouts, and a maximum buffered response size. The
-outbound network guard resolves and validates destinations again immediately
-before dialing and disables redirects and environment proxy variables. This
-keeps probes, webhooks, SMTP, and normal forwarding behind the same egress
-boundary.
+健康和余额任务会遍历上游列表；停用上游仍会执行余额探测，以支持余额恢复后自动清除暂停状态。
 
-Each upstream may optionally override User-Agent. The same configured value is
-used for gateway forwarding, health and balance probes, model discovery, and
-explicit model tests so compatibility behavior stays consistent across paths.
+## 用量、缓存与成本
 
-## Data and Security Boundaries
+D-API 保存请求结果、总耗时、TTFB、可观测的流式 TTFT、尝试链、客户端 IP 和上游返回的
+Token 用量；不保存请求体或响应体。
 
-- Upstream API keys, optional NewAPI balance credentials, and notification
-  channel configurations are encrypted with AES-256-GCM using
-  `DAPI_MASTER_KEY`.
-- Pricing profiles and per-upstream assignments are stored in PostgreSQL. Costs
-  are estimates derived from recorded Token usage and matching profile prices;
-  D-API has no billing or quota-charging subsystem.
-- Balance records retain the last successful usage fields (`used`, currency, and
-  success timestamp) when a later probe is unavailable or incomplete; probe status
-  remains separate from the last known successful values.
-- Client API keys use SHA-256 hashes for authentication and an AES-256-GCM
-  encrypted copy for administrator copy/CCSwitch import. Existing keys created
-  before this encrypted copy was introduced cannot be recovered and must be
-  recreated. Session tokens remain hash-only.
-- Administrator passwords use bcrypt. Changing or resetting the password
-  revokes existing sessions.
-- Admin sessions use `HttpOnly`, `SameSite=Strict` cookies. The `Secure` flag is
-  set when the request is HTTPS or a trusted proxy reports HTTPS.
-- Admin mutations reject a mismatched `Origin` header. Login attempts are
-  rate-limited per observed client IP and account identifier in process memory.
-- `DAPI_TRUST_PROXY` defines whether `X-Real-IP` is trusted. The supplied Caddy
-  configuration overwrites this header. Direct exposure must disable trust.
-- Administrator-configured HTTP and SMTP destinations pass an outbound network
-  guard. Loopback, private, link-local, multicast, carrier-grade NAT, and cloud
-  metadata addresses are rejected both when saved and immediately before DNS
-  connections; redirects are disabled.
+用量可以按上游、客户端 Key、分组、协议或模型聚合，支持平均/P95 延迟、缓存读写、
+Token 命中率和请求命中率。成本由请求发生时匹配的价格档案计算：
 
-The master key is deliberately not stored in PostgreSQL. Database backups are
-not sufficient for recovery unless the same key is retained separately.
+- 受管档案来自 LiteLLM，手动档案作为兜底；
+- 未知价格或缺失 Token 的请求不猜测成本，并计入覆盖率；
+- 回算只补齐未知成本，不覆盖已确定历史金额；
+- `upstream_lifetime_usage` 独立保存按上游 Key 的生命周期请求与估算成本，不受普通日志
+  和日用量清理影响。
 
-## Persistence and Migrations
+这些数值是运营估算，不是供应商账单或客户端扣费。
 
-The schema is embedded in the binary and applied at startup with idempotent SQL.
-D-API v0.1.0 has no separate migration command and no automated rollback.
-PostgreSQL is the only supported database.
+## 数据与安全边界
 
-Deleting an upstream or client key removes the active configuration while
-preserving historical request references where possible and retaining daily
-usage identifiers for historical totals.
+- 上游 API Key、可选余额凭据、通知配置和客户端 Key 可恢复副本使用 AES-256-GCM 加密。
+- 客户端 Key 认证使用 SHA-256 哈希；管理会话使用独立的 HttpOnly Cookie。
+- 管理员密码使用 bcrypt；修改或重置密码会撤销已有会话。
+- 管理修改请求校验 Origin，登录按客户端 IP 和账号标识限速。
+- 出站 HTTP/SMTP 目标会拒绝回环、私网、链路本地、组播、CGNAT 和云元数据地址；
+  连接前会重新解析并校验，且不跟随重定向。
+- 余额查询失败时会保留上次成功的 `used`、币种和成功时间，同时单独标记当前探测失败。
+- `DAPI_MASTER_KEY` 不写入 PostgreSQL；数据库备份必须与同一主密钥配套保管。
 
-## Operational Limits
+## 持久化与迁移
 
-- Maximum client request body: 32 MiB.
-- Maximum buffered non-streaming upstream response: 32 MiB.
-- Health/balance probe response limit: 1 MiB.
-- Gateway defaults: 256 concurrent requests globally, 32 per client key, 600
-  requests per key per minute, and a 15-minute request lifetime.
-- One administrator account is the intended deployment model.
-- No distributed rate limiter, distributed scheduler, or external job queue.
-- No protocol translation, request billing, or multi-tenant isolation.
+数据库结构嵌入二进制并在启动时通过幂等 SQL 更新。当前没有独立迁移命令和自动回滚，
+PostgreSQL 是唯一支持的数据库。删除活动上游或客户端 Key 后，会尽可能保留历史用量标识。
+
+## 默认运行限制
+
+- 客户端请求体：32 MiB。
+- 非流式上游响应缓冲：32 MiB。
+- 健康/余额探测响应：1 MiB。
+- 全局并发：256；每客户端 Key 并发：32。
+- 每 Key 每分钟请求：600。
+- 单请求最长生命周期：15 分钟。
+
+环境变量和完整限制见[配置文档](configuration.md)。

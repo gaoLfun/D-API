@@ -1,80 +1,84 @@
-# D-API
+# D-API：面向 NewAPI 和 Sub2API 的 AI API 网关
 
 [![CI](https://github.com/gaoLfun/D-API/actions/workflows/ci.yml/badge.svg)](https://github.com/gaoLfun/D-API/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/gaoLfun/D-API?include_prereleases&sort=semver)](https://github.com/gaoLfun/D-API/releases)
+[![许可证](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![版本](https://img.shields.io/github/v/release/gaoLfun/D-API?include_prereleases&sort=semver)](https://github.com/gaoLfun/D-API/releases)
 
-[简体中文](README.zh-CN.md)
+[English README](README.en.md) · [文档索引](docs/README.md) · [快速部署](docs/deployment.md)
 
-D-API is a lightweight, single-administrator gateway for NewAPI and Sub2API
-upstreams. It routes supported AI API requests by priority and tries another
-eligible upstream when a connection, timeout, or retryable HTTP error occurs.
+**多上游路由、自动故障切换、分组密钥、优先级路由与可视化运维。**
 
-Current version: **v0.1.0**. The project is usable, but its configuration and
-management API may still change before v1.0.
+D-API 是一个轻量级、自托管的 AI API 网关，连接 NewAPI、Sub2API 及其他
+OpenAI/Anthropic 兼容上游。它为客户端提供统一的 OpenAI 和 Anthropic 兼容入口，
+在分组范围内按优先级选择上游，并在连接失败、超时或可重试 HTTP 错误时自动切换。
 
-## Features
+> 本文描述当前 `main` 分支。项目已可用于个人和小团队部署；v1.0 前配置与管理 API
+> 仍可能发生不兼容变更，已发布版本请以 [CHANGELOG](CHANGELOG.md) 为准。
 
-- Priority-based routing across NewAPI and Sub2API upstreams
-- Automatic failover, health checks, circuit breaking, and per-upstream timeouts
-- OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages endpoints
-- Model discovery, allowlists, and client-to-upstream model aliases
-- Upstream connectivity tests with automatic pause/recovery on exhausted balances
-- Locally recorded request attempts and token usage
-- Group-scoped client API keys with protocol and model restrictions
-- Optional pricing profiles with estimated USD cost and coverage metrics
-- Single-administrator web console with audit logs and login rate limiting
-- Email and webhook notifications with configurable alert rules
-- One Go service, one Vue frontend, PostgreSQL, and an optional Caddy proxy
-- Bounded concurrency, per-key rate limits, request lifetime limits, and SSRF protection
+![D-API 浅色总览（示例数据）](docs/screenshots/dashboard-light.png)
 
-## Quick Start
+## 为什么使用 D-API
 
-The supported deployment target is Linux with Docker Compose v2. A DNS name is
-recommended for public use.
+- **AI API 网关统一入口**：一个 Base URL 接入 OpenAI Responses、Chat Completions
+  和 Anthropic Messages 客户端。
+- **多上游故障切换**：按数字优先级路由，支持连接/首包/空闲超时、健康检查和熔断。
+- **API Key 分组**：客户端密钥绑定分组，分组绑定上游；请求不会越过所属分组。
+- **余额保护**：余额耗尽的上游可自动暂停，余额恢复后自动恢复路由。
+- **用量与成本分析**：统计请求、Token、缓存命中率、延迟，并按 LiteLLM 或手动价格
+  档案估算 USD/CNY 成本。
+- **可视化运维**：总览列表和拓扑视图展示密钥、分组决策、Base URL 集群与响应出口。
+- **安全边界清晰**：上游凭据加密存储，管理会话独立于客户端 Key，出站请求带 SSRF 防护。
+
+![D-API 请求路由拓扑（示例数据）](docs/screenshots/dashboard-topology-light.png)
+
+## 适用场景
+
+| 场景 | D-API 提供的能力 |
+| --- | --- |
+| NewAPI / Sub2API 前置网关 | 统一入口、按优先级选择渠道、失败自动切换 |
+| 个人或小团队的多模型部署 | 分组隔离客户端 Key，限制协议和模型 |
+| OpenAI / Anthropic 兼容客户端接入 | 保留原协议和流式响应，不做协议转换 |
+| 上游额度和成本观测 | 余额探测、耗尽暂停、Token/缓存/价格估算 |
+
+## 不适合的场景
+
+D-API 有意保持轻量，不提供多租户组织、转售计费、支付处理、供应商账号登录、
+协议转换或分布式限流/调度。需要企业级多区域控制面或完整账单系统时，应选择更适合
+该场景的产品。
+
+## 快速开始
+
+正式支持 Linux + Docker Compose v2。公网部署建议准备 DNS 名称和 HTTPS。
 
 ```sh
+git clone https://github.com/gaoLfun/D-API.git
+cd D-API
 cp .env.example .env
 openssl rand -base64 32
 ```
 
-Put the generated value in `DAPI_MASTER_KEY`, then set a separate
-`POSTGRES_PASSWORD` and an administrator password of at least 12 characters in
-`.env`. Keep the master key outside the database backup: losing it makes stored
-upstream, notification, and client-key copies unreadable.
+将生成值写入 `DAPI_MASTER_KEY`，并设置独立的 `POSTGRES_PASSWORD`、至少 12 位的
+`DAPI_ADMIN_PASSWORD` 和 `DAPI_DOMAIN`：
 
 ```sh
 docker compose up -d --build
 docker compose ps
+curl -fsS https://api.example.com/healthz
 ```
 
-Set `DAPI_DOMAIN` to a DNS name whose A/AAAA record points to the host, and allow
-inbound TCP ports 80 and 443. Caddy obtains and renews HTTPS certificates. For a
-local installation, the default address is `https://localhost`; its local CA
-may need to be trusted by your browser.
+首次登录后台后，按以下顺序配置：
 
-The Compose file maps D-API itself to `127.0.0.1:18083` and keeps
-`DAPI_TRUST_PROXY=false` by default. If Caddy is the only public entry point,
-set `DAPI_TRUST_PROXY=true` so audit logs and login limits use the client IP;
-never expose port 18083 publicly while proxy trust is enabled. See
-[Deployment](docs/deployment.md) for temporary direct-IP HTTP access.
+1. 添加 NewAPI 或 Sub2API 上游，使用“获取上游模型”检查模型列表。
+2. 创建分组并绑定一个或多个上游；数字越小的优先级越高。
+3. 创建客户端 API Key 并绑定分组，按需限制协议和模型。
+4. 可选：为上游绑定价格档案，用于官方价格估算；该估算不是供应商账单。
+5. 使用测试 Key 发起一次低成本请求，再开放给真实客户端。
 
-Log in with `DAPI_ADMIN_USERNAME` and `DAPI_ADMIN_PASSWORD`, then:
+完整部署、备份、恢复和升级步骤见[部署文档](docs/deployment.md)。
 
-1. Add a NewAPI or Sub2API upstream and use **Fetch upstream models** before saving.
-2. Select models and run **Test model** for one or more entries. This sends a small real model request (Sub2API uses an arithmetic challenge) and may consume upstream quota.
-3. Create a group and bind one or more upstreams; client requests stay within the key's group.
-4. Optionally assign a pricing profile to each upstream for estimated cost reporting.
-5. Select supported protocols and models. Lower priority numbers route first.
-6. Create a client API key and select its group. The list shows only its prefix; use the copy button or CCSwitch import. Keys created before encrypted copies were added must be recreated.
+## 客户端请求
 
-For production details, direct-IP HTTP access, upgrades, backups, and restores,
-see [Deployment](docs/deployment.md). For a scriptable administrator interface,
-see [Management API](docs/admin-api.md).
-
-## Client Requests
-
-Use a client key created in the admin console, not an upstream API key.
+使用后台创建的客户端 Key，不要使用上游 API Key：
 
 ```sh
 export DAPI_BASE_URL=https://api.example.com
@@ -89,74 +93,66 @@ curl "$DAPI_BASE_URL/v1/chat/completions" \
   -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The supported routes are:
+支持的客户端路由：
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/messages`
 
-D-API passes JSON and streaming responses through without translating between
-protocols. See [API compatibility](docs/api-compatibility.md) for authentication,
-retry behavior, streaming limits, usage collection, and response headers.
+D-API 原样转发 JSON 和流式响应，不在协议之间转换。认证、重试、流式限制、响应头
+和用量采集详见[API 兼容性](docs/api-compatibility.md)。
 
-## Architecture
+## 路由模型
 
 ```text
-Client -> Caddy (HTTPS) -> D-API -> priority-ordered upstreams in the key's group
-                              |
-                              +-> PostgreSQL
+客户端 Key -> 所属分组 -> 按优先级筛选上游 -> 健康/余额/能力检查 -> 请求与故障切换
+                         |
+                         +-> PostgreSQL（配置、日志、用量、审计和告警）
 ```
 
-The Go process serves the admin UI and API gateway, runs health and balance
-probes, evaluates alerts, and stores operational state in PostgreSQL. Upstream
-credentials and notification channel secrets are encrypted with AES-256-GCM
-before storage. Request bodies are not stored.
+同一个 Base URL 的多个上游 Key 会在后台聚合为一个集群展示，但路由和统计仍按各个
+Key 独立处理；详情抽屉会分别显示余额、请求和成本。拓扑视图只是运维摘要，不改变实际
+分组成员和优先级规则。详见[架构文档](docs/architecture.md)。
 
-See [Architecture](docs/architecture.md) for routing, health, persistence, and
-security boundaries.
+## 常见问题
 
-## Production Checklist
+**客户端 Key 绑定分组后，优先级是否仍然生效？**
 
-- Use HTTPS and restrict the administrator console to a trusted network.
-- Keep `DAPI_MASTER_KEY`, `.env`, database backups, and client-key creation
-  responses outside source control and routine logs.
-- Set a database `sslmode` suitable for external PostgreSQL; Compose uses
-  `disable` only because the database is on its private Docker network.
-- Review the configured upstream model allowlists and run a model test before
-  enabling traffic. Tests are real requests and may consume quota.
-- Configure log retention and a tested backup schedule. A database dump without
-  the exact master key cannot recover encrypted secrets.
-- Read [Security](SECURITY.md) and [Troubleshooting](docs/troubleshooting.md)
-  before exposing a direct port.
+生效。网关先读取客户端 Key 绑定的分组，再只在该分组成员中按上游 Key 的数字优先级
+从小到大尝试。相同 Base URL 只影响界面聚合，不改变 Key 级路由顺序。
 
-## Documentation
+**余额耗尽后会怎样？**
 
-- [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Deployment, backup, and restore](docs/deployment.md)
-- [API compatibility](docs/api-compatibility.md)
-- [Management API](docs/admin-api.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Documentation index](docs/README.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Support policy](SUPPORT.md)
-- [Changelog](CHANGELOG.md)
-- [Third-party notices](THIRD_PARTY_NOTICES.md)
-- [Release guide](RELEASING.md)
+开启余额保护后，自动检查连续两次确认可用余额不大于零时暂停该上游；手动刷新只需一次
+确认。余额恢复为正数或无限额度后自动恢复。查询失败不会误判为余额耗尽。
 
-## Development
+**官方价格估算等于实际账单吗？**
 
-Local development requires Go 1.26, Node.js 26, and PostgreSQL 17. Build the
-frontend before starting the Go service:
+不等于。成本来自请求 Token 用量与管理员绑定的 LiteLLM/手动价格档案，只用于运营估算。
+未知价格或缺少 Token 时保留未知并显示覆盖率；历史成本不会因价格更新自动重算。
+
+**可以同时使用 `/v1` 和不带 `/v1` 的 Base URL 吗？**
+
+可以。D-API 会避免重复添加 `/v1`，但仍会对完整 URL 做 SSRF 校验。
+
+## 文档
+
+- [文档索引](docs/README.md)
+- [架构与路由](docs/architecture.md) · [English](docs/architecture.en.md)
+- [部署、备份和恢复](docs/deployment.md) · [English](docs/deployment.en.md)
+- [配置](docs/configuration.md) · [English](docs/configuration.en.md)
+- [API 兼容性](docs/api-compatibility.md) · [English](docs/api-compatibility.en.md)
+- [管理 API](docs/admin-api.md)
+- [故障排查](docs/troubleshooting.md)
+- [更新日志](CHANGELOG.md) · [安全策略](SECURITY.md) · [贡献指南](CONTRIBUTING.md)
+
+## 本地开发
+
+需要 Go 1.26、Node.js 26 和 PostgreSQL 17：
 
 ```sh
-cd web
-npm ci
-npm run build
-cd ..
-
+cd web && npm ci && npm run build && cd ..
 export DAPI_DATABASE_URL='postgres://dapi:password@127.0.0.1:5432/dapi?sslmode=disable'
 export DAPI_MASTER_KEY="$(openssl rand -base64 32)"
 export DAPI_ADMIN_USERNAME=admin
@@ -164,37 +160,17 @@ export DAPI_ADMIN_PASSWORD='local-password-at-least-12-chars'
 go run ./cmd/dapi
 ```
 
-Run the checks used by the project:
+检查命令：
 
 ```sh
 go test ./...
 go vet ./...
 go test -race ./...
-(cd web && npm test && npm run build && npm audit --audit-level=high)
+(cd web && npm test && npm run build)
 docker build -t dapi:local .
 ```
 
-PostgreSQL integration tests run only when `DAPI_TEST_DATABASE_URL` is set.
+## 许可证与声明
 
-The CI workflow runs the same backend/frontend checks on every pull request.
-Maintainers use [RELEASING.md](RELEASING.md) for versioning and GitHub Release
-preparation.
-
-## Scope
-
-D-API is intentionally dedicated and small. v0.1.0 does **not** aim to provide:
-
-- Multi-tenant accounts or organizations
-- Reseller billing, quota charging, or payment processing
-- Login to OpenAI, Anthropic, NewAPI, or Sub2API user accounts
-- Protocol translation or a general-purpose reverse proxy
-- A stable public management API
-
-D-API is an independent compatibility project and is not affiliated with or
-endorsed by NewAPI, Sub2API, CCSwitch, OpenAI, or Anthropic.
-
-## License
-
-Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 gaoLfun.
-See [third-party notices](THIRD_PARTY_NOTICES.md) for bundled font and dependency
-licenses.
+项目采用 [Apache License 2.0](LICENSE)。D-API 是独立兼容项目，与 NewAPI、Sub2API、
+CCSwitch、OpenAI 或 Anthropic 不存在隶属或官方背书关系。

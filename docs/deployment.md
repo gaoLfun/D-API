@@ -1,21 +1,20 @@
-# Deployment, Backup, and Restore
+# 部署、备份和恢复
 
-The supported v0.1.0 production target is a single Linux host running Docker
-Compose v2. Other operating systems and bare-binary installations are best
-effort. The stack is intentionally single-instance: rate-limit counters,
-notification cooldowns, and scheduled probes are process-local.
+[English](deployment.en.md)
 
-## Prerequisites
+D-API 当前推荐部署在单台 Linux 主机的 Docker Compose v2 上。服务由 D-API、
+PostgreSQL 和可选的 Caddy HTTPS 代理组成，适合个人或小团队运行 NewAPI/Sub2API 前置网关。
 
-- Docker Engine with the Compose v2 plugin
-- A DNS A/AAAA record pointing to the host
-- Inbound TCP ports 80 and 443
-- Outbound HTTPS access to configured upstreams and certificate authorities
-- Enough persistent storage for PostgreSQL and request logs
-- A host firewall that limits PostgreSQL to the Compose network and, when
-  applicable, limits the direct D-API port to localhost
+## 前置条件
 
-## First Deployment
+- Docker Engine 与 Compose v2 插件；
+- 指向服务器的 DNS A/AAAA 记录；
+- 公网 HTTPS 开放 TCP 80、443；
+- 允许访问上游和证书服务的出站 HTTPS；
+- 足够的 PostgreSQL 持久化空间；
+- 防火墙不向公网暴露 PostgreSQL，并限制 D-API 直连端口。
+
+## 首次部署
 
 ```sh
 git clone https://github.com/gaoLfun/D-API.git
@@ -24,17 +23,8 @@ cp .env.example .env
 openssl rand -base64 32
 ```
 
-Edit `.env` and set at least:
-
-```dotenv
-DAPI_MASTER_KEY=replace-with-generated-value
-POSTGRES_PASSWORD=replace-with-a-long-random-password
-DAPI_ADMIN_USERNAME=admin
-DAPI_ADMIN_PASSWORD=replace-with-at-least-12-characters
-DAPI_DOMAIN=api.example.com
-```
-
-Start the stack:
+在 `.env` 中设置 `DAPI_MASTER_KEY`、独立的 `POSTGRES_PASSWORD`、至少 12 位的
+`DAPI_ADMIN_PASSWORD` 和 `DAPI_DOMAIN`，然后启动：
 
 ```sh
 docker compose up -d --build
@@ -42,43 +32,22 @@ docker compose ps
 curl -fsS https://api.example.com/healthz
 ```
 
-For a first installation, open the web console only after `/healthz` is healthy.
-Use the configured administrator credentials, then change the password from the
-console after confirming the first login. Do not put real upstream credentials
-in a model test until the HTTPS path and backup procedure have been verified.
+首次登录后，建议按“上游 → 分组 → 客户端 Key → 模型测试 → 真实请求”的顺序配置。
+模型测试会发送真实的小请求，可能消耗上游额度。
 
-The `postgres_data` volume contains the database. `caddy_data` and
-`caddy_config` contain Caddy state and certificates. Do not delete these volumes
-during normal upgrades.
+`postgres_data` 保存数据库，`caddy_data` 和 `caddy_config` 保存证书与 Caddy 状态。
+普通升级不要删除这些命名卷。本地默认访问 `https://localhost` 时，浏览器可能需要信任
+Caddy 的本地 CA。
 
-## Proxy and Network Boundary
+## 代理与直连调试
 
-The default Compose topology publishes Caddy on ports 80/443 and also maps D-API
-to `127.0.0.1:18083`. Compose keeps `DAPI_TRUST_PROXY=false` by default; this
-avoids trusting forged forwarding headers if the direct port is exposed.
-When using the supplied Caddy proxy, set `DAPI_TRUST_PROXY=true` explicitly;
-Caddy overwrites `X-Real-IP` with the connecting client address.
+默认 Caddy 使用 80/443，D-API 仅映射到 `127.0.0.1:18083`。Caddy 是唯一公网入口时
+才设置 `DAPI_TRUST_PROXY=true`，并禁止公网访问 18083。
 
-Do not expose port 18083 publicly while proxy trust is enabled. A client that
-can bypass Caddy could forge the IP used for auditing and login rate limiting.
+临时直连可设置 `DAPI_BIND=0.0.0.0:18083` 和 `DAPI_TRUST_PROXY=false`。
+这是明文 HTTP，只适合排障，不适合录入生产凭据。
 
-For temporary direct-IP testing without TLS, set:
-
-```dotenv
-DAPI_BIND=0.0.0.0:18083
-DAPI_TRUST_PROXY=false
-```
-
-Then start only the database and app:
-
-```sh
-docker compose up -d --build postgres dapi
-```
-
-Access `http://SERVER_IP:18083` and restrict the port at the firewall. This mode
-is not suitable for entering production credentials because traffic is cleartext.
-
-## Routine Operations
+## 日常运维
 
 ```sh
 docker compose ps
@@ -87,21 +56,10 @@ docker compose logs -f caddy
 curl -fsS https://api.example.com/healthz
 ```
 
-`/healthz` reports `200` only when D-API can reach PostgreSQL. It does not assert
-that every configured upstream is healthy; use the admin console for upstream
-status and individual connectivity checks.
+`/healthz` 只表示 D-API 可访问 PostgreSQL，不代表所有上游健康。日志可能包含模型、
+上游、客户端 IP、请求 ID 和耗时，应按敏感运维数据处理。
 
-The service emits structured Go application logs to stdout. Request attempts
-and usage are stored in PostgreSQL and shown in the admin console; audit and
-alert records are also stored in PostgreSQL. Request bodies are not stored.
-Logs can contain request IDs, upstream names, model names, client IPs, status,
-timings, and error summaries. They must be treated as operationally sensitive;
-never forward them unredacted to a third-party log service.
-
-## Administrator Password Reset
-
-The admin console can change the password. If login is unavailable, set the
-existing username and a new password in the command environment and run:
+## 管理员密码重置
 
 ```sh
 docker compose run --rm \
@@ -110,73 +68,40 @@ docker compose run --rm \
   dapi reset-password
 ```
 
-The command updates the named existing administrator and revokes its sessions.
-It does not create another administrator.
+该命令只更新已有管理员并撤销其会话。
 
-## Backup
-
-Run backups from the repository directory while PostgreSQL is running:
+## 备份与恢复
 
 ```sh
 mkdir -p /secure/backups
 ./deploy/backup.sh /secure/backups/dapi-$(date -u +%Y%m%dT%H%M%SZ).sql.gz
 ```
 
-The script uses `pg_dump`, gzip compression, restrictive file permissions, and
-an atomic final rename. It exits without replacing the destination if dumping
-or compression fails. The dump contains the D-API database schema and data, but
-not PostgreSQL cluster roles or the external `.env` file.
+数据库 dump 不包含 `.env`、PostgreSQL 角色或主密钥。必须另外保存精确的
+`DAPI_MASTER_KEY`、环境配置和外部 DNS/防火墙配置，并定期测试恢复。
 
-Back up these separately:
+备份脚本使用 `pg_dump`、gzip、受限文件权限和原子重命名；失败时不会替换目标文件。
+即使应用凭据在数据库中已加密，也应把 SQL 压缩包视为敏感数据并保存异地副本。
 
-- The exact `DAPI_MASTER_KEY` required to decrypt stored secrets
-- `.env` or an equivalent secret-manager record
-- Any external proxy, firewall, or DNS configuration
+恢复前停止服务、重建数据库并导入 dump：
 
-Treat the SQL archive as sensitive even though application credentials are
-encrypted. Test restores periodically and keep copies off the application host.
+```sh
+docker compose stop dapi caddy
+docker compose exec -T postgres dropdb --if-exists --force -U dapi dapi
+docker compose exec -T postgres createdb -U dapi -O dapi dapi
+gzip -dc /secure/backups/dapi-TIMESTAMP.sql.gz \
+  | docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U dapi -d dapi
+docker compose up -d dapi caddy
+```
 
-## Restore
+必须使用备份时的同一主密钥，否则加密上游、通知和客户端 Key 副本无法解密。
 
-Restoring replaces the current D-API database. Confirm the archive path and take
-a fresh backup before proceeding.
+恢复完成后依次检查 `docker compose ps`、`/healthz`、公共 HTTPS 入口，并使用测试 Key
+发起一次低成本请求。
 
-1. Stop components that access the database, leaving PostgreSQL running:
+## 升级与卸载
 
-   ```sh
-   docker compose stop dapi caddy
-   ```
-
-2. Recreate the database:
-
-   ```sh
-   docker compose exec -T postgres dropdb --if-exists --force -U dapi dapi
-   docker compose exec -T postgres createdb -U dapi -O dapi dapi
-   ```
-
-3. Restore the dump:
-
-   ```sh
-   gzip -dc /secure/backups/dapi-TIMESTAMP.sql.gz \
-     | docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U dapi -d dapi
-   ```
-
-4. Ensure `.env` contains the same master key used when the backup was made,
-   then restart and verify:
-
-   ```sh
-   docker compose up -d dapi caddy
-   docker compose ps
-   curl -fsS https://api.example.com/healthz
-   ```
-
-A different or missing master key allows the database to start but prevents
-encrypted upstream and notification credentials from being decrypted.
-
-## Upgrade
-
-Back up first, review the changelog, then rebuild while preserving `.env` and
-named volumes:
+升级前备份并阅读 [CHANGELOG](../CHANGELOG.md)：
 
 ```sh
 git pull --ff-only
@@ -184,17 +109,8 @@ docker compose up -d --build
 docker compose ps
 ```
 
-The application applies its embedded idempotent schema at startup. v0.1.0 does
-not provide automatic schema rollback, so retain a pre-upgrade backup.
+启动时会应用幂等数据库结构，但没有自动回滚。保留升级前备份和旧镜像，并验证健康接口、
+公共代理以及一次低成本测试请求。
 
-After an upgrade, verify both the direct health endpoint and the public proxy,
-then perform one low-cost request with a test client key. If the new process
-cannot start, keep the previous image available and restore the pre-upgrade
-database backup before retrying; changing only the image may not reverse a
-schema change.
-
-## Uninstall
-
-`docker compose down` removes containers and the Compose network but preserves
-named volumes. `docker compose down -v` also deletes the database and Caddy data;
-use it only when permanent data loss is intended and a verified backup exists.
+`docker compose down` 保留命名卷；`docker compose down -v` 会删除数据库和 Caddy
+数据，仅在确认永久数据丢失时使用。

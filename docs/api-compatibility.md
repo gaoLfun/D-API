@@ -1,166 +1,81 @@
-# API Compatibility
+# API 兼容性
 
-D-API v0.1.0 exposes a small pass-through subset of OpenAI- and
-Anthropic-compatible HTTP APIs. Compatibility means routing request and response
-payloads in the same protocol; D-API does not implement every vendor endpoint or
-translate between protocols.
+[English](api-compatibility.en.md)
 
-This document covers client-facing `/v1/*` routes. The cookie-authenticated
-administrator surface is documented separately in [Management API](admin-api.md)
-and is not part of the compatibility promise.
+D-API 提供 OpenAI 和 Anthropic 兼容协议的轻量转发子集。兼容表示按原协议路由请求和响应，
+不代表实现供应商全部端点，也不在协议之间转换。
 
-## Supported Routes
+## 支持的路由
 
-| Route | Family | Behavior |
+| 路由 | 协议族 | 行为 |
 | --- | --- | --- |
-| `GET /v1/models` | Models | Locally builds a model list from eligible upstream configuration |
-| `POST /v1/chat/completions` | Chat | OpenAI Chat Completions pass-through |
-| `POST /v1/responses` | Responses | OpenAI Responses pass-through |
-| `POST /v1/messages` | Messages | Anthropic Messages pass-through |
+| `GET /v1/models` | Models | 从客户端 Key 所属分组的可用上游本地构建模型列表 |
+| `POST /v1/chat/completions` | OpenAI Chat | 原样转发 |
+| `POST /v1/responses` | OpenAI Responses | 原样转发 |
+| `POST /v1/messages` | Anthropic Messages | 原样转发 |
 
-Other `/v1/*` routes are not implemented.
+其他 `/v1/*` 路由未实现。
 
-## Client Authentication
+## 客户端认证与分组
 
-Create client keys in the admin console. Upstream keys are never valid as D-API
-client credentials unless separately created as a client key.
+所有路由接受 `Authorization: Bearer <DAPI_KEY>`；Messages 也接受 `x-api-key`。
+必须使用后台创建的客户端 Key，上游 API Key 不能直接作为 D-API 客户端凭据。
 
-- All routes accept `Authorization: Bearer <DAPI_KEY>`.
-- `POST /v1/messages` also accepts `x-api-key: <DAPI_KEY>` and prefers it when
-  both headers are present.
-- An enabled client key may restrict proxy capabilities and model names.
-- `/v1/models` applies the key's model restriction and only lists models from its group.
+每个客户端 Key 绑定一个启用且至少包含一个上游的分组。请求只在该分组内路由，不会回退
+到其他分组或全局池；Key 还可以限制协议和模型。
 
-Each client key is bound to one enabled group. Requests are routed only through
-that group's upstream members; there is no fallback to another group or to the
-global upstream pool.
+## 请求与模型处理
 
-## Request Handling
+代理请求必须是包含非空顶层 `model` 的 JSON 对象，请求体上限 32 MiB。D-API 保留查询参数
+和端到端请求头，替换客户端认证头，并移除逐跳头。
 
-Proxy requests must contain a JSON object with a non-empty top-level `model`.
-The maximum request body is 32 MiB. D-API otherwise forwards the payload without
-schema validation or protocol conversion.
+模型别名只改写顶层 `model`。上游 Base URL 可以带或不带 `/v1`，D-API 会避免重复添加。
+配置固定 User-Agent 后，转发、健康/余额探测、模型发现和模型测试使用同一值。
 
-When a model alias is configured, D-API rewrites only the top-level `model`
-field before forwarding. Query parameters and end-to-end headers are retained,
-while hop-by-hop headers and client authentication headers are replaced with the
-selected upstream API key. For Messages requests, the upstream receives both
-Bearer authorization and `X-Api-Key`.
+`GET /v1/models` 返回排序后的 OpenAI 风格列表，并应用客户端 Key 的分组和模型限制。
 
-An upstream may define a fixed User-Agent. When configured, it replaces the
-client User-Agent for forwarded requests and is also used by probes; otherwise
-the client User-Agent is retained.
+## 优先级与故障切换
 
-An upstream Base URL may end at the host or include `/v1`; D-API avoids adding a
-second `/v1`. Redirects from upstream API and probe requests are not followed.
+候选上游按数字优先级从小到大尝试，受 `max_attempts` 限制。以下情况会尝试下一个上游：
 
-## Models
+- 连接、首包、响应空闲超时；
+- 首字节发出前的传输或读取失败；
+- HTTP 401、403、404、429 或 5xx。
 
-`GET /v1/models` returns a sorted OpenAI-style list derived from models stored
-for enabled, non-circuit-open upstreams and filtered by the client key. Model
-entries use `owned_by: "dapi"` and `created: 0`; D-API does not proxy this call to
-a single upstream.
+所有上游限流时返回 429，全部超时时返回 504，其他耗尽路径返回 502。已停用、余额暂停、
+熔断中或能力不匹配的上游不会进入候选。
 
-Health checks discover models through each upstream's `GET /v1/models`. Manual
-model selection can lock the list so later probes do not replace it. An empty
-upstream model list permits routing any requested model, but it contributes no
-entries to D-API's `/v1/models` list.
+相同 Base URL 的 Key 在后台聚合显示，但仍是独立候选，优先级也继续按 Key 生效。
 
-The admin console's **model test** is a separate real-request check. NewAPI
-tests follow its channel tester's endpoint convention: regular models use Chat
-Completions while Codex-like models use Responses. Sub2API tests first issue one
-HEAD request to the endpoint origin, then run the selected models through the
-native protocol adapters concurrently. Each Sub2API request contains a
-per-run few-shot arithmetic challenge and is accepted only when the expected
-number appears in the response; successful responses taking six seconds or
-more are reported as degraded. NewAPI Responses probes use an input message
-array; Sub2API Responses probes use `instructions` and a string `input`. These
-tests are explicit admin actions and may consume provider quota; they are never
-triggered by ordinary client traffic or background health checks.
+## 流式响应
 
-## Failover
+使用协议原生的 `stream: true`。首字节发出前可以故障切换；一旦响应已提交，中途断流不能
+安全重放。D-API 不重建事件、不恢复流，也不合并多个上游的部分输出。
 
-Eligible upstreams are tried from lowest numeric priority upward, limited by the
-admin setting `max_attempts` (default 3, range 1 to 5).
+## 响应头
 
-D-API tries the next upstream after:
-
-- A connection, first-byte, or response-idle timeout
-- Another transport or response-read failure before the response is committed
-- HTTP 401, 403, 404, 429, or any 5xx response
-
-Other HTTP statuses, including most 4xx responses, are returned without another
-attempt. Repeated failures can open the upstream circuit; 401 and 403 open it
-immediately. Disabled, balance-suspended, and currently circuit-open upstreams
-are not candidates.
-
-When every attempted upstream is rate-limited, D-API returns 429. When every
-attempt times out, it returns 504. Other exhausted failover paths return 502.
-
-## Streaming
-
-Set the protocol's normal `stream` field to `true`; D-API relays the upstream
-body and flushes chunks to the client. It can fail over while waiting for the
-first byte. Once any byte has been sent, HTTP response commitment makes a safe
-retry impossible, so a later upstream interruption terminates the existing
-stream and is recorded in the request log.
-
-D-API does not reconstruct events, resume streams, or deduplicate partial output.
-
-## Response Headers
-
-Proxied responses include:
-
-| Header | Meaning |
+| 响应头 | 含义 |
 | --- | --- |
-| `X-DAPI-Request-ID` | Generated request identifier used in logs |
-| `X-DAPI-Upstream` | Selected or last-attempted upstream name |
-| `X-DAPI-Attempts` | Number of attempted upstreams |
+| `X-DAPI-Request-ID` | 日志关联请求 ID |
+| `X-DAPI-Upstream` | 最终或最后尝试的上游名称 |
+| `X-DAPI-Attempts` | 已尝试上游数量 |
 
-`GET /v1/models` includes the request ID and reports zero attempts because it is
-built locally.
+## 用量、缓存和成本
 
-## Error Shapes
+D-API 从非流式 JSON 或 SSE 事件中的常见 `usage` 字段读取输入、输出、缓存读、缓存写 Token。
+后台记录总耗时、TTFB、可观测的流式 TTFT 和尝试链，并支持按上游、客户端 Key、分组、协议
+或模型分析日/周/月用量、平均/P95 延迟和缓存命中率。
 
-Chat Completions and Responses gateway errors use an OpenAI-style `error`
-object. Messages gateway errors use Anthropic-style `type: "error"` and nested
-error type/message fields. Error compatibility is intentionally limited to this
-shape; vendor-specific error fields are not synthesized.
+绑定价格档案后，按请求发生时的价格估算 `cost_usd`。价格或 Token 未知时成本保持未知，
+并以覆盖率表达数据完整度。官方价格估算不是供应商账单，不进行客户端扣费。
 
-Non-retryable upstream responses are passed through as received.
+## 余额发现
 
-## Usage and Logs
+余额接口不是 OpenAI/Anthropic 标准。D-API 会尝试已知的 NewAPI/Sub2API 兼容路径；上游不支持
+时显示未知，但不影响正常模型请求。NewAPI 可选 Access Token 和 User ID 仅用于余额查询，
+正常转发仍使用上游 API Key。
 
-For non-streaming responses, D-API reads common OpenAI/Anthropic token fields
-from the top-level `usage` object. For server-sent events, it looks for usage in
-`usage`, `response.usage`, or `message.usage`. Recognized values include input or
-prompt tokens, output or completion tokens, cached-input variants, and
-`cache_creation_input_tokens` (cache writes).
+## 错误格式
 
-The administrator log records total duration, TTFB, and streaming TTFT in
-integer milliseconds, plus the upstream attempt chain. Anthropic Messages usage
-counts `input_tokens` and cache-creation tokens as uncached input; OpenAI-style
-usage treats cached input as a subset of total input. The usage report can split
-daily, weekly, or monthly totals by upstream, client key, group, protocol, or
-model, with Top-N/other aggregation and average/P95 latency. It also reports
-optional `cost_usd` and cost coverage based on the administrator-assigned pricing
-profile for each upstream. These are operational estimates only, not provider
-billing or client-facing charges.
-
-Usage is best effort: missing fields remain unknown in administrator views, and
-costs remain unknown when no matching price or Token usage is available. D-API
-does not perform billing or charge clients. It stores request metadata, attempts,
-latency, status, client IP, discovered usage, and optional cost estimates; request
-and response bodies are not stored.
-
-## Balance Discovery
-
-Balance display is separate from request compatibility. D-API probes several
-known NewAPI/Sub2API-style endpoints, including `/v1/usage`, billing
-subscription, token usage, and user-self endpoints. Providers may omit or alter
-these non-standard APIs, in which case the balance is shown as unknown or
-unavailable without preventing normal request forwarding.
-
-NewAPI Access Token plus User ID can be supplied for compatible user-self
-balance queries. They are not used to forward model requests. Sub2API uses only
-its upstream API key.
+Chat/Responses 网关错误使用 OpenAI 风格 `error` 对象；Messages 使用 Anthropic 风格错误。
+非重试的上游响应原样返回，不合成供应商专有字段。

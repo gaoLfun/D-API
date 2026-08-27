@@ -1,141 +1,88 @@
-# Configuration
+# 配置
 
-D-API reads configuration from environment variables. Docker Compose loads the
-project's `.env` file for interpolation; the application does not parse `.env`
-files itself.
+[English](configuration.en.md)
 
-Values are read at process startup. Change `.env` and recreate the `dapi`
-container; changing a value in the running container does not reload it.
-Environment variables control process and database settings only. Upstream,
-client-key, notification, alert, and routing settings are stored in PostgreSQL
-through the admin console.
+D-API 从环境变量读取进程和数据库配置；上游、客户端 Key、分组、价格、通知和告警
+通过管理后台写入 PostgreSQL。修改环境变量后需要重建 `dapi` 容器。
 
-## Required Secrets
+## 必填配置
 
-| Variable | Requirement | Purpose |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DAPI_MASTER_KEY` | Base64 encoding of exactly 32 bytes | AES-256-GCM key for stored credentials |
-| `DAPI_ADMIN_USERNAME` | Required when the first administrator is created | Initial administrator name |
-| `DAPI_ADMIN_PASSWORD` | Required by Compose; minimum 12 characters when used | Initial administrator password or reset-password value |
-| `POSTGRES_PASSWORD` | Required by `compose.yaml` | Password for the Compose PostgreSQL user |
+| `DAPI_MASTER_KEY` | 无 | Base64 编码的 32 字节 AES-256-GCM 主密钥 |
+| `DAPI_ADMIN_USERNAME` | 无 | 首次创建管理员的名称 |
+| `DAPI_ADMIN_PASSWORD` | 无 | 首次密码或重置密码，至少 12 个字符 |
+| `POSTGRES_PASSWORD` | 无 | Compose PostgreSQL 密码 |
 
-Generate the master key with:
+用 `openssl rand -base64 32` 生成主密钥。主密钥不写入数据库备份，必须单独保管。
 
-```sh
-openssl rand -base64 32
-```
+## 应用变量
 
-Use unrelated values for the database password, administrator password, and
-master key. After the first administrator exists, runtime bootstrap variables
-do not overwrite that account. Compose still requires `DAPI_ADMIN_PASSWORD` to
-be present; change the actual password in the admin console or with the reset
-command documented in [Deployment](deployment.md).
-
-## Application Variables
-
-| Variable | Default | Description |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DAPI_ADDR` | `:8080` | Address used by the Go HTTP server |
-| `DAPI_WEB_DIR` | `web/dist` | Directory containing the built admin SPA |
-| `DAPI_SESSION_TTL` | `24h` | Administrator session lifetime |
-| `DAPI_LOG_RETENTION` | `720h` | Request-log retention; cleanup runs daily |
-| `DAPI_HEALTH_INTERVAL` | `30s` | Automatic upstream health-check interval |
-| `DAPI_BALANCE_INTERVAL` | `10m` | Automatic balance-check interval |
-| `DAPI_TRUST_PROXY` | `false` | Trust a valid `X-Real-IP` supplied by the immediate proxy |
+| `DAPI_ADDR` | `:8080` | Go HTTP 服务监听地址 |
+| `DAPI_WEB_DIR` | `web/dist` | Vue 构建产物目录 |
+| `DAPI_SESSION_TTL` | `24h` | 管理员会话有效期 |
+| `DAPI_LOG_RETENTION` | `720h` | 请求、日用量、审计和告警保留时间 |
+| `DAPI_BALANCE_INTERVAL` | `10m` | 自动余额检查间隔 |
+| `DAPI_HEALTH_INTERVAL` | `30s` | 自动健康检查间隔 |
+| `DAPI_MAX_REQUEST_DURATION` | `15m` | 单个代理请求最长生命周期 |
+| `DAPI_TRUST_PROXY` | `false` | 是否信任 Caddy 写入的 `X-Real-IP` |
 
-Gateway resource limits:
+网关资源限制：
 
-| Variable | Default | Description |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DAPI_MAX_CONCURRENT_REQUESTS` | `256` | Maximum concurrent gateway requests |
-| `DAPI_MAX_CONCURRENT_PER_KEY` | `32` | Maximum concurrent requests per client key |
-| `DAPI_MAX_REQUESTS_PER_MINUTE` | `600` | Per-key fixed-window request limit |
-| `DAPI_MAX_REQUEST_DURATION` | `15m` | Maximum lifetime of one proxied request |
+| `DAPI_MAX_CONCURRENT_REQUESTS` | `256` | 全局最大并发请求数 |
+| `DAPI_MAX_CONCURRENT_PER_KEY` | `32` | 每个客户端 Key 最大并发数 |
+| `DAPI_MAX_REQUESTS_PER_MINUTE` | `600` | 每 Key 固定窗口分钟限流 |
 
-Durations use Go duration syntax, for example `30s`, `10m`, or `24h`. Empty,
-invalid, or non-positive optional durations fall back to their defaults.
+时间使用 Go duration，例如 `30s`、`10m`、`24h`。无效或非正数回退到默认值；进程还会
+限制极端配置：全局并发 10,000、单 Key 并发 1,000、每分钟 100,000、请求最长 24 小时。
 
-Positive integer limits also fall back to their defaults when empty, invalid, or
-non-positive. Upper bounds are enforced by the process: 10,000 global requests,
-1,000 requests per key, 100,000 requests per minute, and 24 hours per request.
-The configured value is printed in the startup log without secrets.
+只有确定客户端无法绕过可信代理访问 D-API 时才启用 `DAPI_TRUST_PROXY=true`。
 
-`DAPI_TRUST_PROXY=true` is safe only when clients cannot reach D-API without
-passing through a trusted proxy that overwrites `X-Real-IP`. The supplied Caddy
-configuration does so. Set it to `false` for direct access; D-API then strips
-forwarding headers and uses the socket address for audit logs and login limits.
+## 数据库变量
 
-## Database Connection
+设置完整 `DAPI_DATABASE_URL`，或使用拆分变量：
 
-Set either a full URL or split connection variables. A non-empty
-`DAPI_DATABASE_URL` takes precedence.
-
-| Variable | Default | Description |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DAPI_DATABASE_URL` | none | PostgreSQL URL, including desired `sslmode` |
-| `DAPI_DATABASE_HOST` | `postgres` | Database host when no full URL is set |
-| `DAPI_DATABASE_PORT` | `5432` | Database port |
-| `DAPI_DATABASE_NAME` | `dapi` | Database name |
-| `DAPI_DATABASE_USER` | `dapi` | Database user |
-| `DAPI_DATABASE_PASSWORD` | none | Database password; required for split configuration |
-| `DAPI_DATABASE_SSLMODE` | `disable` | lib/pq SSL mode |
+| `DAPI_DATABASE_URL` | 无 | PostgreSQL URL，优先于拆分变量 |
+| `DAPI_DATABASE_HOST` | `postgres` | 数据库主机 |
+| `DAPI_DATABASE_PORT` | `5432` | 数据库端口 |
+| `DAPI_DATABASE_NAME` | `dapi` | 数据库名称 |
+| `DAPI_DATABASE_USER` | `dapi` | 数据库用户 |
+| `DAPI_DATABASE_PASSWORD` | 无 | 拆分配置时的密码 |
+| `DAPI_DATABASE_SSLMODE` | `disable` | lib/pq SSL 模式 |
 
-The split form safely URL-encodes passwords containing reserved characters and
-is used by `compose.yaml`. For external PostgreSQL, enable an SSL mode appropriate
-for that server rather than copying the Compose-only `disable` value.
+外部 PostgreSQL 应使用适合服务器的 SSL 模式，不要直接照搬 Compose 的 `disable`。
 
-Compose passes an optional `DAPI_DATABASE_URL` through to the application. When
-it is non-empty, it takes precedence over the split variables, while the bundled
-PostgreSQL container still uses `POSTGRES_PASSWORD` for its own initialization.
+## Compose 变量
 
-Example full URL:
-
-```sh
-export DAPI_DATABASE_URL='postgres://dapi:password@db.example:5432/dapi?sslmode=require'
-```
-
-## Compose Variables
-
-These variables are interpreted by `compose.yaml`, not by the Go process.
-
-| Variable | Default | Description |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `POSTGRES_PASSWORD` | required | PostgreSQL container password and D-API DB password |
-| `DAPI_DOMAIN` | `localhost` | Caddy site address used for HTTPS |
-| `DAPI_BIND` | `127.0.0.1:18083` | Host address and port mapped to D-API port 8080 |
+| `POSTGRES_PASSWORD` | 必填 | PostgreSQL 容器密码 |
+| `DAPI_DOMAIN` | `localhost` | Caddy HTTPS 站点地址 |
+| `DAPI_BIND` | `127.0.0.1:18083` | 主机到 D-API 容器端口的映射 |
 
-The loopback `DAPI_BIND` lets the host inspect D-API while normal public traffic
-uses Caddy on ports 80 and 443. Binding D-API to `0.0.0.0` creates a separate
-unencrypted HTTP entry point and should only be used temporarily with
-`DAPI_TRUST_PROXY=false` and a restrictive firewall.
+`DAPI_BIND` 是 Compose 插值，不是 Go 进程环境变量。临时直连 HTTP 时必须关闭代理信任，
+并用防火墙限制端口。
 
-`DAPI_BIND` is a Compose interpolation value, not an application environment
-variable. The application always listens on its container `DAPI_ADDR` (default
-`:8080`); Compose maps the host address and port to that listener.
+## 后台配置项
 
-## Runtime Settings in the Admin Console
+后台保存以下运行配置：上游 URL、凭据、User-Agent、优先级、协议、模型、别名、超时、
+失败阈值、冷却时间、余额保护、分组成员、客户端 Key、价格档案、USD/CNY 汇率、最大尝试次数、
+通知渠道和告警规则。
 
-The following values are stored in PostgreSQL rather than environment variables:
+客户端 Key 只会在所属分组内路由。相同 Base URL 的多个 Key 仅在界面聚合，路由和成本仍按
+Key 分别处理。价格估算是运营参考，不执行扣费；未知价格或缺失 Token 时显示未知和覆盖率。
 
-- Upstream URLs, credentials, priorities, protocols, models, aliases, timeouts,
-  failure thresholds, cooldowns, and enabled state
-- Upstream groups, their enabled state and members, and the group assigned to
-  each client key
-- Pricing profiles, model prices, USD/CNY display rate, and upstream assignments
-- Client API keys and their protocol/model restrictions
-- Maximum upstream attempts per request (1 to 5, default 3)
-- Notification channels and alert rules
+清理任务每天运行一次，按 `DAPI_LOG_RETENTION` 分批删除请求日志、日用量、审计、告警事件
+和过期会话。独立的上游生命周期请求与估算成本累计不受普通日志保留期影响；清理任务不能
+替代 PostgreSQL 备份或大型部署需要的分区策略。
 
-The built-in cleanup job runs once per day and removes request logs, daily usage,
-audit entries, alert events, and expired sessions older than `DAPI_LOG_RETENTION`.
-Cleanup is best effort and does not replace PostgreSQL backups or partitioning
-for very large installations.
+## 测试变量
 
-NewAPI's optional Access Token and User ID are used only for compatible balance
-queries. Normal forwarding always uses the upstream API Key. Sub2API upstreams
-do not retain Access Token or User ID values.
-
-## Test-Only Variable
-
-`DAPI_TEST_DATABASE_URL` enables PostgreSQL integration tests. Tests create an
-isolated schema inside that database and skip when the variable is absent.
+`DAPI_TEST_DATABASE_URL` 启用 PostgreSQL 集成测试。测试会在数据库内创建隔离 schema，
+未设置时自动跳过。
