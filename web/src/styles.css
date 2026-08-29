@@ -496,6 +496,32 @@ tr:hover .copy-button, .cell-copy:focus-within .copy-button { opacity: 1; }
 .rule-add { padding: 11px 13px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 100px auto; gap: 8px; }
 .rule-add select, .rule-add input { min-height: 36px; }
 .table-input { width: 92px; min-height: 32px; padding: 5px 7px; }
+.upstream-table th:first-child, .upstream-table td:first-child { width: 48px; padding-inline: 10px; text-align: center; }
+.upstream-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 5px;
+  display: inline-grid;
+  place-content: center;
+  color: var(--accent-contrast);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color .16s, background .16s, box-shadow .16s, transform .14s;
+}
+.upstream-checkbox:hover { border-color: var(--accent); background: var(--accent-soft); }
+.upstream-checkbox:checked, .upstream-checkbox:indeterminate { border-color: var(--accent); background: var(--accent); }
+.upstream-checkbox::before { content: ""; width: 9px; height: 5px; border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(-45deg) scale(0); transform-origin: center; transition: transform .14s; }
+.upstream-checkbox:checked::before { transform: rotate(-45deg) scale(1); }
+.upstream-checkbox:indeterminate::before { width: 8px; height: 2px; border: 0; border-radius: 1px; background: currentColor; transform: none; }
+.upstream-checkbox:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.upstream-checkbox:active:not(:disabled) { transform: scale(.92); }
+.upstream-checkbox:disabled { cursor: not-allowed; }
 
 .modal-backdrop, .drawer-backdrop { position: fixed; inset: 0; z-index: 200; background: rgba(13, 20, 16, .48); }
 .modal-backdrop { backdrop-filter: blur(3px); }

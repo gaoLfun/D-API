@@ -406,6 +406,11 @@ const filteredUpstreamGroups = computed(() => upstreamGroups.value.filter((item)
   return true
 }))
 const allVisibleUpstreamsSelected = computed(() => filteredUpstreamGroups.value.length > 0 && filteredUpstreamGroups.value.every((item) => item.items.every((entry) => upstreamSelectedIds.value.includes(entry.id))))
+const someVisibleUpstreamsSelected = computed(() => {
+  const visibleIDs = filteredUpstreamGroups.value.flatMap((item) => item.items.map((entry) => entry.id))
+  const selectedCount = visibleIDs.filter((id) => upstreamSelectedIds.value.includes(id)).length
+  return selectedCount > 0 && selectedCount < visibleIDs.length
+})
 const filteredKeys = computed(() => keys.value.filter((item) => {
   const search = keyFilter.search.trim().toLocaleLowerCase('zh-CN')
   if (search && !`${item.name} ${item.prefix || item.key_prefix || ''}`.toLocaleLowerCase('zh-CN').includes(search)) return false
@@ -2237,7 +2242,7 @@ onBeforeUnmount(() => {
           <div class="list-filterbar"><label><span>搜索</span><input v-model.trim="upstreamFilter.search" placeholder="Base URL 或 Key 名称" /></label><label><span>状态</span><select v-model="upstreamFilter.status"><option value="all">全部状态</option><option value="healthy">正常</option><option value="warning">关注</option><option value="error">异常</option></select></label><label><span>协议</span><select v-model="upstreamFilter.protocol"><option value="all">全部协议</option><option v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><button class="text-button" @click="Object.assign(upstreamFilter, { search: '', status: 'all', protocol: 'all' })">清除筛选</button></div>
           <section class="panel table-panel"><div class="table-wrap"><table class="upstream-table">
             <thead><tr>
-              <th><input type="checkbox" :checked="allVisibleUpstreamsSelected" aria-label="选择全部可见上游 Key" @change="toggleAllVisibleUpstreams" /></th><th :aria-sort="ariaSort('upstreams', 'priority')"><button class="sort-button" @click="toggleSort('upstreams', 'priority')">顺序<ArrowUpDown :size="12" /></button></th>
+              <th><input class="upstream-checkbox" type="checkbox" :checked="allVisibleUpstreamsSelected" :indeterminate="someVisibleUpstreamsSelected" aria-label="选择全部可见上游 Key" @change="toggleAllVisibleUpstreams" /></th><th :aria-sort="ariaSort('upstreams', 'priority')"><button class="sort-button" @click="toggleSort('upstreams', 'priority')">顺序<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('upstreams', 'name')"><button class="sort-button" @click="toggleSort('upstreams', 'name')">上游<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('upstreams', 'health_status')"><button class="sort-button" @click="toggleSort('upstreams', 'health_status')">连接<ArrowUpDown :size="12" /></button></th>
               <th>能力</th>
@@ -2248,7 +2253,7 @@ onBeforeUnmount(() => {
             <tbody>
               <template v-for="item in sortRows(filteredUpstreamGroups, 'upstreams')" :key="item.key">
               <tr :class="{ subdued: item.enabled === 0 }" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
-                <td><input type="checkbox" :checked="item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :aria-label="`选择 ${item.base_url} 下的 Key`" @click.stop @change="item.items.forEach((entry) => toggleUpstreamSelection(entry, $event))" /></td><td><span class="priority">{{ item.priority }}</span></td>
+                <td><input class="upstream-checkbox" type="checkbox" :checked="item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :indeterminate="item.items.some((entry) => upstreamSelectedIds.includes(entry.id)) && !item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :aria-label="`选择 ${item.base_url} 下的 Key`" @click.stop @change="item.items.forEach((entry) => toggleUpstreamSelection(entry, $event))" /></td><td><span class="priority">{{ item.priority }}</span></td>
                 <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.available }} 个可路由<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
                 <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><small v-if="item.total > 1">点击查看各 Key 状态</small></td>
                 <td><div class="tag-row"><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></div><small>{{ item.models?.length || 0 }} 个模型</small></td>
@@ -2410,7 +2415,7 @@ onBeforeUnmount(() => {
           </template>
           <template v-else-if="notificationSection === 'settings'">
             <section class="panel settings-strip"><div><h2>路由设置</h2><p>单次请求最多尝试的上游数量</p></div><label>最大尝试次数<input v-model.number="maxAttempts" type="number" min="1" max="5" /></label><button class="secondary" @click="saveSettings"><Check :size="16" />保存</button></section>
-            <div class="notice-panel"><Check :size="16" /><span>数字越小优先级越高。客户端 Key 只会在所属分组内按上游 Key 的优先级尝试。</span></div>
+            <div class="notice-panel"><Check :size="16" /><span>客户端 Key 仅使用所属分组内的上游；候选按优先级依次尝试（数字越小越优先），单次请求最多尝试这里设置的上游数量。</span></div>
           </template>
           <template v-else>
             <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>
