@@ -493,6 +493,26 @@ tr:hover .copy-button, .cell-copy:focus-within .copy-button { opacity: 1; }
 .settings-strip p { margin: 0; color: var(--text-muted); font-size: 11px; }
 .settings-strip label { width: 130px; }
 .settings-strip input { min-height: 36px; }
+.settings-page-head { min-height: 40px; display: flex; align-items: center; }
+.settings-page-head h2 { margin-bottom: 4px; font-size: 18px; }
+.settings-page-head p { margin: 0; color: var(--text-muted); font-size: 12px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.settings-card { overflow: hidden; }
+.settings-card .panel-head { min-height: 64px; }
+.settings-card-icon { flex: 0 0 auto; color: var(--accent); }
+.settings-card-body { padding: 16px 17px 18px; display: grid; gap: 14px; }
+.settings-control-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; }
+.settings-control-copy { min-width: 0; display: grid; gap: 4px; }
+.settings-control-copy strong { font-size: 13px; }
+.settings-control-copy span, .settings-account-row span { color: var(--text-muted); font-size: 11px; }
+.settings-field { width: 120px; flex: 0 0 auto; }
+.settings-field input { min-height: 36px; }
+.settings-help { margin: 0; padding-top: 13px; border-top: 1px solid var(--line); color: var(--text-muted); font-size: 11px; line-height: 1.55; }
+.settings-card-actions { display: flex; justify-content: flex-end; }
+.settings-card-actions .secondary { min-height: 34px; font-size: 11px; }
+.settings-account-row { min-height: 42px; display: flex; align-items: center; gap: 10px; }
+.settings-account-row > div { min-width: 0; display: grid; gap: 4px; }
+.settings-account-row strong { font-size: 13px; }
 .rule-add { padding: 11px 13px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 100px auto; gap: 8px; }
 .rule-add select, .rule-add input { min-height: 36px; }
 .table-input { width: 92px; min-height: 32px; padding: 5px 7px; }
@@ -700,6 +720,7 @@ legend { margin-bottom: 8px; color: var(--text); font-size: 12px; font-weight: 6
   .metric-grid, .metric-grid.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .usage-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-grid { grid-template-columns: 1fr; }
   .metric-grid.three article:first-child { grid-column: span 2; }
   .metric-grid article { min-height: 90px; padding: 13px; gap: 10px; }
   .metric-grid strong { font-size: 23px; }
@@ -805,6 +826,8 @@ legend { margin-bottom: 8px; color: var(--text); font-size: 12px; font-weight: 6
   .channel-card .status { display: none; }
   .settings-strip { align-items: flex-end; flex-wrap: wrap; }
   .settings-strip > div { width: 100%; }
+  .settings-control-row { align-items: stretch; flex-direction: column; }
+  .settings-field { width: 100%; }
   .rule-add { grid-template-columns: 1fr 1fr; }
   .protocol-result { grid-template-columns: minmax(70px, 1fr) 42px 74px 58px; }
   .protocol-result > small { grid-column: 1 / -1; white-space: normal; overflow-wrap: anywhere; }

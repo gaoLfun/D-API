@@ -46,6 +46,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Changed
 
+- Separated notification and system-settings views in the admin console, with
+  dedicated controls for routing attempts and administrator password changes.
 - Improved upstream bulk-selection feedback with accessible indeterminate states
   and clarified the maximum-attempts routing notice in the admin console.
 - Reorganized the repository documentation around a Chinese default README,

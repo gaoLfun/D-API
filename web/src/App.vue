@@ -3,7 +3,7 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, r
 import {
   Activity, AlertCircle, ArrowUpDown, Bell, Check, ChevronLeft, ChevronRight,
   ChartNoAxesCombined, CircleDollarSign, CircleStop, Clipboard, Copy, Download, Gauge, KeyRound, LayoutDashboard, ListFilter, Play,
-  LoaderCircle, LogOut, Mail, Menu, Monitor, Moon, MoreHorizontal, Network,
+  LoaderCircle, LogOut, Mail, Menu, Monitor, Moon, MoreHorizontal, Network, Settings,
   PanelLeftClose, PanelLeftOpen, Pencil, Plus, RefreshCw, Search, Server,
   ShieldCheck, Sun, Trash2, Upload, Webhook, X,
 } from 'lucide-vue-next'
@@ -15,7 +15,7 @@ import {
 } from './upstream-form'
 import type { UpstreamUserAgentMode } from './upstream-form'
 
-type View = 'dashboard' | 'groups' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels'
+type View = 'dashboard' | 'groups' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels' | 'settings'
 type Theme = 'auto' | 'light' | 'dark'
 type CCSwitchApp = 'claude' | 'codex' | 'gemini'
 type Json = Record<string, any>
@@ -167,6 +167,7 @@ const navItems = [
   { id: 'logs' as View, label: '请求日志', icon: ListFilter },
   { id: 'usage' as View, label: '用量', icon: Gauge },
   { id: 'channels' as View, label: '通知', icon: Bell },
+  { id: 'settings' as View, label: '系统设置', icon: Settings },
 ]
 
 const themeOptions = [
@@ -265,7 +266,7 @@ const usageFilter = reactive({
 Object.assign(usageFilter, readStoredJSON('dapi-usage-filter', {}))
 const usageMetric = ref<'requests' | 'tokens' | 'latency' | 'cache'>('requests')
 const mobileFiltersOpen = ref(false)
-const notificationSection = ref<'channels' | 'alerts' | 'settings'>('channels')
+const notificationSection = ref<'channels' | 'alerts'>('channels')
 
 const upstreamModal = ref(false)
 const editingUpstream = ref<number | null>(null)
@@ -966,15 +967,16 @@ async function loadCurrent() {
       upstreams.value = listOf<Upstream>(upstreamData)
       keys.value = listOf<ClientKey>(keyData)
       groups.value = listOf<Group>(groupData)
-    }
-    else {
-      const [channelData, ruleData, settingsData, upstreamData] = await Promise.all([
-        api.get('/api/admin/channels', { signal }), api.get('/api/admin/alert-rules', { signal }), api.get<Json>('/api/admin/settings', { signal }), api.get('/api/admin/upstreams', { signal }),
+    } else if (view.value === 'channels') {
+      const [channelData, ruleData, upstreamData] = await Promise.all([
+        api.get('/api/admin/channels', { signal }), api.get('/api/admin/alert-rules', { signal }), api.get('/api/admin/upstreams', { signal }),
       ])
       channels.value = listOf<Channel>(channelData)
       alertRules.value = listOf<AlertRule>(ruleData)
-      maxAttempts.value = Number(settingsData.max_attempts || 3)
       upstreams.value = listOf<Upstream>(upstreamData)
+    } else if (view.value === 'settings') {
+      const settingsData = await api.get<Json>('/api/admin/settings', { signal })
+      maxAttempts.value = Number(settingsData.max_attempts || 3)
     }
     lastUpdatedAt.value = new Date()
   } catch (error) {
@@ -2400,11 +2402,10 @@ onBeforeUnmount(() => {
           </tr></thead><tbody><tr v-for="(row, index) in sortRows([...usageRows].reverse(), 'usage')" :key="usageRowKey(row, index)"><td><strong>{{ String(row.day || row.date || row.label || '').slice(0, 10) || '—' }}</strong></td><td><strong>{{ usageDimensionLabel(row) }}</strong></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtNumber(row.successes) }}</td><td>{{ fmtMetric(row.input_tokens) }}</td><td>{{ fmtMetric(row.output_tokens) }}</td><td>{{ fmtMetric(row.cached_input_tokens ?? row.cache_read_tokens) }} / {{ fmtMetric(row.cache_creation_input_tokens ?? row.cache_write_tokens) }}</td><td>{{ fmtDuration(row.avg_duration_ms ?? row.average_duration_ms) }} / {{ fmtDuration(row.p95_duration_ms ?? row.p95_ms) }}</td></tr></tbody></table></div></section>
         </section>
 
-        <section v-else class="view-stack">
-          <div class="section-tabs" role="tablist" aria-label="通知和设置">
+        <section v-else-if="view === 'channels'" class="view-stack">
+          <div class="section-tabs" role="tablist" aria-label="通知设置">
             <button role="tab" :aria-selected="notificationSection === 'channels'" :class="{ active: notificationSection === 'channels' }" @click="notificationSection = 'channels'"><Bell :size="15" />通知渠道</button>
             <button role="tab" :aria-selected="notificationSection === 'alerts'" :class="{ active: notificationSection === 'alerts' }" @click="notificationSection = 'alerts'"><AlertCircle :size="15" />告警规则</button>
-            <button role="tab" :aria-selected="notificationSection === 'settings'" :class="{ active: notificationSection === 'settings' }" @click="notificationSection = 'settings'"><Network :size="15" />路由设置</button>
           </div>
           <template v-if="notificationSection === 'channels'">
             <div class="action-row"><p>上游状态与安全事件将发送到已启用渠道。</p><button class="primary" @click="openChannel"><Plus :size="17" />添加渠道</button></div>
@@ -2412,10 +2413,6 @@ onBeforeUnmount(() => {
               <article v-for="item in channels" :key="item.id" class="channel-card"><span class="channel-icon"><Mail v-if="item.kind === 'email'" :size="21" /><Webhook v-else :size="21" /></span><div><strong>{{ item.name }}</strong><small>{{ item.kind === 'email' ? '邮件' : 'Webhook' }} · {{ item.enabled ? '已启用' : '已停用' }}</small></div><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span><div class="channel-actions"><button v-if="item.kind === 'webhook'" class="secondary channel-test" :disabled="channelTestID !== null" :aria-busy="channelTestID === item.id" @click="testChannel(item)"><LoaderCircle v-if="channelTestID === item.id" class="spin" :size="14" /><Webhook v-else :size="14" />{{ channelTestID === item.id ? '测试中' : '测试' }}</button><button class="icon danger" title="删除" @click="removeChannel(item)"><Trash2 :size="16" /></button></div></article>
               <div v-if="!channels.length" class="empty panel">还没有通知渠道。</div>
             </div>
-          </template>
-          <template v-else-if="notificationSection === 'settings'">
-            <section class="panel settings-strip"><div><h2>路由设置</h2><p>单次请求最多尝试的上游数量</p></div><label>最大尝试次数<input v-model.number="maxAttempts" type="number" min="1" max="5" /></label><button class="secondary" @click="saveSettings"><Check :size="16" />保存</button></section>
-            <div class="notice-panel"><Check :size="16" /><span>客户端 Key 仅使用所属分组内的上游；候选按优先级依次尝试（数字越小越优先），单次请求最多尝试这里设置的上游数量。</span></div>
           </template>
           <template v-else>
             <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>
@@ -2425,6 +2422,33 @@ onBeforeUnmount(() => {
               </tbody></table></div>
             </section>
           </template>
+        </section>
+
+        <section v-else-if="view === 'settings'" class="view-stack">
+          <div class="settings-page-head">
+            <div><h2>系统设置</h2><p>管理网关路由策略与管理员账户。</p></div>
+          </div>
+          <div class="settings-grid">
+            <section class="panel settings-card">
+              <div class="panel-head"><div><h2>路由与请求</h2><p>控制客户端请求的候选上游尝试范围</p></div><Network :size="18" class="settings-card-icon" /></div>
+              <div class="settings-card-body">
+                <div class="settings-control-row">
+                  <div class="settings-control-copy"><strong>最大尝试次数</strong><span>单次请求最多尝试的上游数量</span></div>
+                  <label class="settings-field"><span class="visually-hidden">最大尝试次数</span><input v-model.number="maxAttempts" type="number" min="1" max="5" /></label>
+                </div>
+                <p class="settings-help">客户端 Key 仅使用所属分组内的上游；候选按优先级依次尝试，数字越小越优先。保存后对新请求生效。</p>
+                <div class="settings-card-actions"><button class="secondary" @click="saveSettings"><Check :size="16" />保存路由设置</button></div>
+              </div>
+            </section>
+            <section class="panel settings-card">
+              <div class="panel-head"><div><h2>管理员账户</h2><p>保护控制台访问权限</p></div><ShieldCheck :size="18" class="settings-card-icon" /></div>
+              <div class="settings-card-body">
+                <div class="settings-account-row"><span class="avatar">{{ String(admin.username || 'A').slice(0, 1).toUpperCase() }}</span><div><strong>{{ admin.username || '管理员' }}</strong><span>管理员账户</span></div></div>
+                <p class="settings-help">修改密码后，当前会话会立即失效，需要使用新密码重新登录。</p>
+                <div class="settings-card-actions"><button class="secondary" @click="passwordModal = true"><ShieldCheck :size="16" />修改管理员密码</button></div>
+              </div>
+            </section>
+          </div>
         </section>
       </div>
     </main>
