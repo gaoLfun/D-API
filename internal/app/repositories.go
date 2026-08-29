@@ -142,11 +142,12 @@ func (n ChannelNotifier) Notify(ctx context.Context, event ops.Event) error {
 		switch channel.Kind {
 		case "webhook":
 			var config struct {
-				URL     string            `json:"url"`
-				Headers map[string]string `json:"headers"`
+				URL      string            `json:"url"`
+				Provider string            `json:"provider"`
+				Headers  map[string]string `json:"headers"`
 			}
 			if json.Unmarshal(channel.Config, &config) == nil && config.URL != "" {
-				notifiers = append(notifiers, ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Headers: config.Headers}, nil))
+				notifiers = append(notifiers, ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Provider: config.Provider, Headers: config.Headers}, nil))
 			}
 		case "email":
 			var config struct {

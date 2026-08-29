@@ -18,3 +18,14 @@ func TestValidateChannelRejectsEmptyRecipients(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateChannelRejectsUnknownWebhookProvider(t *testing.T) {
+	channel := store.NotificationChannel{
+		Name:   "hook",
+		Kind:   "webhook",
+		Config: json.RawMessage(`{"url":"https://hooks.example.com/test","provider":"dingtal"}`),
+	}
+	if validateChannel(channel) == nil {
+		t.Fatal("accepted unknown webhook provider")
+	}
+}

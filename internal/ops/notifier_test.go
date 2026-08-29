@@ -55,6 +55,57 @@ func TestWebhookNotifierRejectsApplicationError(t *testing.T) {
 	}
 }
 
+func TestWebhookPayloadAdapters(t *testing.T) {
+	event := Event{Type: "upstream_health", State: "unhealthy", Previous: "healthy", UpstreamName: "primary", Message: "连接失败"}
+	tests := []struct {
+		provider string
+		want     string
+	}{
+		{"dingtalk", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}}`},
+		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"},"msg_type":"text"}`},
+		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}}`},
+		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}`},
+		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.provider, func(t *testing.T) {
+			body, err := webhookPayload(test.provider, "", event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != test.want {
+				t.Fatalf("payload = %s, want %s", body, test.want)
+			}
+		})
+	}
+}
+
+func TestWebhookProviderDetectionUsesHostname(t *testing.T) {
+	event := Event{Type: "notification_test"}
+	dingtalk, err := webhookPayload("", "https://oapi.dingtalk.com/robot/send?next=dingtalk.com", event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(dingtalk) == string(mustJSON(event)) {
+		t.Fatal("dingtalk hostname was not detected")
+	}
+	generic, err := webhookPayload("", "https://example.com/callback?next=dingtalk.com", event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(generic) != string(mustJSON(event)) {
+		t.Fatalf("query string incorrectly selected provider: %s", generic)
+	}
+}
+
+func mustJSON(event Event) []byte {
+	body, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
 func TestMultiNotifierAcceptsPartialDelivery(t *testing.T) {
 	delivered := 0
 	notifier := MultiNotifier{

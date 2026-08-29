@@ -251,6 +251,11 @@ Webhook 投递必须返回 2xx，且响应 JSON 不能明确表示应用层失�
 `success:false`、`ok:false`、非零 `errcode`，以及不是 `0`/`200`/`ok`/`success`
 的 `code`；这类响应会按投递失败处理，并进入现有的失败记录和重试流程。
 
+Webhook 配置可选 `provider`：`dingtalk`（钉钉）、`feishu`（飞书/Lark）、
+`wecom`（企业微信）、`slack`、`discord` 或 `generic`。省略时服务会按 URL
+域名自动识别；无法识别的地址发送原始通用事件 JSON。各平台适配格式同时用于
+连通性测试和告警通知。
+
 告警事件包括 `low_balance`、`balance_unavailable`、`error_rate` 和
 `latency`。规则的窗口至少 60 秒，冷却至少 60 秒；每条规则可绑定一个
 上游。`max_attempts` 位于 1-5，默认 3，控制一次客户端请求最多尝试几个

@@ -1014,21 +1014,22 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var config struct {
-		URL     string            `json:"url"`
-		Headers map[string]string `json:"headers"`
+		URL      string            `json:"url"`
+		Provider string            `json:"provider"`
+		Headers  map[string]string `json:"headers"`
 	}
 	if err := json.Unmarshal(channel.Config, &config); err != nil || strings.TrimSpace(config.URL) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_channel", "Webhook 配置无效")
 		return
 	}
-	notifier := ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Headers: config.Headers}, nil)
+	notifier := ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Provider: config.Provider, Headers: config.Headers}, nil)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	if err := notifier.Notify(ctx, ops.Event{
-		Type: "notification_test",
-		State: "success",
+		Type:    "notification_test",
+		State:   "success",
 		Message: "D-API Webhook 连通性测试",
-		At: time.Now().UTC(),
+		At:      time.Now().UTC(),
 	}); err != nil {
 		writeError(w, http.StatusBadGateway, "channel_test_failed", "Webhook 测试失败，请检查地址、响应状态和网络策略")
 		return
@@ -1055,6 +1056,12 @@ func validateChannel(channel store.NotificationChannel) error {
 		var urlValue string
 		if err := json.Unmarshal(values["url"], &urlValue); err != nil || len(urlValue) > 2048 {
 			return errors.New("invalid webhook URL")
+		}
+		var provider string
+		if raw, ok := values["provider"]; ok {
+			if err := json.Unmarshal(raw, &provider); err != nil || !ops.IsWebhookProvider(provider) {
+				return errors.New("invalid webhook provider")
+			}
 		}
 		parsed, err := url.Parse(strings.TrimSpace(urlValue))
 		if err != nil || parsed.User != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {

@@ -33,6 +33,8 @@ All notable changes to D-API will be documented in this file. The format is base
   checks, route previews, client request simulation, and usage CSV export.
 - Notification tabs with Webhook connectivity tests that keep channel secrets
   out of responses.
+- Webhook payload adapters for DingTalk, Feishu/Lark, WeCom, Slack, Discord,
+  and generic JSON with explicit provider selection or safe hostname detection.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

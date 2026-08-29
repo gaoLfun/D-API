@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -91,9 +92,10 @@ func (n *CooldownNotifier) Notify(ctx context.Context, event Event) error {
 }
 
 type WebhookConfig struct {
-	URL     string
-	Headers map[string]string
-	Timeout time.Duration
+	URL      string
+	Provider string
+	Headers  map[string]string
+	Timeout  time.Duration
 }
 
 type WebhookNotifier struct {
@@ -113,7 +115,7 @@ func NewWebhookNotifier(config WebhookConfig, client *http.Client) *WebhookNotif
 }
 
 func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
-	body, err := json.Marshal(event)
+	body, err := webhookPayload(n.config.Provider, n.config.URL, event)
 	if err != nil {
 		return err
 	}
@@ -143,6 +145,113 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 		return errors.New("webhook rejected request")
 	}
 	return nil
+}
+
+func webhookPayload(provider, rawURL string, event Event) ([]byte, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = webhookProviderFromURL(rawURL)
+	}
+	text := webhookEventText(event)
+	switch provider {
+	case "dingtalk", "wecom":
+		return json.Marshal(map[string]any{"msgtype": "text", "text": map[string]string{"content": text}})
+	case "feishu":
+		return json.Marshal(map[string]any{"msg_type": "text", "content": map[string]string{"text": text}})
+	case "slack":
+		return json.Marshal(map[string]string{"text": text})
+	case "discord":
+		return json.Marshal(map[string]string{"content": text})
+	default:
+		return json.Marshal(event)
+	}
+}
+
+func webhookProviderFromURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	switch {
+	case strings.HasSuffix(host, ".dingtalk.com"):
+		return "dingtalk"
+	case strings.HasSuffix(host, ".feishu.cn"), strings.HasSuffix(host, ".larksuite.com"):
+		return "feishu"
+	case host == "qyapi.weixin.qq.com":
+		return "wecom"
+	case host == "hooks.slack.com":
+		return "slack"
+	case (host == "discord.com" || host == "discordapp.com") && strings.HasPrefix(parsed.Path, "/api/webhooks/"):
+		return "discord"
+	default:
+		return ""
+	}
+}
+
+func IsWebhookProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", "generic", "dingtalk", "feishu", "wecom", "slack", "discord":
+		return true
+	default:
+		return false
+	}
+}
+
+func webhookEventText(event Event) string {
+	lines := []string{"【D-API】通知", "事件：" + webhookEventLabel(event.Type)}
+	if event.UpstreamName != "" {
+		lines = append(lines, "上游："+event.UpstreamName)
+	}
+	if event.State != "" {
+		lines = append(lines, "状态："+webhookStateLabel(event.State))
+	}
+	if event.Previous != "" {
+		lines = append(lines, "之前："+webhookStateLabel(event.Previous))
+	}
+	if event.Message != "" {
+		lines = append(lines, "详情："+event.Message)
+	}
+	if !event.At.IsZero() {
+		lines = append(lines, "时间："+event.At.Local().Format("2006-01-02 15:04:05"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func webhookEventLabel(eventType string) string {
+	switch eventType {
+	case "notification_test":
+		return "通知渠道测试"
+	case "upstream_health":
+		return "上游健康状态变更"
+	case "low_balance":
+		return "上游余额不足"
+	case "balance_unavailable":
+		return "上游余额不可用"
+	case "error_rate":
+		return "错误率告警"
+	case "latency":
+		return "延迟告警"
+	case "upstream_balance_protection":
+		return "余额保护状态变更"
+	default:
+		return eventType
+	}
+}
+
+func webhookStateLabel(state string) string {
+	labels := map[string]string{
+		"healthy":   "正常",
+		"unhealthy": "异常",
+		"success":   "成功",
+		"failed":    "失败",
+		"active":    "已启用",
+		"paused":    "已暂停",
+	}
+	if label, ok := labels[state]; ok {
+		return label + "（" + state + "）"
+	}
+	return state
 }
 
 // Several webhook providers return HTTP 2xx for an application-level failure.

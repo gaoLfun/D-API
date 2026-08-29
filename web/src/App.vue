@@ -316,7 +316,7 @@ const passwordModal = ref(false)
 const confirmDialog = reactive({ show: false, title: '', message: '', confirmLabel: '删除' })
 let resolveConfirmation: ((confirmed: boolean) => void) | null = null
 const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '' })
-const channelForm = reactive({ name: '', kind: 'webhook' as 'email' | 'webhook', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
+const channelForm = reactive({ name: '', kind: 'webhook' as 'email' | 'webhook', provider: '', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
 const newRule = reactive({ event: 'low_balance', upstream_id: '', threshold: 5, window_seconds: 300, cooldown_seconds: 1800 })
 const saving = ref(false)
 
@@ -1534,7 +1534,7 @@ async function bulkUpstreamAction(action: 'check' | 'balance') {
 }
 
 function openChannel() {
-  Object.assign(channelForm, { name: '', kind: 'webhook', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
+  Object.assign(channelForm, { name: '', kind: 'webhook', provider: '', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
   channelModal.value = true
 }
 
@@ -1819,7 +1819,7 @@ async function saveChannel() {
   saving.value = true
   try {
     const config = channelForm.kind === 'webhook'
-      ? { url: channelForm.target }
+      ? { url: channelForm.target, provider: channelForm.provider || undefined }
       : { to: channelForm.target, smtp_host: channelForm.smtp_host, smtp_port: channelForm.smtp_port, username: channelForm.username, password: channelForm.password }
     await api.post('/api/admin/channels', { name: channelForm.name, kind: channelForm.kind, enabled: channelForm.enabled, config })
     channelModal.value = false
@@ -2554,7 +2554,7 @@ onBeforeUnmount(() => {
 
   <div v-if="channelModal" class="modal-backdrop" @mousedown.self="channelModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="channel-title"><header><div><h2 id="channel-title">添加通知渠道</h2><p>将运行状态发送到外部渠道</p></div><button class="icon" title="关闭" @click="channelModal = false"><X :size="19" /></button></header><form @submit.prevent="saveChannel"><div class="form-section"><div class="form-grid">
     <label>名称<input v-model.trim="channelForm.name" required autofocus placeholder="运维告警" /></label><label>类型<select v-model="channelForm.kind"><option value="email">邮件</option><option value="webhook">Webhook</option></select></label>
-    <template v-if="channelForm.kind === 'webhook'"><label class="span-2">Webhook URL<input v-model.trim="channelForm.target" type="url" required placeholder="https://hooks.example.com/…" /></label></template>
+    <template v-if="channelForm.kind === 'webhook'"><label>平台<select v-model="channelForm.provider"><option value="">自动识别</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option><option value="wecom">企业微信</option><option value="slack">Slack</option><option value="discord">Discord</option><option value="generic">通用 JSON</option></select></label><label>Webhook URL<input v-model.trim="channelForm.target" type="url" required placeholder="https://hooks.example.com/…" /></label></template>
     <template v-else><label class="span-2">收件地址<input v-model.trim="channelForm.target" type="email" required /></label><label>SMTP 主机<input v-model.trim="channelForm.smtp_host" required placeholder="smtp.example.com" /></label><label>端口<input v-model.number="channelForm.smtp_port" type="number" min="1" max="65535" required /></label><label>用户名<input v-model="channelForm.username" autocomplete="off" /></label><label>密码<input v-model="channelForm.password" type="password" autocomplete="new-password" /></label></template>
     <label class="switch span-2"><input v-model="channelForm.enabled" type="checkbox" /><span></span>启用渠道</label>
   </div></div><footer><button type="button" class="secondary" @click="channelModal = false">取消</button><button class="primary" :disabled="saving">添加渠道</button></footer></form></section></div>
