@@ -139,6 +139,7 @@ interface AlertRule {
   threshold: number
   window_seconds: number
   cooldown_seconds: number
+  max_notifications: number
   enabled: boolean
 }
 
@@ -317,7 +318,7 @@ const confirmDialog = reactive({ show: false, title: '', message: '', confirmLab
 let resolveConfirmation: ((confirmed: boolean) => void) | null = null
 const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '' })
 const channelForm = reactive({ name: '', kind: 'webhook' as 'email' | 'webhook', provider: '', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
-const newRule = reactive({ event: 'low_balance', upstream_id: '', threshold: 5, window_seconds: 300, cooldown_seconds: 1800 })
+const newRule = reactive({ event: 'low_balance', upstream_id: '', threshold: 5, window_seconds: 300, cooldown_seconds: 1800, max_notifications: 3 })
 const saving = ref(false)
 
 const setupSteps = computed(() => [
@@ -1856,7 +1857,7 @@ async function saveRule(rule: AlertRule) {
   try {
     await api.put(`/api/admin/alert-rules/${rule.id}`, {
       threshold: Number(rule.threshold), window_seconds: Number(rule.window_seconds),
-      cooldown_seconds: Number(rule.cooldown_seconds), enabled: rule.enabled,
+      cooldown_seconds: Number(rule.cooldown_seconds), max_notifications: Number(rule.max_notifications), enabled: rule.enabled,
     })
     notify('告警规则已保存')
   } catch (error) { notify(errorMessage(error), true) }
@@ -1868,6 +1869,7 @@ async function addRule() {
     await api.post('/api/admin/alert-rules', {
       event: newRule.event, upstream_id: Number(newRule.upstream_id), threshold: Number(newRule.threshold),
       window_seconds: Number(newRule.window_seconds), cooldown_seconds: Number(newRule.cooldown_seconds), enabled: true,
+      max_notifications: Number(newRule.max_notifications),
     })
     notify('上游告警覆盖已添加')
     await loadCurrent()
@@ -2413,8 +2415,8 @@ onBeforeUnmount(() => {
           <template v-else>
             <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>
               <div class="rule-add"><select v-model="newRule.event"><option v-for="event in ['low_balance','balance_unavailable','error_rate','latency','client_error_rate']" :key="event" :value="event">{{ alertEventText(event) }}</option></select><select v-model="newRule.upstream_id"><option value="">选择上游</option><option v-for="item in upstreams" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select><input v-model.number="newRule.threshold" type="number" min="0" step="0.1" title="阈值" /><button class="secondary" @click="addRule"><Plus :size="16" />添加覆盖</button></div>
-              <div class="table-wrap"><table><thead><tr><th>事件</th><th>范围</th><th>阈值</th><th>窗口（秒）</th><th>冷却（秒）</th><th>启用</th><th></th></tr></thead><tbody>
-                <tr v-for="rule in alertRules" :key="rule.id"><td><strong>{{ alertEventText(rule.event) }}</strong></td><td>{{ upstreamName(rule.upstream_id) }}</td><td><input v-model.number="rule.threshold" class="table-input" type="number" min="0" step="0.1" /></td><td><input v-model.number="rule.window_seconds" class="table-input" type="number" min="60" /></td><td><input v-model.number="rule.cooldown_seconds" class="table-input" type="number" min="60" /></td><td><label class="switch"><input v-model="rule.enabled" type="checkbox" /><span></span></label></td><td class="right"><button class="icon" title="保存规则" @click="saveRule(rule)"><Check :size="16" /></button><button v-if="rule.upstream_id" class="icon danger" title="删除覆盖" @click="removeRule(rule)"><Trash2 :size="16" /></button></td></tr>
+              <div class="table-wrap"><table><thead><tr><th>事件</th><th>范围</th><th>阈值</th><th>窗口（秒）</th><th>冷却（秒）</th><th>最多提醒</th><th>启用</th><th></th></tr></thead><tbody>
+                <tr v-for="rule in alertRules" :key="rule.id"><td><strong>{{ alertEventText(rule.event) }}</strong></td><td>{{ upstreamName(rule.upstream_id) }}</td><td><input v-model.number="rule.threshold" class="table-input" type="number" min="0" step="0.1" /></td><td><input v-model.number="rule.window_seconds" class="table-input" type="number" min="60" /></td><td><input v-model.number="rule.cooldown_seconds" class="table-input" type="number" min="60" /></td><td><input v-model.number="rule.max_notifications" class="table-input" type="number" min="1" max="100" /></td><td><label class="switch"><input v-model="rule.enabled" type="checkbox" /><span></span></label></td><td class="right"><button class="icon" title="保存规则" @click="saveRule(rule)"><Check :size="16" /></button><button v-if="rule.upstream_id" class="icon danger" title="删除覆盖" @click="removeRule(rule)"><Trash2 :size="16" /></button></td></tr>
               </tbody></table></div>
             </section>
           </template>

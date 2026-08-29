@@ -104,7 +104,7 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 			Previous:     upstream.HealthStatus,
 			UpstreamID:   upstream.ID,
 			UpstreamName: upstream.Name,
-			Message:      fmt.Sprintf("upstream %s changed from %s to %s", upstream.Name, upstream.HealthStatus, status),
+			Message:      fmt.Sprintf("上游 %s 状态从 %s 变更为 %s", upstream.Name, upstream.HealthStatus, status),
 			At:           health.CheckedAt,
 		}
 		if err := m.Repository.SaveEvent(ctx, event); err != nil {

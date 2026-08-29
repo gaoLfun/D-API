@@ -246,6 +246,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     threshold DOUBLE PRECISION,
     window_seconds INTEGER NOT NULL DEFAULT 300,
     cooldown_seconds INTEGER NOT NULL DEFAULT 1800,
+    max_notifications INTEGER NOT NULL DEFAULT 3,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(event, upstream_id)
 );
@@ -271,8 +272,12 @@ CREATE TABLE IF NOT EXISTS alert_states (
     message TEXT NOT NULL DEFAULT '',
     last_observed_at TIMESTAMPTZ NOT NULL,
     last_notified_at TIMESTAMPTZ,
+    notification_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(rule_id, observation_key)
 );
+
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS max_notifications INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS notification_count INTEGER NOT NULL DEFAULT 0;
 
 CREATE UNIQUE INDEX IF NOT EXISTS alert_rules_global_event_idx ON alert_rules(event) WHERE upstream_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS alert_rules_upstream_event_idx ON alert_rules(event, upstream_id) WHERE upstream_id IS NOT NULL;

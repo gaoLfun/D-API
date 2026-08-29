@@ -22,8 +22,8 @@ func (r AlertRepository) ListRules(ctx context.Context) ([]alerts.Rule, error) {
 	for _, rule := range stored {
 		rules = append(rules, alerts.Rule{
 			ID: rule.ID, Event: rule.Event, UpstreamID: rule.UpstreamID, Threshold: rule.Threshold,
-			Window:   time.Duration(rule.WindowSeconds) * time.Second,
-			Cooldown: time.Duration(rule.CooldownSeconds) * time.Second, Enabled: rule.Enabled,
+			Window: time.Duration(rule.WindowSeconds) * time.Second, Cooldown: time.Duration(rule.CooldownSeconds) * time.Second,
+			MaxNotifications: rule.MaxNotifications, Enabled: rule.Enabled,
 		})
 	}
 	return rules, nil
@@ -50,14 +50,14 @@ func (r AlertRepository) LoadState(ctx context.Context, ruleID int64, key string
 	state, found, err := r.Store.AlertState(ctx, ruleID, key)
 	return alerts.State{
 		Active: state.Active, Value: state.Value, Message: state.Message,
-		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt,
+		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt, NotificationCount: state.NotificationCount,
 	}, found, err
 }
 
 func (r AlertRepository) SaveState(ctx context.Context, ruleID int64, key string, state alerts.State) error {
 	return r.Store.SaveAlertState(ctx, ruleID, key, store.AlertState{
 		Active: state.Active, Value: state.Value, Message: state.Message,
-		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt,
+		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt, NotificationCount: state.NotificationCount,
 	})
 }
 
@@ -95,13 +95,13 @@ func (r AlertRepository) observeBalance(ctx context.Context, rule alerts.Rule) (
 				observation.Value = *record.Balance.Available
 			}
 			observation.Active = record.Balance.Status == "ok" && !record.Balance.Unlimited && record.Balance.Available != nil && *record.Balance.Available < threshold
-			observation.Message = fmt.Sprintf("upstream %s balance %.2f %s (threshold %.2f)", record.Name, observation.Value, record.Balance.Currency, threshold)
+			observation.Message = fmt.Sprintf("上游 %s 当前余额 %.2f %s，低于阈值 %.2f", record.Name, observation.Value, record.Balance.Currency, threshold)
 		} else {
 			observation.Active = record.Balance.Status == "unavailable"
 			if observation.Active {
 				observation.Value = 1
 			}
-			observation.Message = fmt.Sprintf("upstream %s balance query status: %s", record.Name, record.Balance.Status)
+			observation.Message = fmt.Sprintf("上游 %s 余额查询状态：%s", record.Name, record.Balance.Status)
 		}
 		result = append(result, observation)
 	}
@@ -148,11 +148,11 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 		}
 		value := errorRate
 		active := count >= 5 && errorRate >= threshold(rule, 20)
-		message := fmt.Sprintf("upstream %s error rate %.1f%% in %ds", name, errorRate, window)
+		message := fmt.Sprintf("上游 %s 在 %d 秒内错误率为 %.1f%%", name, window, errorRate)
 		if rule.Event == alerts.EventLatency {
 			value = latency
 			active = count > 0 && latency >= threshold(rule, 30000)
-			message = fmt.Sprintf("upstream %s average latency %.0fms in %ds", name, latency, window)
+			message = fmt.Sprintf("上游 %s 在 %d 秒内平均延迟 %.0fms", name, window, latency)
 		}
 		result = append(result, alerts.Observation{
 			Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Value: value,
@@ -182,7 +182,7 @@ func (r AlertRepository) observeClientErrors(ctx context.Context, rule alerts.Ru
 		}
 		result = append(result, alerts.Observation{
 			Key: "api_key:" + strconv.FormatInt(id, 10), Active: count >= 10 && rate >= threshold(rule, 50),
-			Value: rate, Message: fmt.Sprintf("client key %s error rate %.1f%% in %ds", name, rate, window),
+			Value: rate, Message: fmt.Sprintf("客户端密钥 %s 在 %d 秒内错误率为 %.1f%%", name, window, rate),
 		})
 	}
 	return result, rows.Err()
@@ -199,7 +199,7 @@ func (r AlertRepository) observeLoginFailures(ctx context.Context, rule alerts.R
 	}
 	return []alerts.Observation{{
 		Key: "admin:login_failures", Active: float64(count) >= threshold(rule, 5), Value: float64(count),
-		Message: fmt.Sprintf("administrator login failed %d times in %ds", count, window),
+		Message: fmt.Sprintf("管理员登录在 %d 秒内失败 %d 次", window, count),
 	}}, nil
 }
 
@@ -218,14 +218,14 @@ func (r AlertRepository) observeNewLoginIP(ctx context.Context, rule alerts.Rule
 		GROUP BY latest.ip`, window,
 	).Scan(&ip, &total)
 	if err == sql.ErrNoRows {
-		return []alerts.Observation{{Key: "admin:new_login_ip", Message: "no new administrator login IP"}}, nil
+		return []alerts.Observation{{Key: "admin:new_login_ip", Message: "未发现新的管理员登录 IP"}}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	return []alerts.Observation{{
 		Key: "admin:new_login_ip", Active: ip != "" && total == 0, Value: float64(total),
-		Message: fmt.Sprintf("administrator logged in from a new IP: %s", ip),
+		Message: fmt.Sprintf("管理员从新的 IP 登录：%s", ip),
 	}}, nil
 }
 

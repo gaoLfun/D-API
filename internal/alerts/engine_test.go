@@ -112,6 +112,34 @@ func TestEngineRemindsAfterCooldown(t *testing.T) {
 	}
 }
 
+func TestEngineStopsRemindersAtMaximum(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventLatency, Enabled: true, Cooldown: time.Hour, MaxNotifications: 2}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true}}},
+		states:       make(map[string]State),
+	}
+	var events []ops.Event
+	engine := newTestEngine(repository, now, &events)
+	for _, advance := range []time.Duration{0, 2 * time.Hour, 4 * time.Hour} {
+		engine.now = func() time.Time { return now.Add(advance) }
+		if err := engine.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(events) != 2 || repository.states[stateKey(1, "upstream:7")].NotificationCount != 2 {
+		t.Fatalf("events=%d state=%#v", len(events), repository.states[stateKey(1, "upstream:7")])
+	}
+	repository.observations[1][0].Active = false
+	engine.now = func() time.Time { return now.Add(5 * time.Hour) }
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || repository.states[stateKey(1, "upstream:7")].NotificationCount != 0 {
+		t.Fatalf("recovery events=%d state=%#v", len(events), repository.states[stateKey(1, "upstream:7")])
+	}
+}
+
 func TestEngineNotifiesRecovery(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	repository := &testRepository{

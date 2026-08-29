@@ -103,6 +103,8 @@ type WebhookNotifier struct {
 	client *http.Client
 }
 
+var webhookTimezone = time.FixedZone("UTC+8", 8*60*60)
+
 func NewWebhookNotifier(config WebhookConfig, client *http.Client) *WebhookNotifier {
 	if client == nil {
 		client = netguard.NewHTTPClient(config.Timeout)
@@ -154,7 +156,9 @@ func webhookPayload(provider, rawURL string, event Event) ([]byte, error) {
 	}
 	text := webhookEventText(event)
 	switch provider {
-	case "dingtalk", "wecom":
+	case "dingtalk":
+		return json.Marshal(map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": "D-API 通知", "text": webhookEventMarkdown(event)}})
+	case "wecom":
 		return json.Marshal(map[string]any{"msgtype": "text", "text": map[string]string{"content": text}})
 	case "feishu":
 		return json.Marshal(map[string]any{"msg_type": "text", "content": map[string]string{"text": text}})
@@ -210,12 +214,46 @@ func webhookEventText(event Event) string {
 		lines = append(lines, "之前："+webhookStateLabel(event.Previous))
 	}
 	if event.Message != "" {
-		lines = append(lines, "详情："+event.Message)
+		lines = append(lines, "详情："+webhookEventMessage(event))
 	}
 	if !event.At.IsZero() {
-		lines = append(lines, "时间："+event.At.Local().Format("2006-01-02 15:04:05"))
+		lines = append(lines, "时间："+event.At.In(webhookTimezone).Format("2006-01-02 15:04:05")+" (UTC+8)")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func webhookEventMarkdown(event Event) string {
+	lines := strings.Split(webhookEventText(event), "\n")
+	if len(lines) < 2 {
+		return strings.Join(lines, "\n")
+	}
+	for i := 1; i < len(lines); i++ {
+		if index := strings.Index(lines[i], "："); index >= 0 {
+			lines[i] = "**" + lines[i][:index+len("：")] + "**" + lines[i][index+len("："):]
+		}
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func webhookEventMessage(event Event) string {
+	if event.Type == "upstream_health" && event.UpstreamName != "" {
+		return "上游状态已从" + webhookStateLabel(event.Previous) + "变更为" + webhookStateLabel(event.State)
+	}
+	if event.Type == "upstream_balance_protection" && event.UpstreamName != "" {
+		return "上游余额保护状态：" + webhookStateLabel(event.State)
+	}
+	return localizeWebhookMessage(event.Message)
+}
+
+func localizeWebhookMessage(message string) string {
+	translations := map[string]string{
+		"administrator password was changed": "管理员密码已修改",
+		"no new administrator login IP":      "未发现新的管理员登录 IP",
+	}
+	if translated, ok := translations[message]; ok {
+		return translated
+	}
+	return message
 }
 
 func webhookEventLabel(eventType string) string {
@@ -232,6 +270,14 @@ func webhookEventLabel(eventType string) string {
 		return "错误率告警"
 	case "latency":
 		return "延迟告警"
+	case "client_error_rate":
+		return "客户端错误率告警"
+	case "login_failure":
+		return "登录失败告警"
+	case "new_login_ip":
+		return "新 IP 登录告警"
+	case "password_changed":
+		return "管理员密码变更"
 	case "upstream_balance_protection":
 		return "余额保护状态变更"
 	default:
@@ -241,12 +287,16 @@ func webhookEventLabel(eventType string) string {
 
 func webhookStateLabel(state string) string {
 	labels := map[string]string{
-		"healthy":   "正常",
-		"unhealthy": "异常",
-		"success":   "成功",
-		"failed":    "失败",
-		"active":    "已启用",
-		"paused":    "已暂停",
+		"healthy":           "正常",
+		"unhealthy":         "异常",
+		"success":           "成功",
+		"failed":            "失败",
+		"firing":            "触发",
+		"resolved":          "已恢复",
+		"active":            "已启用",
+		"paused":            "已暂停",
+		"balance_suspended": "已暂停路由",
+		"balance_resumed":   "已恢复路由",
 	}
 	if label, ok := labels[state]; ok {
 		return label + "（" + state + "）"

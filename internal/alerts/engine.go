@@ -21,13 +21,14 @@ const (
 )
 
 type Rule struct {
-	ID         int64         `json:"id"`
-	Event      string        `json:"event"`
-	UpstreamID *int64        `json:"upstream_id,omitempty"`
-	Threshold  *float64      `json:"threshold,omitempty"`
-	Window     time.Duration `json:"window"`
-	Cooldown   time.Duration `json:"cooldown"`
-	Enabled    bool          `json:"enabled"`
+	ID               int64         `json:"id"`
+	Event            string        `json:"event"`
+	UpstreamID       *int64        `json:"upstream_id,omitempty"`
+	Threshold        *float64      `json:"threshold,omitempty"`
+	Window           time.Duration `json:"window"`
+	Cooldown         time.Duration `json:"cooldown"`
+	MaxNotifications int           `json:"max_notifications"`
+	Enabled          bool          `json:"enabled"`
 }
 
 type Observation struct {
@@ -40,11 +41,12 @@ type Observation struct {
 }
 
 type State struct {
-	Active         bool       `json:"active"`
-	Value          float64    `json:"value"`
-	Message        string     `json:"message"`
-	LastObservedAt time.Time  `json:"last_observed_at"`
-	LastNotifiedAt *time.Time `json:"last_notified_at,omitempty"`
+	Active            bool       `json:"active"`
+	Value             float64    `json:"value"`
+	Message           string     `json:"message"`
+	LastObservedAt    time.Time  `json:"last_observed_at"`
+	LastNotifiedAt    *time.Time `json:"last_notified_at,omitempty"`
+	NotificationCount int        `json:"notification_count"`
 }
 
 type Repository interface {
@@ -130,10 +132,13 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 	}
 	now := e.now()
 	notify := observation.Active && (!exists || !state.Active)
-	if observation.Active && exists && state.Active && rule.Cooldown > 0 {
+	if observation.Active && exists && state.Active && rule.Cooldown > 0 && (rule.MaxNotifications <= 0 || state.NotificationCount < rule.MaxNotifications) {
 		notify = state.LastNotifiedAt == nil || now.Sub(*state.LastNotifiedAt) >= rule.Cooldown
 	}
 	resolved := !observation.Active && exists && state.Active
+	if observation.Active && (!exists || !state.Active) {
+		state.NotificationCount = 0
+	}
 	if notify || resolved {
 		event := ops.Event{
 			Type:         rule.Event,
@@ -153,6 +158,11 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 			}
 		}
 		state.LastNotifiedAt = &now
+		if resolved {
+			state.NotificationCount = 0
+		} else {
+			state.NotificationCount++
+		}
 	}
 	state.Active = observation.Active
 	state.Value = observation.Value

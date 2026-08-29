@@ -1163,6 +1163,9 @@ func (s *Server) createAlertRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_alert_rule", "告警规则无效")
 		return
 	}
+	if input.MaxNotifications == 0 {
+		input.MaxNotifications = 3
+	}
 	id, err := s.store.CreateAlertRule(r.Context(), input)
 	if err != nil {
 		writeStoreError(w, err)
@@ -1181,6 +1184,9 @@ func (s *Server) updateAlertRule(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &input); err != nil || !validAlertRule(input, false) {
 		writeError(w, http.StatusBadRequest, "invalid_alert_rule", "告警规则无效")
 		return
+	}
+	if input.MaxNotifications == 0 {
+		input.MaxNotifications = 3
 	}
 	input.ID = id
 	if err := s.store.UpdateAlertRule(r.Context(), input); err != nil {
@@ -1571,7 +1577,7 @@ func validAlertRule(rule store.AlertRule, creating bool) bool {
 			return false
 		}
 	}
-	return rule.Threshold != nil && *rule.Threshold >= 0 && rule.WindowSeconds >= 60 && rule.WindowSeconds <= 86400 && rule.CooldownSeconds >= 60 && rule.CooldownSeconds <= 604800
+	return rule.Threshold != nil && *rule.Threshold >= 0 && rule.WindowSeconds >= 60 && rule.WindowSeconds <= 86400 && rule.CooldownSeconds >= 60 && rule.CooldownSeconds <= 604800 && (rule.MaxNotifications == 0 || (rule.MaxNotifications >= 1 && rule.MaxNotifications <= 100))
 }
 
 func cleanStrings(values []string) []string {

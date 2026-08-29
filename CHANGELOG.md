@@ -35,6 +35,10 @@ All notable changes to D-API will be documented in this file. The format is base
   out of responses.
 - Webhook payload adapters for DingTalk, Feishu/Lark, WeCom, Slack, Discord,
   and generic JSON with explicit provider selection or safe hostname detection.
+- Alert coverage for client error rate, administrator login failures, and new
+  login IPs, with persistent per-rule notification caps and recovery notices.
+- Localized webhook event labels and UTC+8 timestamps, including DingTalk
+  Markdown formatting for operational alerts.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

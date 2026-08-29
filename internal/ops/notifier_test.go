@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,11 +62,11 @@ func TestWebhookPayloadAdapters(t *testing.T) {
 		provider string
 		want     string
 	}{
-		{"dingtalk", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}}`},
-		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"},"msg_type":"text"}`},
-		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}}`},
-		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}`},
-		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：连接失败"}`},
+		{"dingtalk", `{"markdown":{"text":"【D-API】通知\n\n**事件：**上游健康状态变更\n\n**上游：**primary\n\n**状态：**异常（unhealthy）\n\n**之前：**正常（healthy）\n\n**详情：**上游状态已从正常（healthy）变更为异常（unhealthy）","title":"D-API 通知"},"msgtype":"markdown"}`},
+		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"},"msg_type":"text"}`},
+		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}}`},
+		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}`},
+		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
@@ -95,6 +96,13 @@ func TestWebhookProviderDetectionUsesHostname(t *testing.T) {
 	}
 	if string(generic) != string(mustJSON(event)) {
 		t.Fatalf("query string incorrectly selected provider: %s", generic)
+	}
+}
+
+func TestWebhookEventTextUsesUTC8(t *testing.T) {
+	text := webhookEventText(Event{Type: "notification_test", At: time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)})
+	if !strings.Contains(text, "时间：2026-08-29 20:00:00 (UTC+8)") {
+		t.Fatalf("text = %q", text)
 	}
 }
 
