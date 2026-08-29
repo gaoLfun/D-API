@@ -44,6 +44,7 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `GET` | `/api/admin/logs` | 分页请求日志 |
 | `GET` | `/api/admin/usage` | 多维度用量汇总 |
 | `GET/POST/DELETE` | `/api/admin/channels[/{id}]` | Webhook/邮件渠道 |
+| `POST` | `/api/admin/channels/{id}/test` | 发送一次 Webhook 连通性测试 |
 | `GET/POST/PUT/DELETE` | `/api/admin/alert-rules[/{id}]` | 告警规则 |
 | `GET/PUT` | `/api/admin/settings` | 路由最大尝试次数 |
 | `GET` | `/api/admin/pricing` | 价格档案和 USD/CNY 汇率 |
@@ -218,12 +219,33 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 输入/输出 Token、缓存读写、缓存命中率、平均耗时、P95 耗时、`cost_usd` 和
 成本覆盖率。缺少上游 usage 字段或价格档案时对应成本保持未知，不会推测价格。
 
+## 后台操作说明
+
+- **总览**：可展开 Token、缓存和成本指标；选择 7 天或 30 天后可开启上周期对比，
+  查看请求、Token 和成本环比。可选开启每 30 秒自动刷新；页面会显示最近成功刷新时间，
+  刷新失败时保留已有数据并提示错误。
+- **上游**：支持按名称、Base URL、状态和协议筛选；勾选多个上游 Key 后可批量执行健康
+  检查或余额刷新。拓扑视图支持点击客户端 Key 或分组聚焦实际路由链路。
+- **客户端密钥**：列表支持搜索、启用状态和分组筛选。创建或编辑时会按优先级预览实际
+  候选上游；“模拟请求”会发送一个最小协议请求，真实走该 Key 的分组路由并写入请求日志，
+  可能产生少量上游 Token 消耗。
+- **用量**：支持按日期、维度和指标筛选，并可导出当前结果为 CSV。移动端默认收起筛选项，
+  点击“筛选”后展开。
+- **通知**：通知渠道、告警规则和路由设置分为独立页签；Webhook 测试规则见下方
+  “通知、告警和设置”章节。
+
+筛选条件、总览视图和自动刷新偏好仅保存在当前浏览器本地，不会写入服务端配置。
+
 ## 通知、告警和设置
 
 通知渠道 `kind` 为 `webhook` 或 `email`。Webhook 至少需要 JSON 配置中的
 `url`；邮件需要 SMTP 主机或 `address`，以及 `to` 收件人。配置会加密存储，
 列表接口只返回 `configured: true/false`，不会返回 SMTP 密码、Webhook URL
 或自定义请求头。
+
+对 Webhook 渠道调用 `POST /api/admin/channels/{id}/test` 会发送一条固定的
+`notification_test` JSON 事件。接口只返回成功或失败状态，不会回显 URL、请求头
+或其他敏感配置；邮件渠道不支持该测试接口。
 
 告警事件包括 `low_balance`、`balance_unavailable`、`error_rate` 和
 `latency`。规则的窗口至少 60 秒，冷却至少 60 秒；每条规则可绑定一个

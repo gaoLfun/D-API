@@ -9,10 +9,14 @@ const upstreams = [
   { id: 3, name: '美西应急线路', kind: 'newapi', base_url: 'https://us-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: true, zero_balance_checks: 2, priority: 30, protocols: ['chat', 'responses', 'messages'], models: ['gpt-5.6-mini'], model_aliases: {}, failure_threshold: 3, health_status: 'unhealthy', consecutive_failures: 3, today_requests: 81, today_tokens: 132900, last_check_at: '2026-08-25T15:21:00Z', last_error: 'upstream returned 502', circuit_open_until: '2026-08-25T15:31:00Z', balance: { status: 'ok', available: 0, used: 100, currency: '$', updated_at: '2026-08-25T15:20:00Z' } },
 ]
 
+const groups = [
+  { id: 1, name: '生产分组', enabled: true, upstream_ids: [1, 2, 3], key_count: 2, created_at: '2026-07-01T08:00:00Z', updated_at: '2026-08-25T08:00:00Z' },
+]
+
 const keys = [
-  { id: 1, name: 'Claude Code 工作站', prefix: 'dapi_live_8k2', enabled: true, protocols: ['messages'], models: ['claude-sonnet-4'], last_used_at: '2026-08-25T15:26:00Z', created_at: '2026-07-04T08:00:00Z' },
-  { id: 2, name: '内部自动化', prefix: 'dapi_live_3m9', enabled: true, protocols: ['chat', 'responses'], models: [], last_used_at: '2026-08-25T14:58:00Z', created_at: '2026-07-12T08:00:00Z' },
-  { id: 3, name: '旧测试环境', prefix: 'dapi_test_1p4', enabled: false, protocols: ['chat'], models: ['gpt-5-mini'], created_at: '2026-06-18T08:00:00Z' },
+  { id: 1, name: 'Claude Code 工作站', prefix: 'dapi_live_8k2', enabled: true, group_id: 1, protocols: ['messages'], models: ['claude-sonnet-4'], last_used_at: '2026-08-25T15:26:00Z', created_at: '2026-07-04T08:00:00Z' },
+  { id: 2, name: '内部自动化', prefix: 'dapi_live_3m9', enabled: true, group_id: 1, protocols: ['chat', 'responses'], models: [], last_used_at: '2026-08-25T14:58:00Z', created_at: '2026-07-12T08:00:00Z' },
+  { id: 3, name: '旧测试环境', prefix: 'dapi_test_1p4', enabled: false, group_id: 1, protocols: ['chat'], models: ['gpt-5-mini'], created_at: '2026-06-18T08:00:00Z' },
 ]
 
 const logs = [
@@ -74,8 +78,10 @@ async function mockApi(page: Page) {
     else if (pathname.endsWith('/upstreams')) body = upstreams
     else if (/\/keys\/\d+\/secret$/.test(pathname)) body = { key: 'dapi_live_visual_secret' }
     else if (pathname.endsWith('/keys')) body = route.request().method() === 'POST' ? { key: 'dapi_live_created_secret' } : (emptyKeys ? [] : keys)
+    else if (pathname.endsWith('/groups')) body = groups
     else if (pathname.endsWith('/logs')) body = logs
     else if (pathname.endsWith('/usage')) body = { daily }
+    else if (/\/channels\/\d+\/test$/.test(pathname)) body = { ok: true, message: 'Webhook 测试成功' }
     else if (pathname.endsWith('/channels')) body = [{ id: 1, name: '值班邮箱', kind: 'email', enabled: true }, { id: 2, name: '运维 Webhook', kind: 'webhook', enabled: true }]
     else if (pathname.endsWith('/alert-rules')) body = [{ id: 1, event: 'low_balance', threshold: 5, window_seconds: 300, cooldown_seconds: 1800, enabled: true }, { id: 2, event: 'error_rate', upstream_id: 3, threshold: 20, window_seconds: 300, cooldown_seconds: 900, enabled: true }]
     else if (pathname.endsWith('/settings')) body = { max_attempts: 3 }
@@ -95,6 +101,8 @@ async function mockApi(page: Page) {
 }
 
 async function openView(page: Page, label: string) {
+  const menuButton = page.getByTitle('打开菜单')
+  if (await menuButton.isVisible()) await menuButton.click()
   await page.getByRole('button', { name: label, exact: true }).first().click()
   await expect(page.locator('.topbar h1')).toHaveText(label)
 }
@@ -144,7 +152,7 @@ test('capture the operational surface across themes and viewports', async ({ pag
   state.setDelayDashboard(false)
   state.failNextDashboard()
   await page.getByTitle('刷新当前页面').click()
-  await expect(page.getByText('测试期模拟：无法读取总览')).toBeVisible()
+  await expect(page.getByTitle('测试期模拟：无法读取总览')).toBeVisible()
   await page.screenshot({ path: path.join(reviewDir, 'desktop-dark-error.png'), fullPage: true })
 
   state.setEmptyKeys(true)
@@ -384,6 +392,45 @@ test('new defaults, model discovery, and dashboard chart work together', async (
   const channelDialog = page.getByRole('dialog', { name: '添加通知渠道' })
   await expect(channelDialog.getByLabel('类型')).toHaveValue('webhook')
   await expect(channelDialog.getByLabel('Webhook URL')).toBeVisible()
+  await channelDialog.getByRole('button', { name: '取消' }).click()
+  await expect(page.getByText('运维 Webhook')).toBeVisible()
+  await page.getByRole('button', { name: '测试', exact: true }).last().click()
+  await expect(page.getByText('Webhook 测试成功')).toBeVisible()
+})
+
+test('新增总览、通知、路由预览和移动端筛选交互可用', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/')
+
+  await expect(page.locator('.dashboard-metric-grid .dashboard-metric')).toHaveCount(4)
+  await page.getByRole('button', { name: '显示 Token、缓存与成本指标' }).click()
+  await expect(page.locator('.dashboard-metric-grid .dashboard-metric')).toHaveCount(8)
+  await page.getByRole('button', { name: '收起详细指标' }).click()
+
+  await openView(page, '通知')
+  await page.getByRole('tab', { name: '告警规则' }).click()
+  await expect(page.getByRole('heading', { name: '告警规则' })).toBeVisible()
+  await page.getByRole('tab', { name: '路由设置' }).click()
+  await expect(page.getByRole('heading', { name: '路由设置' })).toBeVisible()
+
+  await openView(page, '客户端密钥')
+  await page.getByRole('button', { name: '创建密钥' }).first().click()
+  const keyDialog = page.getByRole('dialog', { name: '创建客户端密钥' })
+  await keyDialog.getByLabel('分组').selectOption('1')
+  await expect(keyDialog.locator('.route-preview-row')).toHaveCount(3)
+  await expect(keyDialog.locator('.route-preview-row').first()).toContainText('P10')
+  await keyDialog.getByRole('button', { name: '取消' }).click()
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await openView(page, '用量')
+  const mobileBar = page.locator('.mobile-filter-bar')
+  await mobileBar.getByRole('button', { name: '筛选' }).click()
+  await expect(page.locator('.usage-filterbar.filters-open')).toBeVisible()
+  await page.locator('.usage-filterbar.filters-open').getByRole('button', { name: '应用筛选' }).click()
+  await expect(page.locator('.usage-filterbar.filters-open')).toBeHidden()
+  const download = page.waitForEvent('download')
+  await mobileBar.getByRole('button', { name: '导出 CSV' }).click()
+  await expect((await download).suggestedFilename()).toMatch(/^dapi-usage-\d{4}-\d{2}-\d{2}\.csv$/)
 })
 
 test('model batch testing enforces its limit, confirms large runs, and stops cleanly', async ({ page }) => {
@@ -415,4 +462,22 @@ test('model batch testing enforces its limit, confirms large runs, and stops cle
   await expect(page.getByText(/已停止，保留 \d+ 个完成结果/)).toBeVisible()
   await expect.poll(() => state.modelAuditRequests.length).toBe(1)
   expect(state.modelAuditRequests[0]).toMatchObject({ models_count: 0, stopped: true })
+})
+
+test('客户端模拟 Messages 请求发送兼容请求头', async ({ page }) => {
+  await mockApi(page)
+  let requestHeaders: Record<string, string> = {}
+  await page.route('**/v1/messages', async (route) => {
+    requestHeaders = route.request().headers()
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{"content":[{"type":"text","text":"pong"}]}' })
+  })
+  await page.goto('/#keys')
+  await page.locator('.key-table tbody tr').first().getByTitle('模拟请求').click()
+  const dialog = page.getByRole('dialog', { name: '模拟客户端请求' })
+  await dialog.getByLabel('模型').fill('claude-sonnet-4')
+  await dialog.getByRole('button', { name: '发送测试请求' }).click()
+  await expect(dialog).toContainText('请求成功')
+  expect(requestHeaders['x-api-key']).toBe('dapi_live_visual_secret')
+  expect(requestHeaders['anthropic-version']).toBe('2023-06-01')
+  expect(requestHeaders.authorization).toBeUndefined()
 })

@@ -29,6 +29,10 @@ All notable changes to D-API will be documented in this file. The format is base
   probes, including Codex/OpenCode presets and custom values.
 - Upstream dashboard cost details for today and lifetime, plus a transactional
   lifetime usage aggregate and retention of last successful balance metadata.
+- Dashboard auto-refresh, period comparison, persistent filters, bulk upstream
+  checks, route previews, client request simulation, and usage CSV export.
+- Notification tabs with Webhook connectivity tests that keep channel secrets
+  out of responses.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,

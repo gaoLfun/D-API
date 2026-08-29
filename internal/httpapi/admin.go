@@ -105,6 +105,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/admin/usage", s.admin(http.HandlerFunc(s.usage)))
 	mux.Handle("GET /api/admin/channels", s.admin(http.HandlerFunc(s.listChannels)))
 	mux.Handle("POST /api/admin/channels", s.admin(http.HandlerFunc(s.createChannel)))
+	mux.Handle("POST /api/admin/channels/{id}/test", s.admin(http.HandlerFunc(s.testChannel)))
 	mux.Handle("DELETE /api/admin/channels/{id}", s.admin(http.HandlerFunc(s.deleteChannel)))
 	mux.Handle("GET /api/admin/alert-rules", s.admin(http.HandlerFunc(s.listAlertRules)))
 	mux.Handle("POST /api/admin/alert-rules", s.admin(http.HandlerFunc(s.createAlertRule)))
@@ -992,6 +993,48 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "channel.create", "channel", id, map[string]any{"name": input.Name, "kind": input.Kind})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	channel, err := s.store.ChannelByID(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if channel.Kind != "webhook" {
+		writeError(w, http.StatusBadRequest, "unsupported_channel_test", "仅支持测试 Webhook 渠道")
+		return
+	}
+	if err := validateChannel(channel); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_channel", "通知渠道配置无效")
+		return
+	}
+	var config struct {
+		URL     string            `json:"url"`
+		Headers map[string]string `json:"headers"`
+	}
+	if err := json.Unmarshal(channel.Config, &config); err != nil || strings.TrimSpace(config.URL) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_channel", "Webhook 配置无效")
+		return
+	}
+	notifier := ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Headers: config.Headers}, nil)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := notifier.Notify(ctx, ops.Event{
+		Type: "notification_test",
+		State: "success",
+		Message: "D-API Webhook 连通性测试",
+		At: time.Now().UTC(),
+	}); err != nil {
+		writeError(w, http.StatusBadGateway, "channel_test_failed", "Webhook 测试失败，请检查地址、响应状态和网络策略")
+		return
+	}
+	s.audit(r, "channel.test", "channel", id, map[string]any{"kind": channel.Kind})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Webhook 测试成功"})
 }
 
 func validateChannel(channel store.NotificationChannel) error {

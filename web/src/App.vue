@@ -2,7 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   Activity, AlertCircle, ArrowUpDown, Bell, Check, ChevronLeft, ChevronRight,
-  ChartNoAxesCombined, CircleDollarSign, CircleStop, Clipboard, Copy, Download, Gauge, KeyRound, LayoutDashboard, ListFilter,
+  ChartNoAxesCombined, CircleDollarSign, CircleStop, Clipboard, Copy, Download, Gauge, KeyRound, LayoutDashboard, ListFilter, Play,
   LoaderCircle, LogOut, Mail, Menu, Monitor, Moon, MoreHorizontal, Network,
   PanelLeftClose, PanelLeftOpen, Pencil, Plus, RefreshCw, Search, Server,
   ShieldCheck, Sun, Trash2, Upload, Webhook, X,
@@ -182,6 +182,13 @@ function writeStored(key: string, value: string) {
   try { localStorage.setItem(key, value) } catch { /* Persistence is optional. */ }
 }
 
+function readStoredJSON<T>(key: string, fallback: T): T {
+  try {
+    const value = localStorage.getItem(key)
+    return value ? JSON.parse(value) as T : fallback
+  } catch { return fallback }
+}
+
 const storedTheme = readStored('dapi-theme') as Theme | null
 const theme = ref<Theme>(['auto', 'light', 'dark'].includes(storedTheme || '') ? storedTheme! : 'auto')
 const resolvedTheme = ref<'light' | 'dark'>('light')
@@ -205,6 +212,12 @@ let pageLoadSequence = 0
 const menuOpen = ref(false)
 const toast = reactive({ show: false, message: '', error: false })
 let toastTimer = 0
+const lastUpdatedAt = ref<Date | null>(null)
+const autoRefresh = ref(readStored('dapi-auto-refresh') === 'true')
+let autoRefreshTimer: number | null = null
+const refreshError = ref('')
+let dashboardRangeController: AbortController | null = null
+let dashboardRangeSequence = 0
 
 const dashboard = ref<Json>({})
 const dashboardCostRows = ref<Json[]>([])
@@ -213,19 +226,29 @@ const pricing = ref<Json>({})
 const pricingModal = ref(false)
 const editingPricing = ref<number | null>(null)
 const pricingForm = reactive({ name: '', provider: '', source_url: '', source_version: 'custom', prices: '' })
-const dashboardRange = ref<'24h' | '7d' | '30d'>('24h')
-const dashboardMetric = ref<'requests' | 'tokens' | 'cache' | 'cost'>('requests')
-const dashboardRouteView = ref<'current' | 'topology'>('current')
+const dashboardRange = ref<'24h' | '7d' | '30d'>(['24h', '7d', '30d'].includes(readStored('dapi-dashboard-range') || '') ? readStored('dapi-dashboard-range') as '24h' | '7d' | '30d' : '24h')
+const dashboardMetric = ref<'requests' | 'tokens' | 'cache' | 'cost'>(['requests', 'tokens', 'cache', 'cost'].includes(readStored('dapi-dashboard-metric') || '') ? readStored('dapi-dashboard-metric') as 'requests' | 'tokens' | 'cache' | 'cost' : 'requests')
+const dashboardRouteView = ref<'current' | 'topology'>(readStored('dapi-dashboard-route-view') === 'topology' ? 'topology' : 'current')
+const dashboardMetricsExpanded = ref(false)
+const dashboardCompare = ref(false)
+const dashboardComparison = ref<Json>({})
+const dashboardComparisonLoading = ref(false)
 const upstreams = ref<Upstream[]>([])
 const upstreamGroupDrawer = ref<UpstreamGroup | null>(null)
+const upstreamFilter = reactive({ search: '', status: 'all', protocol: 'all' })
+Object.assign(upstreamFilter, readStoredJSON('dapi-upstream-filter', {}))
+const upstreamSelectedIds = ref<number[]>([])
 const groups = ref<Group[]>([])
 const keys = ref<ClientKey[]>([])
+const keyFilter = reactive({ search: '', status: 'all', group_id: '' })
+Object.assign(keyFilter, readStoredJSON('dapi-key-filter', {}))
 const logs = ref<RequestLog[]>([])
 const usage = ref<Json>({})
 const channels = ref<Channel[]>([])
 const alertRules = ref<AlertRule[]>([])
 const maxAttempts = ref(3)
 const logFilter = reactive({ status: '', upstream_id: '', group_id: '', limit: 50, offset: 0 })
+Object.assign(logFilter, readStoredJSON('dapi-log-filter', {}))
 const expandedLog = ref<string | null>(null)
 const usageFilter = reactive({
   days: 30,
@@ -238,7 +261,10 @@ const usageFilter = reactive({
   protocol: '',
   model: '',
 })
+Object.assign(usageFilter, readStoredJSON('dapi-usage-filter', {}))
 const usageMetric = ref<'requests' | 'tokens' | 'latency' | 'cache'>('requests')
+const mobileFiltersOpen = ref(false)
+const notificationSection = ref<'channels' | 'alerts' | 'settings'>('channels')
 
 const upstreamModal = ref(false)
 const editingUpstream = ref<number | null>(null)
@@ -262,6 +288,12 @@ const upstreamForm = reactive({
 const keyModal = ref(false)
 const editingKey = ref<number | null>(null)
 const keyForm = reactive({ name: '', enabled: true, group_id: 0, protocols: ['responses'] as string[], models: '' })
+const keySimulationModal = ref(false)
+const keySimulationTarget = ref<ClientKey | null>(null)
+const keySimulationProtocol = ref('responses')
+const keySimulationModel = ref('')
+const keySimulationBusy = ref(false)
+const keySimulationResult = ref<Json | null>(null)
 const groupModal = ref(false)
 const editingGroup = ref<number | null>(null)
 const groupForm = reactive({ name: '', enabled: true, upstream_ids: [] as number[] })
@@ -279,6 +311,7 @@ let ccswitchModelsController: AbortController | null = null
 let keySecretController: AbortController | null = null
 const createdKeyForImport = ref<ClientKey | null>(null)
 const channelModal = ref(false)
+const channelTestID = ref<number | null>(null)
 const passwordModal = ref(false)
 const confirmDialog = reactive({ show: false, title: '', message: '', confirmLabel: '删除' })
 let resolveConfirmation: ((confirmed: boolean) => void) | null = null
@@ -287,11 +320,42 @@ const channelForm = reactive({ name: '', kind: 'webhook' as 'email' | 'webhook',
 const newRule = reactive({ event: 'low_balance', upstream_id: '', threshold: 5, window_seconds: 300, cooldown_seconds: 1800 })
 const saving = ref(false)
 
+const setupSteps = computed(() => [
+  { id: 'upstream', label: '添加第一个上游', description: '配置 Base URL、Key 并获取模型', done: upstreams.value.length > 0, view: 'upstreams' as View },
+  { id: 'group', label: '创建路由分组', description: '把上游按用途组成路由范围', done: groups.value.some((group) => group.enabled && (group.upstream_ids || []).length > 0), view: 'groups' as View },
+  { id: 'key', label: '创建客户端密钥', description: '绑定分组并限制协议或模型', done: keys.value.some((key) => key.enabled), view: 'keys' as View },
+  { id: 'request', label: '发起一次测试请求', description: '确认客户端可以通过网关访问', done: Number(dashboard.value.requests_24h ?? dashboard.value.stats?.requests_24h ?? dashboard.value.summary?.requests_24h ?? 0) > 0, view: 'logs' as View },
+])
+const setupComplete = computed(() => setupSteps.value.every((step) => step.done))
+const keyRoutePreview = computed(() => {
+  const group = groups.value.find((item) => item.id === Number(keyForm.group_id))
+  if (!group) return []
+  return (group.upstream_ids || []).map((id) => upstreams.value.find((item) => item.id === id)).filter(Boolean).sort((a, b) => Number(a!.priority) - Number(b!.priority) || a!.id - b!.id) as Upstream[]
+})
+
 watch(() => upstreamForm.kind, (kind) => {
   upstreamForm.access_token = ''
   upstreamForm.user_id = ''
   upstreamForm.clear_balance_credentials = kind === 'sub2api' && editingUpstream.value !== null
 })
+
+watch(autoRefresh, (enabled) => {
+  writeStored('dapi-auto-refresh', String(enabled))
+  if (autoRefreshTimer !== null) window.clearInterval(autoRefreshTimer)
+  autoRefreshTimer = enabled
+    ? window.setInterval(() => {
+      if (auth.value === 'ready' && document.visibilityState === 'visible' && !loading.value && !activeOverlayId.value) void loadCurrent()
+    }, 30000)
+    : null
+}, { immediate: true })
+
+watch(dashboardRange, (value) => writeStored('dapi-dashboard-range', value))
+watch(dashboardMetric, (value) => writeStored('dapi-dashboard-metric', value))
+watch(dashboardRouteView, (value) => writeStored('dapi-dashboard-route-view', value))
+watch(usageFilter, (value) => writeStored('dapi-usage-filter', JSON.stringify(value)), { deep: true })
+watch(upstreamFilter, (value) => writeStored('dapi-upstream-filter', JSON.stringify(value)), { deep: true })
+watch(keyFilter, (value) => writeStored('dapi-key-filter', JSON.stringify(value)), { deep: true })
+watch(logFilter, (value) => writeStored('dapi-log-filter', JSON.stringify({ status: value.status, upstream_id: value.upstream_id, group_id: value.group_id })), { deep: true })
 
 const title = computed(() => navItems.find((item) => item.id === view.value)?.label || '')
 const gatewayBaseURL = computed(() => window.location.origin)
@@ -331,12 +395,72 @@ const upstreamGroups = computed<UpstreamGroup[]>(() => {
   })).sort((a, b) => a.priority - b.priority || a.base_url.localeCompare(b.base_url))
 })
 const shownDashUpstreams = computed<UpstreamGroup[]>(() => upstreamGroups.value.slice(0, 8))
+const filteredUpstreamGroups = computed(() => upstreamGroups.value.filter((item) => {
+  const search = upstreamFilter.search.trim().toLocaleLowerCase('zh-CN')
+  if (search && !`${item.base_url} ${item.items.map((entry) => entry.name).join(' ')}`.toLocaleLowerCase('zh-CN').includes(search)) return false
+  if (upstreamFilter.status === 'healthy' && groupStatusTone(item) !== 'good') return false
+  if (upstreamFilter.status === 'warning' && groupStatusTone(item) !== 'warn') return false
+  if (upstreamFilter.status === 'error' && groupStatusTone(item) !== 'bad') return false
+  if (upstreamFilter.protocol !== 'all' && !item.protocols.includes(upstreamFilter.protocol)) return false
+  return true
+}))
+const allVisibleUpstreamsSelected = computed(() => filteredUpstreamGroups.value.length > 0 && filteredUpstreamGroups.value.every((item) => item.items.every((entry) => upstreamSelectedIds.value.includes(entry.id))))
+const filteredKeys = computed(() => keys.value.filter((item) => {
+  const search = keyFilter.search.trim().toLocaleLowerCase('zh-CN')
+  if (search && !`${item.name} ${item.prefix || item.key_prefix || ''}`.toLocaleLowerCase('zh-CN').includes(search)) return false
+  if (keyFilter.status === 'enabled' && !item.enabled) return false
+  if (keyFilter.status === 'disabled' && item.enabled) return false
+  if (keyFilter.group_id && Number(item.group_id) !== Number(keyFilter.group_id)) return false
+  return true
+}))
 const dashboardTopologyGroups = computed<Group[]>(() => {
   const enabledGroups = groups.value.filter((group) => group.enabled)
   return (enabledGroups.length ? enabledGroups : groups.value).slice(0, 4)
 })
 const dashboardTopologyKeys = computed<ClientKey[]>(() => keys.value.slice(0, 6))
 const dashboardTopologyHasData = computed(() => Boolean(dashboardTopologyKeys.value.length || dashboardTopologyGroups.value.length || shownDashUpstreams.value.length))
+const topologyFocusKeyId = ref<number | null>(null)
+const topologyFocusGroupId = ref<number | null>(null)
+const topologyPulseActive = ref(false)
+let topologyPulseTimer: number | null = null
+const topologyFocusedKey = computed(() => topologyFocusKeyId.value == null ? null : keys.value.find((item) => Number(item.id) === topologyFocusKeyId.value) || null)
+const topologyFocusedGroup = computed(() => {
+  const groupID = topologyFocusGroupId.value ?? topologyFocusedKey.value?.group_id
+  return groupID == null ? null : groups.value.find((item) => Number(item.id) === Number(groupID)) || null
+})
+const topologyFocusedUpstreamIDs = computed(() => new Set(topologyFocusedGroup.value?.upstream_ids || []))
+const topologyHasFocus = computed(() => topologyFocusKeyId.value != null || topologyFocusGroupId.value != null)
+const topologyFocusedUpstreams = computed(() => topologyFocusedGroup.value ? topologyGroupUpstreams(topologyFocusedGroup.value) : [])
+function focusTopologyKey(item: ClientKey) {
+  topologyFocusKeyId.value = Number(item.id)
+  topologyFocusGroupId.value = null
+}
+function focusTopologyGroup(item: Group) {
+  topologyFocusGroupId.value = Number(item.id)
+  topologyFocusKeyId.value = null
+}
+function clearTopologyFocus() {
+  topologyFocusKeyId.value = null
+  topologyFocusGroupId.value = null
+}
+function triggerTopologyPulse() {
+  topologyPulseActive.value = true
+  if (topologyPulseTimer !== null) window.clearTimeout(topologyPulseTimer)
+  topologyPulseTimer = window.setTimeout(() => {
+    topologyPulseActive.value = false
+    topologyPulseTimer = null
+  }, 1800)
+}
+function topologyNodeState(type: 'key' | 'group' | 'upstream', id: number) {
+  if (!topologyHasFocus.value) return ''
+  if (type === 'key') return topologyFocusKeyId.value === id ? 'is-focused' : 'is-dimmed'
+  if (type === 'group') return (topologyFocusedGroup.value?.id === id) ? 'is-focused' : 'is-dimmed'
+  return topologyFocusedUpstreamIDs.value.has(id) ? 'is-focused' : 'is-dimmed'
+}
+function topologyGroupNodeState(group: UpstreamGroup) {
+  if (!topologyHasFocus.value) return ''
+  return group.items.some((item) => topologyFocusedUpstreamIDs.value.has(item.id)) ? 'is-focused' : 'is-dimmed'
+}
 const dashboardRows = computed<Json[]>(() => {
   const rows = dashboard.value.daily
   return Array.isArray(rows) ? rows : []
@@ -352,6 +476,40 @@ const dashboardTrendTotals = computed(() => dashboardChartRows.value.reduce((sum
   cached: sum.cached + Number(row.cached_input_tokens || 0),
   cost: sum.cost + Number(row.cost_usd || 0),
 }), { requests: 0, tokens: 0, cached: 0, cost: 0 }))
+function usageTotalsFromRows(rows: Json[]) {
+  return rows.reduce((sum, row) => ({
+    requests: sum.requests + Number(row.requests || 0),
+    successes: sum.successes + Number(row.successes || 0),
+    tokens: sum.tokens + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
+    cost: sum.cost + Number(row.cost_usd || 0),
+  }), { requests: 0, successes: 0, tokens: 0, cost: 0 })
+}
+const dashboardComparisonTotals = computed(() => {
+  const supplied = dashboardComparison.value.totals || dashboardComparison.value.summary
+  if (supplied) return {
+    requests: Number(supplied.requests || 0), successes: Number(supplied.successes || 0),
+    tokens: Number(supplied.input_tokens || 0) + Number(supplied.output_tokens || 0), cost: Number(supplied.cost_usd || 0),
+  }
+  return usageTotalsFromRows(listOf<Json>(dashboardComparison.value.daily || dashboardComparison.value.items))
+})
+const dashboardComparisonReady = computed(() => dashboardCompare.value && dashboardRange.value !== '24h' && !dashboardComparisonLoading.value && Boolean(Object.keys(dashboardComparison.value).length))
+function dashboardDelta(key: 'requests' | 'tokens' | 'cost') {
+  if (!dashboardComparisonReady.value) return null
+  const current = dashboardTrendTotals.value[key]
+  const previous = dashboardComparisonTotals.value[key]
+  if (!previous) return current > 0 ? 1 : null
+  return (current - previous) / previous
+}
+function dashboardDeltaText(key: 'requests' | 'tokens' | 'cost') {
+  const delta = dashboardDelta(key)
+  if (delta == null) return ''
+  const percent = Math.abs(delta * 100).toFixed(1)
+  return `${delta >= 0 ? '↑' : '↓'} ${percent}% 环比`
+}
+function dashboardDeltaTone(key: 'requests' | 'tokens' | 'cost') {
+  const delta = dashboardDelta(key)
+  return delta == null ? '' : delta >= 0 ? 'up' : 'down'
+}
 const dashboardTotals = computed(() => dashboardRows.value.reduce((sum, row) => ({
   requests: sum.requests + Number(row.requests || 0),
   tokens: sum.tokens + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
@@ -376,6 +534,16 @@ const dashboardCostByModel = computed(() => {
     totals.set(model, current)
   }
   return [...totals.values()].sort((a, b) => b.cost_usd - a.cost_usd).slice(0, 8)
+})
+const dashboardCost30d = computed(() => dashboardCostRows.value.reduce((sum, row) => sum + Number(row.cost_usd || 0), 0))
+const dashboardCostCoverage30d = computed(() => {
+  const requests = dashboardCostRows.value.reduce((sum, row) => sum + Number(row.requests || 0), 0)
+  const known = dashboardCostRows.value.reduce((sum, row) => sum + Number(row.cost_known_requests || 0), 0)
+  return requests > 0 ? known / requests : null
+})
+const dashboardCostForecast30d = computed(() => {
+  const days = new Set(dashboardCostRows.value.map((row) => String(row.day || row.date || '').slice(0, 10)).filter(Boolean)).size
+  return days > 0 ? dashboardCost30d.value / days * 30 : 0
 })
 const summary = computed(() => {
   const stats = dashboard.value.stats || dashboard.value.summary || dashboard.value
@@ -404,7 +572,9 @@ const usageTotals = computed(() => {
     cache_creation_input_tokens: sum.cache_creation_input_tokens + Number(row.cache_creation_input_tokens || row.cache_write_tokens || 0),
     successes: sum.successes + Number(row.successes || 0),
     duration_ms: sum.duration_ms + Number(row.duration_ms || row.total_duration_ms || 0),
-  }), { requests: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, successes: 0, duration_ms: 0 })
+    cost_usd: sum.cost_usd + Number(row.cost_usd || 0),
+    cost_known_requests: sum.cost_known_requests + Number(row.cost_known_requests || 0),
+  }), { requests: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, successes: 0, duration_ms: 0, cost_usd: 0, cost_known_requests: 0 })
 })
 const usageInputTokens = computed(() => Number(usageTotals.value.input_tokens ?? 0))
 const usageOutputTokens = computed(() => Number(usageTotals.value.output_tokens ?? 0))
@@ -434,6 +604,18 @@ const usageRequestHitRate = computed(() => {
 })
 const usageAvgLatency = computed(() => usageTotals.value.avg_duration_ms ?? usageTotals.value.average_duration_ms ?? null)
 const usageP95Latency = computed(() => usageTotals.value.p95_duration_ms ?? usageTotals.value.p95_ms ?? null)
+const usageCostUsd = computed(() => Number(usageTotals.value.cost_usd ?? usageRows.value.reduce((sum, row) => sum + Number(row.cost_usd || 0), 0)))
+const usageCostCoverage = computed(() => {
+  const explicit = usageTotals.value.cost_coverage
+  if (explicit != null) return Number(explicit)
+  const requests = Number(usageTotals.value.requests || 0)
+  const known = Number(usageTotals.value.cost_known_requests || 0)
+  return requests > 0 && known > 0 ? known / requests : null
+})
+const usageCostForecast30d = computed(() => {
+  const days = new Set(usageRows.value.map((row) => String(row.day || row.date || '').slice(0, 10)).filter(Boolean)).size || usageFilter.days
+  return days > 0 ? usageCostUsd.value / days * 30 : 0
+})
 const selectedUpstreamModels = computed(() => parseModelList(upstreamForm.models))
 const batchModelSelection = computed(() => modelBatchSelection(upstreamForm.models, discoveredModels.value))
 const allDiscoveredModelsSelected = computed(() => discoveredModels.value.length > 0
@@ -449,6 +631,7 @@ const activeOverlayId = computed(() => {
   if (confirmDialog.show) return 'confirm'
   if (ccswitchModal.value) return 'ccswitch'
   if (revealedKey.value) return 'secret'
+  if (keySimulationModal.value) return 'key-simulation'
   if (passwordModal.value) return 'password'
   if (channelModal.value) return 'channel'
   if (keyModal.value) return 'key'
@@ -553,6 +736,19 @@ function toggleLog(requestID: string) {
   expandedLog.value = expandedLog.value === requestID ? null : requestID
 }
 
+function setLogPreset(preset: 'all' | 'errors') {
+  if (preset === 'errors') logFilter.status = 'error'
+  else Object.assign(logFilter, { status: '', upstream_id: '', group_id: '' })
+  logFilter.offset = 0
+  void loadLogs()
+}
+
+function attemptWidth(item: RequestLog, duration?: number) {
+  const durations = (item.attempts || []).map((attempt) => Number(attempt.duration_ms || 0))
+  const max = Math.max(...durations, Number(item.duration_ms || 0), 1)
+  return `${Math.max(6, Math.round(Number(duration || 0) / max * 100))}%`
+}
+
 function copyWithExecCommand(value: string) {
   const field = document.createElement('textarea')
   field.value = value
@@ -603,6 +799,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     if (openRowMenu.value) { closeRowMenu(); return }
     if (ccswitchModal.value) { closeCCSwitch(); return }
     if (revealedKey.value) return
+    if (keySimulationModal.value) { closeKeySimulation(); return }
     if (confirmDialog.show) settleConfirmation(false)
     else if (passwordModal.value) passwordModal.value = false
     else if (channelModal.value) channelModal.value = false
@@ -663,6 +860,7 @@ async function login() {
 
 async function logout() {
   try { await api.post('/api/admin/logout') } finally {
+    autoRefresh.value = false
     closeCCSwitch()
     closeSecret()
     auth.value = 'guest'
@@ -692,10 +890,13 @@ async function go(next: View) {
 
 function beginPageLoad() {
   pageLoadController?.abort()
+  dashboardRangeController?.abort()
+  dashboardRangeController = null
   const controller = new AbortController()
   pageLoadController = controller
   const sequence = ++pageLoadSequence
   loading.value = true
+  refreshError.value = ''
   return { controller, sequence }
 }
 
@@ -732,6 +933,8 @@ async function loadCurrent() {
       pricing.value = pricingData || {}
       groups.value = listOf<Group>(groupData)
       keys.value = listOf<ClientKey>(keyData)
+      triggerTopologyPulse()
+      if (dashboardRange.value !== '24h') await loadDashboardRange(signal)
     } else if (view.value === 'upstreams') {
       const [upstreamData, pricingData] = await Promise.all([api.get('/api/admin/upstreams', { signal }), api.get<Json>('/api/admin/pricing', { signal })])
       upstreams.value = listOf<Upstream>(upstreamData)
@@ -767,10 +970,16 @@ async function loadCurrent() {
       maxAttempts.value = Number(settingsData.max_attempts || 3)
       upstreams.value = listOf<Upstream>(upstreamData)
     }
+    lastUpdatedAt.value = new Date()
   } catch (error) {
     if (isAbortError(error) || !isCurrentPageLoad(sequence)) return
-    if (error instanceof ApiError && error.status === 401) auth.value = 'guest'
-    else notify(errorMessage(error), true)
+    if (error instanceof ApiError && error.status === 401) {
+      autoRefresh.value = false
+      auth.value = 'guest'
+    } else {
+      refreshError.value = errorMessage(error)
+      notify(refreshError.value, true)
+    }
   } finally {
     if (isCurrentPageLoad(sequence)) {
       loading.value = false
@@ -779,13 +988,82 @@ async function loadCurrent() {
   }
 }
 
-async function loadDashboardRange() {
-  if (dashboardRange.value === '24h') return
+function fmtUpdatedAt(value: Date | null) {
+  if (!value) return '尚未刷新'
+  return `更新于 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(value)}`
+}
+
+function toggleDashboardMetrics() {
+  dashboardMetricsExpanded.value = !dashboardMetricsExpanded.value
+}
+
+function exportUsageCSV() {
+  const headers = ['日期', '维度', '请求', '成功', '输入 Token', '输出 Token', '缓存读', '缓存写', '平均耗时(s)', 'P95耗时(s)']
+  const seconds = (value: unknown) => value == null || Number.isNaN(Number(value)) ? '' : (Number(value) / 1000).toFixed(2)
+  const rows = usageRows.value.map((row) => [
+    String(row.day || row.date || row.label || '').slice(0, 10), usageDimensionLabel(row), row.requests, row.successes,
+    row.input_tokens, row.output_tokens, row.cached_input_tokens ?? row.cache_read_tokens ?? '',
+    row.cache_creation_input_tokens ?? row.cache_write_tokens ?? '', seconds(row.avg_duration_ms ?? row.average_duration_ms), seconds(row.p95_duration_ms ?? row.p95_ms),
+  ])
+  const escapeCell = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`
+  const csv = [headers, ...rows].map((row) => row.map(escapeCell).join(',')).join('\n')
+  const blob = new Blob([`\ufeff${csv}`], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `dapi-usage-${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  URL.revokeObjectURL(url)
+  notify(`已导出 ${rows.length} 条用量记录`)
+}
+
+async function loadDashboardRange(signal?: AbortSignal) {
+  const sequence = ++dashboardRangeSequence
+  dashboardRangeController?.abort()
+  if (dashboardRange.value === '24h') {
+    dashboardRangeController = null
+    dashboardRangeUsage.value = []
+    dashboardComparison.value = {}
+    dashboardComparisonLoading.value = false
+    return
+  }
+  const controller = new AbortController()
+  dashboardRangeController = controller
+  const abortFromPageLoad = () => controller.abort()
+  signal?.addEventListener('abort', abortFromPageLoad, { once: true })
   const days = dashboardRange.value === '7d' ? 7 : 30
+  const today = new Date()
+  today.setUTCHours(0, 0, 0, 0)
+  const to = new Date(today)
+  const from = new Date(today)
+  from.setUTCDate(from.getUTCDate() - days + 1)
+  const previousTo = new Date(from)
+  previousTo.setUTCDate(previousTo.getUTCDate() - 1)
+  const previousFrom = new Date(previousTo)
+  previousFrom.setUTCDate(previousFrom.getUTCDate() - days + 1)
+  const fmt = (value: Date) => value.toISOString().slice(0, 10)
+  const query = (start: Date, end: Date) => `/api/admin/usage?granularity=day&dimension=&top_n=1&from=${fmt(start)}&to=${fmt(end)}`
+  dashboardComparisonLoading.value = true
   try {
-    const result = await api.get<Json>(`/api/admin/usage?days=${days}&granularity=day&dimension=&top_n=1`)
+    const currentRequest = api.get<Json>(query(from, to), { signal: controller.signal })
+    const previousRequest = dashboardCompare.value ? api.get<Json>(query(previousFrom, previousTo), { signal: controller.signal }) : Promise.resolve<Json>({})
+    const [result, previous] = await Promise.all([currentRequest, previousRequest])
+    if (controller.signal.aborted || sequence !== dashboardRangeSequence) return
     dashboardRangeUsage.value = listOf<Json>(result?.daily || result?.items)
-  } catch (error) { notify(errorMessage(error), true) }
+    dashboardComparison.value = previous || {}
+  } catch (error) { if (!isAbortError(error)) notify(errorMessage(error), true) }
+  finally {
+    signal?.removeEventListener('abort', abortFromPageLoad)
+    if (sequence === dashboardRangeSequence) {
+      dashboardComparisonLoading.value = false
+      dashboardRangeController = null
+    }
+  }
+}
+
+function toggleDashboardCompare() {
+  dashboardCompare.value = !dashboardCompare.value
+  void loadDashboardRange()
 }
 
 async function refreshPricing() {
@@ -945,6 +1223,7 @@ async function loadUsage(signal?: AbortSignal) {
 
 async function applyUsageFilters() {
   await loadUsage()
+  mobileFiltersOpen.value = false
 }
 
 function openUpstream(item?: Upstream) {
@@ -1222,6 +1501,38 @@ async function upstreamAction(item: Upstream, action: 'check' | 'balance' | 'mod
   } catch (error) { notify(errorMessage(error), true) }
 }
 
+function toggleUpstreamSelection(item: Upstream, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  upstreamSelectedIds.value = checked
+    ? [...new Set([...upstreamSelectedIds.value, item.id])]
+    : upstreamSelectedIds.value.filter((id) => id !== item.id)
+}
+
+function toggleAllVisibleUpstreams(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  const visibleIDs = filteredUpstreamGroups.value.flatMap((item) => item.items.map((entry) => entry.id))
+  upstreamSelectedIds.value = checked
+    ? [...new Set([...upstreamSelectedIds.value, ...visibleIDs])]
+    : upstreamSelectedIds.value.filter((id) => !visibleIDs.includes(id))
+}
+
+async function bulkUpstreamAction(action: 'check' | 'balance') {
+  const items = upstreams.value.filter((item) => upstreamSelectedIds.value.includes(item.id))
+  if (!items.length) return notify('请先选择上游', true)
+  saving.value = true
+  try {
+    const results = await Promise.allSettled(items.map((item) => api.post(`/api/admin/upstreams/${item.id}/${action}`)))
+    const succeeded = results.filter((result) => result.status === 'fulfilled').length
+    const failed = results.length - succeeded
+    upstreamSelectedIds.value = []
+    notify(failed
+      ? `${action === 'check' ? '检查' : '刷新余额'}完成：${succeeded} 个成功，${failed} 个失败`
+      : action === 'check' ? `已检查 ${items.length} 个上游` : `已刷新 ${items.length} 个上游余额`, failed > 0)
+    await loadCurrent()
+  } catch (error) { notify(errorMessage(error), true) }
+  finally { saving.value = false }
+}
+
 function openChannel() {
   Object.assign(channelForm, { name: '', kind: 'webhook', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
   channelModal.value = true
@@ -1231,7 +1542,7 @@ function openKey(item?: ClientKey) {
   editingKey.value = item?.id ?? null
   Object.assign(keyForm, item ? {
     name: item.name, enabled: item.enabled, group_id: item.group_id || 0, protocols: [...(item.protocols || [])], models: (item.models || []).join(', '),
-  } : { name: '', enabled: true, group_id: groups.value.find((group) => group.enabled && group.upstream_ids.length)?.id || 0, protocols: ['responses'], models: '' })
+  } : { name: '', enabled: true, group_id: groups.value.find((group) => group.enabled && (group.upstream_ids || []).length)?.id || 0, protocols: ['responses'], models: '' })
   keyModal.value = true
 }
 
@@ -1304,6 +1615,53 @@ async function copyClientKey(item: ClientKey) {
   } finally {
     if (keySecretController === controller) keySecretController = null
   }
+}
+
+function openKeySimulation(item: ClientKey) {
+  keySimulationTarget.value = item
+  keySimulationProtocol.value = item.protocols?.[0] || 'responses'
+  keySimulationModel.value = item.models?.[0] || ''
+  keySimulationResult.value = null
+  keySimulationModal.value = true
+}
+
+function closeKeySimulation() {
+  keySimulationModal.value = false
+  keySimulationTarget.value = null
+  keySimulationResult.value = null
+  keySimulationBusy.value = false
+}
+
+async function runKeySimulation() {
+  const target = keySimulationTarget.value
+  const model = keySimulationModel.value.trim()
+  if (!target || !model) return notify('请选择或填写模型', true)
+  keySimulationBusy.value = true
+  keySimulationResult.value = null
+  const started = performance.now()
+  try {
+    const secret = await resolveClientKey(target)
+    const protocol = keySimulationProtocol.value
+    const endpoint = protocol === 'chat' ? '/v1/chat/completions' : protocol === 'messages' ? '/v1/messages' : '/v1/responses'
+    const headers: Record<string, string> = { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` }
+    if (protocol === 'messages') {
+      headers['x-api-key'] = secret
+      headers['anthropic-version'] = '2023-06-01'
+      delete headers.Authorization
+    }
+    const body = protocol === 'messages'
+      ? { model, max_tokens: 8, messages: [{ role: 'user', content: 'ping' }] }
+      : protocol === 'chat'
+        ? { model, max_tokens: 8, messages: [{ role: 'user', content: 'ping' }] }
+        : { model, max_output_tokens: 8, input: 'ping' }
+    const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store' })
+    const text = await response.text()
+    let detail = ''
+    try { detail = String((JSON.parse(text) as Json)?.error?.message || '') } catch { detail = text.slice(0, 180) }
+    keySimulationResult.value = { ok: response.ok, status: response.status, duration_ms: performance.now() - started, detail }
+  } catch (error) {
+    keySimulationResult.value = { ok: false, status: 0, duration_ms: performance.now() - started, detail: errorMessage(error) }
+  } finally { keySimulationBusy.value = false }
 }
 
 async function openCCSwitch(item: ClientKey) {
@@ -1443,6 +1801,20 @@ function closeSecret() {
   createdKeyForImport.value = null
 }
 
+async function copyClientConfig() {
+  if (!revealedKey.value) return
+  const config = [
+    '# D-API OpenAI-compatible endpoint',
+    'export OPENAI_BASE_URL=' + gatewayBaseURL.value + '/v1',
+    'export OPENAI_API_KEY=' + revealedKey.value,
+    '',
+    '# D-API Anthropic-compatible endpoint',
+    'export ANTHROPIC_BASE_URL=' + gatewayBaseURL.value,
+    'export ANTHROPIC_API_KEY=' + revealedKey.value,
+  ].join('\n')
+  await copyValue(config, '接入配置')
+}
+
 async function saveChannel() {
   saving.value = true
   try {
@@ -1454,6 +1826,19 @@ async function saveChannel() {
     notify('通知渠道已添加')
     await loadCurrent()
   } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
+}
+
+async function testChannel(item: Channel) {
+  if (item.kind !== 'webhook' || channelTestID.value !== null) return
+  channelTestID.value = item.id
+  try {
+    const result = await api.post<{ ok?: boolean; message?: string }>(`/api/admin/channels/${item.id}/test`)
+    notify(result?.message || 'Webhook 测试成功')
+  } catch (error) {
+    notify(errorMessage(error), true)
+  } finally {
+    channelTestID.value = null
+  }
 }
 
 async function removeChannel(item: Channel) {
@@ -1493,6 +1878,18 @@ async function removeRule(rule: AlertRule) {
   if (!rule.upstream_id || !(await requestConfirmation('删除告警覆盖', `将恢复“${upstreamName(rule.upstream_id)}”对应事件的全局默认规则。`))) return
   try { await api.delete(`/api/admin/alert-rules/${rule.id}`); notify('告警覆盖已删除'); await loadCurrent() }
   catch (error) { notify(errorMessage(error), true) }
+}
+
+function inspectLogUpstream(item: RequestLog) {
+  const upstream = item.upstream_id ? upstreams.value.find((entry) => entry.id === item.upstream_id) : undefined
+  if (upstream) openUpstream(upstream)
+  else notify('该请求没有可打开的上游配置', true)
+}
+
+function inspectLogAction(item: RequestLog, action: 'check' | 'balance') {
+  const upstream = item.upstream_id ? upstreams.value.find((entry) => entry.id === item.upstream_id) : undefined
+  if (upstream) void upstreamAction(upstream, action)
+  else notify('该请求没有可操作的上游配置', true)
 }
 
 function alertEventText(event: string) {
@@ -1603,9 +2000,15 @@ onBeforeUnmount(() => {
   singleModelTestController?.abort()
   pageLoadController?.abort()
   pageLoadController = null
+  dashboardRangeController?.abort()
+  dashboardRangeController = null
   ccswitchModelsController?.abort()
   ccswitchModelsController = null
   window.clearTimeout(toastTimer)
+  if (topologyPulseTimer !== null) window.clearTimeout(topologyPulseTimer)
+  topologyPulseTimer = null
+  if (autoRefreshTimer !== null) window.clearInterval(autoRefreshTimer)
+  autoRefreshTimer = null
   colorScheme.removeEventListener('change', applyTheme)
   window.removeEventListener('keydown', handleGlobalKeydown)
   window.removeEventListener('popstate', handleHistoryNavigation)
@@ -1670,6 +2073,11 @@ onBeforeUnmount(() => {
               <component :is="option.icon" :size="16" />
             </button>
           </div>
+          <span class="refresh-meta" :class="{ stale: !lastUpdatedAt || refreshError }" :title="refreshError || undefined">{{ refreshError || fmtUpdatedAt(lastUpdatedAt) }}</span>
+          <label class="auto-refresh-control" title="自动刷新（30 秒）">
+            <input v-model="autoRefresh" type="checkbox" />
+            <span>自动刷新</span>
+          </label>
           <button class="icon refresh" title="刷新当前页面" :disabled="loading" @click="loadCurrent"><RefreshCw :class="{ spin: loading }" :size="17" /></button>
         </div>
         <div v-if="loading" class="loading-line" aria-hidden="true"></div>
@@ -1677,35 +2085,48 @@ onBeforeUnmount(() => {
 
       <div class="content" :aria-busy="loading">
         <section v-if="view === 'dashboard'" class="view-stack">
-          <div class="dashboard-metric-grid">
+          <section v-if="!setupComplete" class="setup-panel panel">
+            <div class="setup-panel-head"><div><h2>完成首次配置</h2><p>按顺序完成以下步骤，快速验证网关可以正常路由。</p></div><span class="setup-progress">{{ setupSteps.filter((step) => step.done).length }}/{{ setupSteps.length }}</span></div>
+            <div class="setup-steps">
+              <button v-for="step in setupSteps" :key="step.id" class="setup-step" :class="{ done: step.done }" @click="go(step.view)">
+                <span class="setup-step-icon"><Check v-if="step.done" :size="15" /><span v-else>{{ setupSteps.indexOf(step) + 1 }}</span></span>
+                <span><strong>{{ step.label }}</strong><small>{{ step.description }}</small></span><ChevronRight :size="15" />
+              </button>
+            </div>
+          </section>
+          <div class="dashboard-metric-grid dashboard-health-grid">
             <article class="dashboard-metric"><span class="metric-icon green"><Server :size="19" /></span><div><small>可用上游</small><strong>{{ summary.healthy }}<em>/ {{ summary.total }}</em></strong><span class="metric-detail">{{ dashboard.active_alerts || 0 }} 个活跃告警</span></div></article>
             <article class="dashboard-metric"><span class="metric-icon ink"><Activity :size="19" /></span><div><small>24 小时请求</small><strong>{{ fmtNumber(summary.requests) }}</strong><span class="metric-detail">{{ fmtNumber(dashboard.usage_requests_24h) }} 条含 Token</span></div></article>
             <article class="dashboard-metric"><span class="metric-icon blue"><Check :size="19" /></span><div><small>成功率</small><strong>{{ summary.success.toFixed(1) }}<em>%</em></strong><span class="metric-detail">按 HTTP 2xx-3xx 统计</span></div></article>
             <article class="dashboard-metric"><span class="metric-icon amber"><Gauge :size="19" /></span><div><small>平均延迟</small><strong>{{ fmtDuration(summary.latency) }}</strong><span class="metric-detail">24 小时请求均值</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon green"><ChevronRight :size="19" /></span><div><small>输入 / 输出 Token</small><strong>{{ fmtNumber(dashboard.input_tokens_24h) }} <em>/ {{ fmtNumber(dashboard.output_tokens_24h) }}</em></strong><span class="metric-detail">缓存读 {{ fmtNumber(dashboard.cached_input_tokens_24h) }}</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon blue"><ChartNoAxesCombined :size="19" /></span><div><small>Token 命中率</small><strong>{{ fmtPercent(dashboardCacheHitRate) }}</strong><span class="metric-detail">缓存读 / 输入 Token</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon amber"><Network :size="19" /></span><div><small>请求命中率</small><strong>{{ fmtPercent(dashboardRequestHitRate) }}</strong><span class="metric-detail">{{ fmtNumber(dashboard.cache_hit_requests_24h) }} 次命中</span></div></article>
-            <article class="dashboard-metric cost-metric"><span class="metric-icon green"><CircleDollarSign :size="19" /></span><div><small>官方价格估算 · 24 小时</small><strong>{{ fmtCurrency(dashboardCost, 'USD') }}</strong><span class="metric-detail">约 {{ fmtCurrency(dashboardCostCNY, 'CNY') }} · 覆盖 {{ fmtPercent(dashboardCostCoverage) }}</span></div></article>
+            <template v-if="dashboardMetricsExpanded">
+              <article class="dashboard-metric"><span class="metric-icon green"><ChevronRight :size="19" /></span><div><small>输入 / 输出 Token</small><strong>{{ fmtNumber(dashboard.input_tokens_24h) }} <em>/ {{ fmtNumber(dashboard.output_tokens_24h) }}</em></strong><span class="metric-detail">缓存读 {{ fmtNumber(dashboard.cached_input_tokens_24h) }}</span></div></article>
+              <article class="dashboard-metric"><span class="metric-icon blue"><ChartNoAxesCombined :size="19" /></span><div><small>Token 命中率</small><strong>{{ fmtPercent(dashboardCacheHitRate) }}</strong><span class="metric-detail">缓存读 / 输入 Token</span></div></article>
+              <article class="dashboard-metric"><span class="metric-icon amber"><Network :size="19" /></span><div><small>请求命中率</small><strong>{{ fmtPercent(dashboardRequestHitRate) }}</strong><span class="metric-detail">{{ fmtNumber(dashboard.cache_hit_requests_24h) }} 次命中</span></div></article>
+              <article class="dashboard-metric cost-metric"><span class="metric-icon green"><CircleDollarSign :size="19" /></span><div><small>官方价格估算 · 24 小时</small><strong>{{ fmtCurrency(dashboardCost, 'USD') }}</strong><span class="metric-detail">约 {{ fmtCurrency(dashboardCostCNY, 'CNY') }} · 覆盖 {{ fmtPercent(dashboardCostCoverage) }}</span></div></article>
+            </template>
           </div>
-          <section class="panel usage-panel dashboard-usage-panel">
+          <button class="metrics-toggle text-button" :aria-expanded="dashboardMetricsExpanded" @click="toggleDashboardMetrics">{{ dashboardMetricsExpanded ? '收起详细指标' : '显示 Token、缓存与成本指标' }}<ChevronRight :class="{ rotate: dashboardMetricsExpanded }" :size="15" /></button>
+          <section class="panel usage-panel dashboard-usage-panel dashboard-trend-panel">
             <div class="panel-head dashboard-toolbar">
               <div><h2>用量趋势</h2><p>{{ dashboardRange === '24h' ? '按浏览器本地时区显示最近 24 小时' : `${dashboardRange === '7d' ? '近 7 天' : '近 30 天'} · 日粒度` }}</p></div>
               <div class="dashboard-controls">
-                <div class="segmented-control" aria-label="时间范围"><button v-for="item in [{id:'24h',label:'24 小时'},{id:'7d',label:'7 天'},{id:'30d',label:'30 天'}]" :key="item.id" :class="{ active: dashboardRange === item.id }" @click="dashboardRange = item.id; loadDashboardRange()">{{ item.label }}</button></div>
+                <div class="segmented-control" aria-label="时间范围"><button v-for="item in [{id:'24h',label:'24 小时'},{id:'7d',label:'7 天'},{id:'30d',label:'30 天'}]" :key="item.id" :class="{ active: dashboardRange === item.id }" @click="dashboardRange = item.id; loadDashboardRange()">{{ item.label }}</button></div><label class="compare-control"><input type="checkbox" :checked="dashboardCompare" :disabled="dashboardRange === '24h' || dashboardComparisonLoading" @change="toggleDashboardCompare" />对比上周期</label>
                 <div class="segmented-control" aria-label="趋势指标"><button v-for="item in [{id:'requests',label:'请求'},{id:'tokens',label:'Token'},{id:'cache',label:'缓存'},{id:'cost',label:'成本'}]" :key="item.id" :class="{ active: dashboardMetric === item.id }" @click="dashboardMetric = item.id">{{ item.label }}</button></div>
               </div>
             </div>
+            <div v-if="dashboardCompare" class="comparison-summary" :class="{ pending: dashboardComparisonLoading }"><span>{{ dashboardComparisonLoading ? '正在读取上周期数据…' : dashboardComparisonReady ? '环比上周期' : '选择 7 天或 30 天后可用' }}</span><template v-if="dashboardComparisonReady"><strong :class="dashboardDeltaTone('requests')">请求 {{ dashboardDeltaText('requests') }}</strong><strong :class="dashboardDeltaTone('tokens')">Token {{ dashboardDeltaText('tokens') }}</strong><strong :class="dashboardDeltaTone('cost')">成本 {{ dashboardDeltaText('cost') }}</strong></template></div>
             <div class="chart-summary dashboard-chart-summary" aria-label="当前趋势汇总">
               <span><i class="bar"></i><small>请求</small><strong>{{ fmtNumber(dashboardTrendTotals.requests) }}</strong></span><span><i class="line"></i><small>Token</small><strong>{{ fmtNumber(dashboardTrendTotals.tokens) }}</strong></span><span><i class="cache-dot"></i><small>缓存读</small><strong>{{ fmtNumber(dashboardTrendTotals.cached) }}</strong></span><span><i class="cost-dot"></i><small>成本 USD</small><strong>{{ fmtCurrency(dashboardTrendTotals.cost, 'USD') }}</strong></span>
             </div>
             <div v-if="dashboardChartRows.length" class="chart-frame dashboard-chart-frame"><UsageChart :rows="dashboardChartRows" :theme="resolvedTheme" :metric="dashboardMetric" :range-label="dashboardRange === '24h' ? '近 24 小时' : dashboardRange === '7d' ? '近 7 天' : '近 30 天'" /></div>
             <div v-else class="empty"><ChartNoAxesCombined :size="22" /><strong>暂无使用数据</strong><span>产生请求后显示趋势。</span></div>
           </section>
-          <div class="dashboard-detail-grid">
-            <section class="panel cost-breakdown"><div class="panel-head"><div><h2>成本明细</h2><p>近 30 天 · 模型与 Token 类型</p></div><span class="muted">{{ fmtPercent(dashboardCostCoverage) }} 已计价</span></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>请求</th><th>覆盖率</th><th>Token 构成</th><th class="right">USD</th><th class="right">CNY</th></tr></thead><tbody><tr v-for="row in dashboardCostByModel" :key="row.model"><td><strong>{{ row.model }}</strong></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtPercent(row.requests ? row.known / row.requests : null) }}</td><td><small class="token-breakdown">入 {{ fmtNumber(row.input) }} · 出 {{ fmtNumber(row.output) }}<br />读 {{ fmtNumber(row.cached) }} · 写 {{ fmtNumber(row.cacheWrite) }}</small></td><td class="right"><strong>{{ fmtCurrency(row.cost_usd, 'USD') }}</strong></td><td class="right">{{ fmtCurrency(row.cost_usd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }}</td></tr><tr v-if="!dashboardCostByModel.length"><td colspan="6"><div class="empty"><CircleDollarSign :size="20" /><strong>暂无可计价成本</strong><span>绑定价格档案并产生带 Token 的请求后显示。</span></div></td></tr></tbody></table></div></section>
+          <div class="dashboard-detail-grid dashboard-supporting-grid">
+            <section class="panel cost-breakdown"><div class="panel-head"><div><h2>成本明细</h2><p>近 30 天 · 模型与 Token 类型</p></div><span class="muted">{{ fmtPercent(dashboardCostCoverage30d) }} 已计价 · 月度预测 {{ fmtCurrency(dashboardCostForecast30d, 'USD') }}</span></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>请求</th><th>覆盖率</th><th>Token 构成</th><th class="right">USD</th><th class="right">CNY</th></tr></thead><tbody><tr v-for="row in dashboardCostByModel" :key="row.model"><td><strong>{{ row.model }}</strong></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtPercent(row.requests ? row.known / row.requests : null) }}</td><td><small class="token-breakdown">入 {{ fmtNumber(row.input) }} · 出 {{ fmtNumber(row.output) }}<br />读 {{ fmtNumber(row.cached) }} · 写 {{ fmtNumber(row.cacheWrite) }}</small></td><td class="right"><strong>{{ fmtCurrency(row.cost_usd, 'USD') }}</strong></td><td class="right">{{ fmtCurrency(row.cost_usd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }}</td></tr><tr v-if="!dashboardCostByModel.length"><td colspan="6"><div class="empty"><CircleDollarSign :size="20" /><strong>暂无可计价成本</strong><span>绑定价格档案并产生带 Token 的请求后显示。</span></div></td></tr></tbody></table></div></section>
             <section class="panel pricing-snapshot"><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" :disabled="saving" @click="backfillPricing"><RefreshCw :class="{ spin: saving }" :size="15" />回算成本</button><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.prices?.length || 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<Json>(pricing.profiles).length" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
           </div>
-          <section class="panel">
+          <section class="panel dashboard-upstream-panel">
             <div class="panel-head dashboard-route-head">
               <div><h2>上游状态</h2><p>{{ dashboardRouteView === 'topology' ? '按 baseurl 聚合的路由拓扑与决策路径' : '当前路由顺序与连接状态' }}</p></div>
               <div class="dashboard-route-actions">
@@ -1735,12 +2156,12 @@ onBeforeUnmount(() => {
                 </tbody>
               </table>
             </div>
-            <div v-else class="dashboard-route-topology" :class="{ 'is-empty': !dashboardTopologyHasData }">
+            <div v-else class="dashboard-route-topology" :class="{ 'is-empty': !dashboardTopologyHasData, 'topology-live': topologyPulseActive && summary.requests > 0, 'topology-status-good': summary.success >= 99, 'topology-status-warn': summary.success >= 95 && summary.success < 99, 'topology-status-bad': summary.success < 95 }">
               <div v-if="dashboardTopologyHasData" class="topology-flow">
                 <section class="topology-column topology-source" aria-label="客户端密钥入口">
                   <div class="topology-column-label"><KeyRound :size="14" /><span>客户端密钥</span><small>{{ keys.length }} 个</small></div>
                   <div v-if="dashboardTopologyKeys.length" class="topology-node-list">
-                    <article v-for="item in dashboardTopologyKeys" :key="item.id" class="topology-node key-node">
+                    <article v-for="item in dashboardTopologyKeys" :key="item.id" class="topology-node key-node" :class="topologyNodeState('key', item.id)" role="button" :aria-label="`聚焦客户端密钥 ${item.name || item.prefix || item.key_prefix || `密钥 #${item.id}`}`" tabindex="0" @click="focusTopologyKey(item)" @keydown.enter.prevent="focusTopologyKey(item)" @keydown.space.prevent="focusTopologyKey(item)">
                       <span class="topology-node-mark"><KeyRound :size="13" /></span>
                       <div><strong>{{ item.name || item.prefix || item.key_prefix || `密钥 #${item.id}` }}</strong><small>{{ item.group_name || '未分组' }}</small></div>
                       <span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span>
@@ -1755,7 +2176,7 @@ onBeforeUnmount(() => {
                 <section class="topology-column topology-decision" aria-label="分组策略">
                   <div class="topology-column-label"><Network :size="14" /><span>分组决策</span><small>{{ groups.length }} 个</small></div>
                   <div v-if="dashboardTopologyGroups.length" class="topology-node-list">
-                    <article v-for="item in dashboardTopologyGroups" :key="item.id" class="topology-node group-node">
+                    <article v-for="item in dashboardTopologyGroups" :key="item.id" class="topology-node group-node" :class="topologyNodeState('group', item.id)" role="button" :aria-label="`聚焦分组 ${item.name}`" tabindex="0" @click="focusTopologyGroup(item)" @keydown.enter.prevent="focusTopologyGroup(item)" @keydown.space.prevent="focusTopologyGroup(item)">
                       <div class="topology-node-heading"><strong>{{ item.name }}</strong><span class="topology-strategy">按优先级</span></div>
                       <div class="topology-group-meta"><span>{{ item.key_count || 0 }} 个密钥</span><span>{{ item.upstream_ids?.length || 0 }} 条线路</span><span v-if="topologyGroupPriorities(item).length">优先级 {{ topologyGroupPriorities(item).map((priority) => `P${priority}`).join(' / ') }}</span><span v-else>待配置</span></div>
                       <div class="topology-group-keys"><span v-for="key in topologyKeysForGroup(item).slice(0, 3)" :key="key.id" class="topology-client-key"><KeyRound :size="10" />{{ key.name || key.prefix || key.key_prefix || `密钥 #${key.id}` }}</span><span v-if="topologyKeysForGroup(item).length > 3" class="topology-key-overflow">+{{ topologyKeysForGroup(item).length - 3 }}</span><span v-if="!topologyKeysForGroup(item).length" class="muted">暂无客户端密钥</span></div>
@@ -1771,7 +2192,7 @@ onBeforeUnmount(() => {
                 <section class="topology-column topology-target" aria-label="上游集群">
                   <div class="topology-column-label"><Server :size="14" /><span>上游集群</span><small>{{ upstreamGroups.length }} 个 baseurl</small></div>
                   <div v-if="shownDashUpstreams.length" class="topology-node-list">
-                    <article v-for="item in shownDashUpstreams" :key="item.key" class="topology-node upstream-node" :class="groupStatusTone(item)" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
+                    <article v-for="item in shownDashUpstreams" :key="item.key" class="topology-node upstream-node" :class="[groupStatusTone(item), topologyGroupNodeState(item)]" role="button" :aria-label="`打开上游集群 ${item.base_url}`" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)" @keydown.space.prevent="openUpstreamGroup(item)">
                       <div class="topology-node-heading"><strong :title="item.base_url">{{ item.base_url }}</strong><span class="priority-badge">P{{ item.priority }}</span></div>
                       <div class="topology-upstream-state"><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><span class="topology-circuit" :class="item.circuit_open ? 'bad' : 'muted'">{{ groupCircuitText(item) }}</span></div>
                       <div class="topology-upstream-keys"><div v-for="key in item.items.slice(0, 6)" :key="key.id" class="topology-upstream-key"><span class="topology-key-dot" :class="key.health_status === 'healthy' && !key.balance_suspended ? 'healthy' : key.health_status === 'open' ? 'open' : 'unknown'">{{ (key.name || `#${key.id}`).slice(0, 1).toUpperCase() }}</span><strong :title="key.name">{{ key.name || `上游 Key #${key.id}` }}</strong><span class="topology-key-priority">P{{ key.priority }}</span><span class="status" :class="upstreamRouteTone(key)"><i></i>{{ upstreamRouteText(key) }}</span></div><span v-if="item.total > 6" class="topology-more">+ {{ item.total - 6 }} 个 Key，点击查看全部</span></div>
@@ -1787,6 +2208,7 @@ onBeforeUnmount(() => {
                 <span class="topology-response-line" aria-hidden="true"></span>
                 <div class="topology-response-node"><span class="topology-response-icon"><Check :size="15" /></span><div><strong>响应出口</strong><small>{{ fmtNumber(summary.requests) }} 请求 · 成功率 {{ summary.success.toFixed(1) }}% · 平均 {{ fmtDuration(summary.latency) }}</small></div><span class="status" :class="summary.success >= 99 ? 'good' : summary.success >= 95 ? 'warn' : 'bad'"><i></i>{{ summary.success >= 99 ? '稳定' : summary.success >= 95 ? '关注' : '异常' }}</span></div>
               </div>
+              <section v-if="topologyHasFocus" class="topology-focus-panel" aria-live="polite"><div><strong>{{ topologyFocusedKey ? `客户端 Key：${topologyFocusedKey.name}` : `分组：${topologyFocusedGroup?.name || '未知分组'}` }}</strong><small>{{ topologyFocusedKey ? `按所属分组 · ${topologyFocusedUpstreams.length} 条候选线路` : `${topologyFocusedUpstreams.length} 条候选线路 · 按优先级尝试` }}</small></div><div class="topology-focus-route"><span v-for="item in topologyFocusedUpstreams" :key="item.id" class="topology-focus-chip"><b>P{{ item.priority }}</b>{{ item.name }}<em :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</em></span><span v-if="!topologyFocusedUpstreams.length" class="muted">暂无可用线路</span></div><button class="icon" title="清除拓扑聚焦" @click="clearTopologyFocus"><X :size="15" /></button></section>
             </div>
           </section>
         </section>
@@ -1809,10 +2231,11 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else-if="view === 'upstreams'" class="view-stack">
-          <div class="action-row"><p>{{ upstreams.length }} 个上游，数字越小优先级越高。</p><button class="primary" @click="openUpstream()"><Plus :size="17" />添加上游</button></div>
+          <div class="action-row upstream-toolbar"><div class="toolbar-summary"><p>{{ filteredUpstreamGroups.length }}/{{ upstreamGroups.length }} 个 Base URL，数字越小优先级越高。</p><span v-if="upstreamSelectedIds.length" class="selection-count">已选 {{ upstreamSelectedIds.length }} 个 Key</span></div><div class="toolbar-actions"><button v-if="upstreamSelectedIds.length" class="secondary" :disabled="saving" @click="bulkUpstreamAction('check')"><Activity :size="15" />批量检查</button><button v-if="upstreamSelectedIds.length" class="secondary" :disabled="saving" @click="bulkUpstreamAction('balance')"><CircleDollarSign :size="15" />批量刷新余额</button><button class="primary" @click="openUpstream()"><Plus :size="17" />添加上游</button></div></div>
+          <div class="list-filterbar"><label><span>搜索</span><input v-model.trim="upstreamFilter.search" placeholder="Base URL 或 Key 名称" /></label><label><span>状态</span><select v-model="upstreamFilter.status"><option value="all">全部状态</option><option value="healthy">正常</option><option value="warning">关注</option><option value="error">异常</option></select></label><label><span>协议</span><select v-model="upstreamFilter.protocol"><option value="all">全部协议</option><option v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><button class="text-button" @click="Object.assign(upstreamFilter, { search: '', status: 'all', protocol: 'all' })">清除筛选</button></div>
           <section class="panel table-panel"><div class="table-wrap"><table class="upstream-table">
             <thead><tr>
-              <th :aria-sort="ariaSort('upstreams', 'priority')"><button class="sort-button" @click="toggleSort('upstreams', 'priority')">顺序<ArrowUpDown :size="12" /></button></th>
+              <th><input type="checkbox" :checked="allVisibleUpstreamsSelected" aria-label="选择全部可见上游 Key" @change="toggleAllVisibleUpstreams" /></th><th :aria-sort="ariaSort('upstreams', 'priority')"><button class="sort-button" @click="toggleSort('upstreams', 'priority')">顺序<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('upstreams', 'name')"><button class="sort-button" @click="toggleSort('upstreams', 'name')">上游<ArrowUpDown :size="12" /></button></th>
               <th :aria-sort="ariaSort('upstreams', 'health_status')"><button class="sort-button" @click="toggleSort('upstreams', 'health_status')">连接<ArrowUpDown :size="12" /></button></th>
               <th>能力</th>
@@ -1821,9 +2244,9 @@ onBeforeUnmount(() => {
               <th>熔断</th><th class="right">操作</th>
             </tr></thead>
             <tbody>
-              <template v-for="item in sortRows(upstreamGroups, 'upstreams')" :key="item.key">
+              <template v-for="item in sortRows(filteredUpstreamGroups, 'upstreams')" :key="item.key">
               <tr :class="{ subdued: item.enabled === 0 }" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
-                <td><span class="priority">{{ item.priority }}</span></td>
+                <td><input type="checkbox" :checked="item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :aria-label="`选择 ${item.base_url} 下的 Key`" @click.stop @change="item.items.forEach((entry) => toggleUpstreamSelection(entry, $event))" /></td><td><span class="priority">{{ item.priority }}</span></td>
                 <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.available }} 个可路由<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
                 <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><small v-if="item.total > 1">点击查看各 Key 状态</small></td>
                 <td><div class="tag-row"><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></div><small>{{ item.models?.length || 0 }} 个模型</small></td>
@@ -1835,9 +2258,9 @@ onBeforeUnmount(() => {
                   <button class="icon" title="查看 Key" @click.stop="openUpstreamGroup(item)"><MoreHorizontal :size="16" /></button>
                 </div></td>
               </tr>
-              <tr v-if="expandedMobileRow === `upstream-${item.key}`" class="mobile-detail-row"><td colspan="9"><dl><div><dt>连接</dt><dd>{{ groupStatusText(item) }}</dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型</dt><dd>{{ item.models?.length || 0 }} 个</dd></div><div><dt>Key 数量</dt><dd>{{ item.total }}</dd></div></dl></td></tr>
+              <tr v-if="expandedMobileRow === `upstream-${item.key}`" class="mobile-detail-row"><td colspan="10"><dl><div><dt>连接</dt><dd>{{ groupStatusText(item) }}</dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型</dt><dd>{{ item.models?.length || 0 }} 个</dd></div><div><dt>Key 数量</dt><dd>{{ item.total }}</dd></div></dl></td></tr>
               </template>
-              <tr v-if="!upstreamGroups.length"><td colspan="9"><div class="empty"><Server :size="22" /><strong>还没有配置上游</strong><span>添加第一个 NewAPI 或 Sub2API 路由目标。</span><button class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
+              <tr v-if="!filteredUpstreamGroups.length"><td colspan="10"><div class="empty"><Server :size="22" /><strong>{{ upstreamGroups.length ? '没有匹配的上游' : '还没有配置上游' }}</strong><span>{{ upstreamGroups.length ? '调整筛选条件后重试。' : '添加第一个 NewAPI 或 Sub2API 路由目标。' }}</span><button v-if="!upstreamGroups.length" class="secondary" @click="openUpstream()"><Plus :size="15" />添加上游</button></div></td></tr>
             </tbody>
           </table></div></section>
         </section>
@@ -1854,6 +2277,7 @@ onBeforeUnmount(() => {
             </div>
             <button class="primary" @click="openKey()"><Plus :size="17" />创建密钥</button>
           </div>
+          <div class="list-filterbar"><label><span>搜索</span><input v-model.trim="keyFilter.search" placeholder="名称或密钥前缀" /></label><label><span>状态</span><select v-model="keyFilter.status"><option value="all">全部状态</option><option value="enabled">启用</option><option value="disabled">停用</option></select></label><label><span>分组</span><select v-model="keyFilter.group_id"><option value="">全部分组</option><option v-for="group in groups" :key="group.id" :value="String(group.id)">{{ group.name }}</option></select></label><button class="text-button" @click="Object.assign(keyFilter, { search: '', status: 'all', group_id: '' })">清除筛选</button></div>
           <section class="panel table-panel"><div class="table-wrap"><table class="key-table">
             <thead><tr>
               <th :aria-sort="ariaSort('keys', 'name')"><button class="sort-button" @click="toggleSort('keys', 'name')">名称<ArrowUpDown :size="12" /></button></th>
@@ -1866,7 +2290,7 @@ onBeforeUnmount(() => {
               <th class="right">操作</th>
             </tr></thead>
             <tbody>
-              <template v-for="item in sortRows(keys, 'keys')" :key="item.id">
+              <template v-for="item in sortRows(filteredKeys, 'keys')" :key="item.id">
               <tr :class="{ subdued: !item.enabled }">
                 <td><strong>{{ item.name }}</strong><small>创建于 {{ fmtDate(item.created_at) }}</small></td>
                 <td><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></td>
@@ -1874,11 +2298,11 @@ onBeforeUnmount(() => {
                 <td>{{ item.group_name || '历史未分组' }}</td>
                 <td><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span><span v-if="!item.protocols?.length" class="muted">全部</span></td>
                 <td>{{ item.models?.length ? `${item.models.length} 个模型` : '全部模型' }}</td><td class="muted">{{ fmtDate(item.last_used_at) }}</td>
-                <td class="menu-cell"><div class="row-actions"><button class="icon" title="复制密钥" aria-label="复制密钥" @click="copyClientKey(item)"><Copy :size="16" /></button><button class="icon" title="编辑" @click="openKey(item)"><Pencil :size="16" /></button><button class="icon" title="导入 CCSwitch" aria-label="导入 CCSwitch" @click="openCCSwitch(item)"><Upload :size="16" /></button><button class="icon mobile-row-toggle" title="展开详情" :aria-expanded="expandedMobileRow === `key-${item.id}`" @click="expandedMobileRow = expandedMobileRow === `key-${item.id}` ? '' : `key-${item.id}`"><ChevronRight :class="{ rotate: expandedMobileRow === `key-${item.id}` }" :size="17" /></button><button class="icon" title="更多操作" aria-haspopup="menu" :aria-expanded="openRowMenu === `key-${item.id}`" @click.stop="toggleRowMenu(`key-${item.id}`, $event)"><MoreHorizontal :size="17" /></button><Teleport to="body"><div v-if="openRowMenu === `key-${item.id}`" class="row-menu" role="menu" :style="{ top: `${rowMenuPosition.top}px`, left: `${rowMenuPosition.left}px` }" @click.stop @keydown="handleRowMenuKeydown"><button role="menuitem" @click="closeRowMenu(); copyClientKey(item)"><Copy :size="15" />复制密钥</button><button role="menuitem" @click="closeRowMenu(); openCCSwitch(item)"><Upload :size="15" />导入 CCSwitch</button><button class="danger" role="menuitem" @click="closeRowMenu(); removeKey(item)"><Trash2 :size="15" />删除密钥</button></div></Teleport></div></td>
+                <td class="menu-cell"><div class="row-actions"><button class="icon" title="复制密钥" aria-label="复制密钥" @click="copyClientKey(item)"><Copy :size="16" /></button><button class="icon" title="模拟请求" aria-label="模拟请求" @click="openKeySimulation(item)"><Play :size="16" /></button><button class="icon" title="编辑" @click="openKey(item)"><Pencil :size="16" /></button><button class="icon" title="导入 CCSwitch" aria-label="导入 CCSwitch" @click="openCCSwitch(item)"><Upload :size="16" /></button><button class="icon mobile-row-toggle" title="展开详情" :aria-expanded="expandedMobileRow === `key-${item.id}`" @click="expandedMobileRow = expandedMobileRow === `key-${item.id}` ? '' : `key-${item.id}`"><ChevronRight :class="{ rotate: expandedMobileRow === `key-${item.id}` }" :size="17" /></button><button class="icon" title="更多操作" aria-haspopup="menu" :aria-expanded="openRowMenu === `key-${item.id}`" @click.stop="toggleRowMenu(`key-${item.id}`, $event)"><MoreHorizontal :size="17" /></button><Teleport to="body"><div v-if="openRowMenu === `key-${item.id}`" class="row-menu" role="menu" :style="{ top: `${rowMenuPosition.top}px`, left: `${rowMenuPosition.left}px` }" @click.stop @keydown="handleRowMenuKeydown"><button role="menuitem" @click="closeRowMenu(); copyClientKey(item)"><Copy :size="15" />复制密钥</button><button role="menuitem" @click="closeRowMenu(); openKeySimulation(item)"><Play :size="15" />模拟请求</button><button role="menuitem" @click="closeRowMenu(); openCCSwitch(item)"><Upload :size="15" />导入 CCSwitch</button><button class="danger" role="menuitem" @click="closeRowMenu(); removeKey(item)"><Trash2 :size="15" />删除密钥</button></div></Teleport></div></td>
               </tr>
               <tr v-if="expandedMobileRow === `key-${item.id}`" class="mobile-detail-row"><td colspan="8"><dl><div><dt>分组</dt><dd>{{ item.group_name || '历史未分组' }}</dd></div><div><dt>密钥前缀</dt><dd><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></dd></div><div><dt>协议</dt><dd>{{ item.protocols?.join(', ') || '全部' }}</dd></div><div><dt>模型限制</dt><dd>{{ item.models?.length ? `${item.models.length} 个模型` : '全部模型' }}</dd></div><div><dt>最后使用</dt><dd>{{ fmtDate(item.last_used_at) }}</dd></div><div><dt>创建时间</dt><dd>{{ fmtDate(item.created_at) }}</dd></div></dl></td></tr>
               </template>
-              <tr v-if="!keys.length"><td colspan="8"><div class="empty"><KeyRound :size="22" /><strong>还没有客户端密钥</strong><span>为调用方创建独立密钥并限制协议与模型。</span><button class="secondary" @click="openKey()"><Plus :size="15" />创建密钥</button></div></td></tr>
+              <tr v-if="!filteredKeys.length"><td colspan="8"><div class="empty"><KeyRound :size="22" /><strong>{{ keys.length ? '没有匹配的客户端密钥' : '还没有客户端密钥' }}</strong><span>{{ keys.length ? '调整筛选条件后重试。' : '为调用方创建独立密钥并限制协议与模型。' }}</span><button v-if="!keys.length" class="secondary" @click="openKey()"><Plus :size="15" />创建密钥</button></div></td></tr>
             </tbody>
           </table></div></section>
         </section>
@@ -1888,7 +2312,7 @@ onBeforeUnmount(() => {
             <label><span>状态</span><select v-model="logFilter.status"><option value="">全部</option><option value="success">成功</option><option value="error">失败</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
             <label><span>上游</span><select v-model="logFilter.upstream_id"><option value="">全部</option><option v-for="item in upstreams" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
             <label><span>分组</span><select v-model="logFilter.group_id"><option value="">全部</option><option v-for="item in groups" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
-            <button class="secondary"><Search :size="16" />筛选</button>
+            <button class="secondary"><Search :size="16" />筛选</button><div class="quick-filters"><button type="button" class="text-button" :class="{ active: logFilter.status === 'error' }" @click="setLogPreset('errors')">只看失败</button><button type="button" class="text-button" :class="{ active: !logFilter.status && !logFilter.upstream_id && !logFilter.group_id }" @click="setLogPreset('all')">清除筛选</button></div>
           </form>
           <section class="panel table-panel"><div class="table-wrap"><table>
             <thead><tr>
@@ -1920,8 +2344,8 @@ onBeforeUnmount(() => {
                     <div><span>缓存写入</span><strong>{{ fmtMetric(item.usage?.cache_creation_input_tokens) }}</strong></div>
                     <div><span>Token 命中率</span><strong>{{ fmtPercent(logTokenHitRate(item)) }}</strong></div>
                   </div>
-                  <div class="attempt-head"><strong>切换链</strong><span>{{ item.attempts?.length || 0 }} 次尝试</span></div>
-                  <ol v-if="item.attempts?.length"><li v-for="(attempt, index) in item.attempts" :key="index"><span>{{ index + 1 }}</span><strong>{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</strong><code>{{ attempt.status_code || 'ERR' }}</code><small>{{ fmtDuration(attempt.duration_ms) }}</small><small>TTFB {{ fmtDuration(attempt.ttfb_ms) }} · TTFT {{ fmtDuration(attempt.ttft_ms) }}</small><em>{{ attempt.error || '已响应' }}</em></li></ol>
+                  <div class="attempt-head"><div><strong>切换链</strong><span>{{ item.attempts?.length || 0 }} 次尝试</span></div><div class="log-detail-actions"><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogUpstream(item)"><Server :size="14" />查看上游</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'check')"><Activity :size="14" />检查连接</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'balance')"><CircleDollarSign :size="14" />刷新余额</button></div></div>
+                  <div v-if="item.attempts?.length" class="attempt-timeline" aria-label="请求尝试时间轴"><div v-for="(attempt, index) in item.attempts" :key="index" class="attempt-timeline-row"><span>{{ index + 1 }}</span><div><strong>{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</strong><div class="attempt-track"><i :class="attempt.status_code && attempt.status_code < 400 ? 'good' : 'bad'" :style="{ width: attemptWidth(item, attempt.duration_ms) }"></i></div></div><small>{{ fmtDuration(attempt.duration_ms) }}</small></div></div>
                   <p v-else class="muted">未记录上游尝试。</p>
                 </div></td></tr>
               </template>
@@ -1931,7 +2355,9 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else-if="view === 'usage'" class="view-stack">
-          <form class="filterbar usage-filterbar" @submit.prevent="applyUsageFilters">
+          <div class="mobile-filter-bar"><span>{{ usageFilter.days === 30 ? '近 30 天' : ('近 ' + usageFilter.days + ' 天') }} · 按{{ usageFilter.dimension === 'upstream' ? '上游' : usageFilter.dimension === 'api_key' ? '客户端' : usageFilter.dimension === 'group' ? '分组' : usageFilter.dimension === 'protocol' ? '协议' : '模型' }}</span><button class="secondary" type="button" @click="mobileFiltersOpen = !mobileFiltersOpen"><ListFilter :size="15" />{{ mobileFiltersOpen ? '收起筛选' : '筛选' }}</button><button class="secondary" type="button" @click="exportUsageCSV"><Download :size="15" />导出 CSV</button></div>
+          <form class="filterbar usage-filterbar" :class="{ 'filters-open': mobileFiltersOpen }" @submit.prevent="applyUsageFilters">
+            <button class="icon mobile-filter-close" type="button" title="关闭筛选" @click="mobileFiltersOpen = false"><X :size="17" /></button>
             <label><span>时间范围</span><select v-model.number="usageFilter.days"><option :value="7">近 7 天</option><option :value="30">近 30 天</option><option :value="90">近 90 天</option><option :value="365">近 1 年</option></select></label>
             <label><span>统计粒度</span><select v-model="usageFilter.granularity"><option value="day">按天</option><option value="week">按周</option><option value="month">按月</option></select></label>
             <label><span>拆分维度</span><select v-model="usageFilter.dimension"><option value="upstream">上游</option><option value="api_key">客户端密钥</option><option value="group">分组</option><option value="protocol">协议</option><option value="model">模型</option></select></label>
@@ -1941,7 +2367,7 @@ onBeforeUnmount(() => {
             <label v-if="usageFilter.dimension === 'group'"><span>分组筛选</span><select v-model="usageFilter.group_id"><option value="">全部分组</option><option v-for="item in groups" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select></label>
             <label v-if="usageFilter.dimension === 'protocol'"><span>协议筛选</span><select v-model="usageFilter.protocol"><option value="">全部协议</option><option v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label>
             <label v-if="usageFilter.dimension === 'model'"><span>模型筛选</span><input v-model.trim="usageFilter.model" placeholder="模型名称" /></label>
-            <button class="secondary"><Search :size="16" />应用筛选</button>
+            <button class="secondary"><Search :size="16" />应用筛选</button><button class="secondary usage-export-button" type="button" @click="exportUsageCSV"><Download :size="15" />导出 CSV</button>
           </form>
           <div class="metric-grid usage-metric-grid">
             <article><span class="metric-icon ink"><Activity :size="19" /></span><div><small>{{ usageFilter.days }} 天请求</small><strong>{{ fmtNumber(usageTotals.requests) }}</strong></div></article>
@@ -1950,12 +2376,14 @@ onBeforeUnmount(() => {
 			<article><span class="metric-icon amber"><CircleDollarSign :size="19" /></span><div><small>缓存读 / 写</small><strong>{{ fmtNumber(usageCachedTokens) }} <em>/ {{ fmtMetric(usageCacheWriteTokens) }}</em></strong></div></article>
             <article><span class="metric-icon green"><Check :size="19" /></span><div><small>Token 命中率</small><strong>{{ fmtPercent(usageTokenHitRate) }}</strong></div></article>
 			<article><span class="metric-icon blue"><Gauge :size="19" /></span><div><small>平均 / P95 耗时</small><strong>{{ fmtDuration(usageAvgLatency) }} <em>/ {{ fmtDuration(usageP95Latency) }}</em></strong></div></article>
+			<article class="cost-metric"><span class="metric-icon green"><CircleDollarSign :size="19" /></span><div><small>官方价格估算</small><strong>{{ fmtCurrency(usageCostUsd, 'USD') }}</strong><span class="metric-detail">约 {{ fmtCurrency(usageCostUsd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }} · 覆盖 {{ fmtPercent(usageCostCoverage) }}</span></div></article>
+			<article class="cost-metric"><span class="metric-icon amber"><ChartNoAxesCombined :size="19" /></span><div><small>月度成本预测</small><strong>{{ fmtCurrency(usageCostForecast30d, 'USD') }}</strong><span class="metric-detail">按当前周期日均外推 30 天</span></div></article>
           </div>
           <section class="panel usage-panel"><div class="panel-head usage-chart-head"><div><h2>使用趋势</h2><p>{{ usageFilter.granularity === 'day' ? '按天' : usageFilter.granularity === 'week' ? '按周' : '按月' }} · {{ usageDimensionLabel({ label: usageFilter.dimension === 'upstream' ? '上游' : usageFilter.dimension === 'api_key' ? '客户端密钥' : usageFilter.dimension === 'group' ? '分组' : usageFilter.dimension === 'protocol' ? '协议' : '模型' }) }}</p></div><div class="segmented-control" role="group" aria-label="趋势指标"><button :aria-pressed="usageMetric === 'requests'" :class="{ active: usageMetric === 'requests' }" @click="usageMetric = 'requests'">请求</button><button :aria-pressed="usageMetric === 'tokens'" :class="{ active: usageMetric === 'tokens' }" @click="usageMetric = 'tokens'">Token</button><button :aria-pressed="usageMetric === 'cache'" :class="{ active: usageMetric === 'cache' }" @click="usageMetric = 'cache'">缓存</button><button :aria-pressed="usageMetric === 'latency'" :class="{ active: usageMetric === 'latency' }" @click="usageMetric = 'latency'">耗时</button></div></div>
             <div v-if="usageRows.length" class="chart-frame"><UsageChart :rows="usageRows" :theme="resolvedTheme" :metric="usageMetric" :range-label="`近 ${usageFilter.days} 天`" /></div>
             <div v-else class="empty"><Gauge :size="22" /><strong>暂无用量数据</strong><span>产生请求后，这里会显示趋势与缓存命中情况。</span></div>
           </section>
-          <section class="panel table-panel usage-table-panel"><div class="panel-head"><div><h2>明细汇总</h2><p>Top {{ usageFilter.topN }} · 其余项目聚合为“其他”</p></div><span class="muted usage-hit-summary">请求命中率 {{ fmtPercent(usageRequestHitRate) }}</span></div><div class="table-wrap"><table><thead><tr>
+          <section class="panel table-panel usage-table-panel"><div class="panel-head"><div><h2>明细汇总</h2><p>Top {{ usageFilter.topN }} · 其余项目聚合为“其他”</p></div><div class="panel-head-actions"><span class="muted usage-hit-summary">请求命中率 {{ fmtPercent(usageRequestHitRate) }}</span><button class="secondary usage-export-inline" type="button" @click="exportUsageCSV"><Download :size="15" />导出</button></div></div><div class="table-wrap"><table><thead><tr>
             <th :aria-sort="ariaSort('usage', 'day')"><button class="sort-button" @click="toggleSort('usage', 'day')">日期<ArrowUpDown :size="12" /></button></th><th>维度</th>
             <th :aria-sort="ariaSort('usage', 'requests')"><button class="sort-button" @click="toggleSort('usage', 'requests')">请求<ArrowUpDown :size="12" /></button></th>
             <th :aria-sort="ariaSort('usage', 'successes')"><button class="sort-button" @click="toggleSort('usage', 'successes')">成功<ArrowUpDown :size="12" /></button></th>
@@ -1966,18 +2394,30 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else class="view-stack">
-          <div class="action-row"><p>上游状态与安全事件将发送到已启用渠道。</p><button class="primary" @click="openChannel"><Plus :size="17" />添加渠道</button></div>
-          <div class="channel-grid">
-            <article v-for="item in channels" :key="item.id" class="channel-card"><span class="channel-icon"><Mail v-if="item.kind === 'email'" :size="21" /><Webhook v-else :size="21" /></span><div><strong>{{ item.name }}</strong><small>{{ item.kind === 'email' ? '邮件' : 'Webhook' }} · {{ item.enabled ? '已启用' : '已停用' }}</small></div><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span><button class="icon danger" title="删除" @click="removeChannel(item)"><Trash2 :size="16" /></button></article>
-            <div v-if="!channels.length" class="empty panel">还没有通知渠道。</div>
+          <div class="section-tabs" role="tablist" aria-label="通知和设置">
+            <button role="tab" :aria-selected="notificationSection === 'channels'" :class="{ active: notificationSection === 'channels' }" @click="notificationSection = 'channels'"><Bell :size="15" />通知渠道</button>
+            <button role="tab" :aria-selected="notificationSection === 'alerts'" :class="{ active: notificationSection === 'alerts' }" @click="notificationSection = 'alerts'"><AlertCircle :size="15" />告警规则</button>
+            <button role="tab" :aria-selected="notificationSection === 'settings'" :class="{ active: notificationSection === 'settings' }" @click="notificationSection = 'settings'"><Network :size="15" />路由设置</button>
           </div>
-          <section class="panel settings-strip"><div><h2>路由设置</h2><p>单次请求最多尝试的上游数量</p></div><label>最大尝试次数<input v-model.number="maxAttempts" type="number" min="1" max="5" /></label><button class="secondary" @click="saveSettings"><Check :size="16" />保存</button></section>
-          <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>
-            <div class="rule-add"><select v-model="newRule.event"><option v-for="event in ['low_balance','balance_unavailable','error_rate','latency','client_error_rate']" :key="event" :value="event">{{ alertEventText(event) }}</option></select><select v-model="newRule.upstream_id"><option value="">选择上游</option><option v-for="item in upstreams" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select><input v-model.number="newRule.threshold" type="number" min="0" step="0.1" title="阈值" /><button class="secondary" @click="addRule"><Plus :size="16" />添加覆盖</button></div>
-            <div class="table-wrap"><table><thead><tr><th>事件</th><th>范围</th><th>阈值</th><th>窗口（秒）</th><th>冷却（秒）</th><th>启用</th><th></th></tr></thead><tbody>
-              <tr v-for="rule in alertRules" :key="rule.id"><td><strong>{{ alertEventText(rule.event) }}</strong></td><td>{{ upstreamName(rule.upstream_id) }}</td><td><input v-model.number="rule.threshold" class="table-input" type="number" min="0" step="0.1" /></td><td><input v-model.number="rule.window_seconds" class="table-input" type="number" min="60" /></td><td><input v-model.number="rule.cooldown_seconds" class="table-input" type="number" min="60" /></td><td><label class="switch"><input v-model="rule.enabled" type="checkbox" /><span></span></label></td><td class="right"><button class="icon" title="保存规则" @click="saveRule(rule)"><Check :size="16" /></button><button v-if="rule.upstream_id" class="icon danger" title="删除覆盖" @click="removeRule(rule)"><Trash2 :size="16" /></button></td></tr>
-            </tbody></table></div>
-          </section>
+          <template v-if="notificationSection === 'channels'">
+            <div class="action-row"><p>上游状态与安全事件将发送到已启用渠道。</p><button class="primary" @click="openChannel"><Plus :size="17" />添加渠道</button></div>
+            <div class="channel-grid">
+              <article v-for="item in channels" :key="item.id" class="channel-card"><span class="channel-icon"><Mail v-if="item.kind === 'email'" :size="21" /><Webhook v-else :size="21" /></span><div><strong>{{ item.name }}</strong><small>{{ item.kind === 'email' ? '邮件' : 'Webhook' }} · {{ item.enabled ? '已启用' : '已停用' }}</small></div><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span><div class="channel-actions"><button v-if="item.kind === 'webhook'" class="secondary channel-test" :disabled="channelTestID !== null" :aria-busy="channelTestID === item.id" @click="testChannel(item)"><LoaderCircle v-if="channelTestID === item.id" class="spin" :size="14" /><Webhook v-else :size="14" />{{ channelTestID === item.id ? '测试中' : '测试' }}</button><button class="icon danger" title="删除" @click="removeChannel(item)"><Trash2 :size="16" /></button></div></article>
+              <div v-if="!channels.length" class="empty panel">还没有通知渠道。</div>
+            </div>
+          </template>
+          <template v-else-if="notificationSection === 'settings'">
+            <section class="panel settings-strip"><div><h2>路由设置</h2><p>单次请求最多尝试的上游数量</p></div><label>最大尝试次数<input v-model.number="maxAttempts" type="number" min="1" max="5" /></label><button class="secondary" @click="saveSettings"><Check :size="16" />保存</button></section>
+            <div class="notice-panel"><Check :size="16" /><span>数字越小优先级越高。客户端 Key 只会在所属分组内按上游 Key 的优先级尝试。</span></div>
+          </template>
+          <template v-else>
+            <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>
+              <div class="rule-add"><select v-model="newRule.event"><option v-for="event in ['low_balance','balance_unavailable','error_rate','latency','client_error_rate']" :key="event" :value="event">{{ alertEventText(event) }}</option></select><select v-model="newRule.upstream_id"><option value="">选择上游</option><option v-for="item in upstreams" :key="item.id" :value="String(item.id)">{{ item.name }}</option></select><input v-model.number="newRule.threshold" type="number" min="0" step="0.1" title="阈值" /><button class="secondary" @click="addRule"><Plus :size="16" />添加覆盖</button></div>
+              <div class="table-wrap"><table><thead><tr><th>事件</th><th>范围</th><th>阈值</th><th>窗口（秒）</th><th>冷却（秒）</th><th>启用</th><th></th></tr></thead><tbody>
+                <tr v-for="rule in alertRules" :key="rule.id"><td><strong>{{ alertEventText(rule.event) }}</strong></td><td>{{ upstreamName(rule.upstream_id) }}</td><td><input v-model.number="rule.threshold" class="table-input" type="number" min="0" step="0.1" /></td><td><input v-model.number="rule.window_seconds" class="table-input" type="number" min="60" /></td><td><input v-model.number="rule.cooldown_seconds" class="table-input" type="number" min="60" /></td><td><label class="switch"><input v-model="rule.enabled" type="checkbox" /><span></span></label></td><td class="right"><button class="icon" title="保存规则" @click="saveRule(rule)"><Check :size="16" /></button><button v-if="rule.upstream_id" class="icon danger" title="删除覆盖" @click="removeRule(rule)"><Trash2 :size="16" /></button></td></tr>
+              </tbody></table></div>
+            </section>
+          </template>
         </section>
       </div>
     </main>
@@ -2087,11 +2527,20 @@ onBeforeUnmount(() => {
 
   <div v-if="keyModal" class="modal-backdrop" @mousedown.self="keyModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="key-title"><header><div><h2 id="key-title">{{ editingKey ? '编辑客户端密钥' : '创建客户端密钥' }}</h2><p>设置客户端访问范围</p></div><button class="icon" title="关闭" @click="keyModal = false"><X :size="19" /></button></header><form @submit.prevent="saveKey"><div class="form-section"><div class="form-grid">
     <label class="span-2">名称<input v-model.trim="keyForm.name" required autofocus placeholder="Claude Code 工作站" /></label>
-    <label class="span-2">分组<select v-model.number="keyForm.group_id" required><option :value="0" disabled>选择分组</option><option v-for="item in groups" :key="item.id" :value="item.id" :disabled="!item.enabled || !item.upstream_ids.length">{{ item.name }}{{ !item.enabled ? '（停用）' : '' }}</option></select></label>
+    <label class="span-2">分组<select v-model.number="keyForm.group_id" required><option :value="0" disabled>选择分组</option><option v-for="item in groups" :key="item.id" :value="item.id" :disabled="!item.enabled || !(item.upstream_ids || []).length">{{ item.name }}{{ !item.enabled ? '（停用）' : '' }}</option></select></label>
+    <div class="route-preview span-2" aria-live="polite">
+      <div class="route-preview-head"><strong>生效路由预览</strong><span v-if="keyRoutePreview.length">{{ keyRoutePreview.length }} 条候选</span></div>
+      <div v-if="keyRoutePreview.length" class="route-preview-list">
+        <div v-for="item in keyRoutePreview" :key="item.id" class="route-preview-row"><span class="priority">P{{ item.priority }}</span><strong>{{ item.name }}</strong><span class="status" :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</span></div>
+      </div>
+      <p v-else>选择一个包含上游的分组后，这里会显示实际尝试顺序。</p>
+    </div>
     <fieldset class="span-2"><legend>允许协议</legend><div class="check-row"><label v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol"><input v-model="keyForm.protocols" type="checkbox" :value="protocol" />{{ protocol }}</label></div></fieldset>
     <label class="span-2">允许模型 <span>逗号分隔；留空表示全部</span><textarea v-model="keyForm.models" rows="3" placeholder="gpt-5, claude-sonnet"></textarea></label>
     <label class="switch span-2"><input v-model="keyForm.enabled" type="checkbox" /><span></span>启用密钥</label>
   </div></div><footer><button type="button" class="secondary" @click="keyModal = false">取消</button><button class="primary" :disabled="saving">{{ editingKey ? '保存修改' : '创建密钥' }}</button></footer></form></section></div>
+
+  <div v-if="keySimulationModal" class="modal-backdrop" @mousedown.self="closeKeySimulation"><section class="modal simulation-modal" role="dialog" aria-modal="true" aria-labelledby="simulation-title"><header><div><h2 id="simulation-title">模拟客户端请求</h2><p>{{ keySimulationTarget?.name }} · 实际走所属分组路由</p></div><button class="icon" title="关闭" @click="closeKeySimulation"><X :size="19" /></button></header><form @submit.prevent="runKeySimulation"><div class="form-section"><div class="form-grid"><label>协议<select v-model="keySimulationProtocol"><option v-for="protocol in keySimulationTarget?.protocols?.length ? keySimulationTarget.protocols : UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>模型<input v-model.trim="keySimulationModel" required list="simulation-models" placeholder="例如 gpt-5.6" /><datalist id="simulation-models"><option v-for="model in keySimulationTarget?.models || []" :key="model" :value="model" /></datalist></label><p class="form-hint span-2">将发送一个最小 ping 请求，可能产生少量 Token 消耗；结果会计入请求日志。</p><div v-if="keySimulationResult" class="simulation-result span-2" :class="keySimulationResult.ok ? 'good' : 'bad'"><div><strong>{{ keySimulationResult.ok ? '请求成功' : '请求失败' }}</strong><span>{{ keySimulationResult.status ? `HTTP ${keySimulationResult.status}` : '未建立连接' }} · {{ fmtDuration(keySimulationResult.duration_ms) }}</span></div><p v-if="keySimulationResult.detail">{{ keySimulationResult.detail }}</p></div></div></div><footer><button type="button" class="secondary" @click="closeKeySimulation">取消</button><button class="primary" :disabled="keySimulationBusy"><LoaderCircle v-if="keySimulationBusy" class="spin" :size="16" /><Play v-else :size="16" />发送测试请求</button></footer></form></section></div>
 
   <div v-if="ccswitchModal" class="modal-backdrop ccswitch-backdrop" @mousedown.self="closeCCSwitch"><section class="modal ccswitch-modal" role="dialog" aria-modal="true" aria-labelledby="ccswitch-title"><header><div><h2 id="ccswitch-title">导入到 CCSwitch</h2><p>把当前客户端密钥配置到本机 CCSwitch</p></div><button class="icon" title="关闭" @click="closeCCSwitch"><X :size="19" /></button></header><form @submit.prevent="importToCCSwitch"><div class="form-section"><div class="form-stack">
     <label>客户端<select :value="ccswitchApp" @change="changeCCSwitchApp"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select></label>
@@ -2101,7 +2550,7 @@ onBeforeUnmount(() => {
     <p class="form-hint ccswitch-warning">安全提示：当前 CCSwitch 协议需要将密钥交给本机导入器。请仅在受信任设备使用；导入完成后本页会立即清理密钥。网关地址：<code>{{ gatewayBaseURL }}</code></p>
   </div></div><footer><button type="button" class="secondary" @click="closeCCSwitch">取消</button><button class="primary"><Upload :size="16" />打开 CCSwitch</button></footer></form></section></div>
 
-  <div v-if="revealedKey" class="modal-backdrop"><section class="modal secret-modal" role="dialog" aria-modal="true" aria-labelledby="secret-title"><header><div><h2 id="secret-title">客户端密钥已创建</h2><p>仅可在此时复制</p></div></header><div class="secret-body"><p>密钥已隐藏。点击下方区域或复制按钮后立即保存；关闭后无法再次获取。</p><div class="secret-value" title="点击复制密钥" @click="copySecret"><input class="secret-mask" type="password" :value="revealedKey" readonly autocomplete="off" aria-label="已隐藏的客户端密钥，点击复制" @keydown.enter.prevent="copySecret" /><button class="icon" title="复制密钥" @click.stop="copySecret"><Clipboard :size="17" /></button></div></div><footer><button v-if="createdKeyForImport" class="secondary" @click="openCCSwitchFromSecret"><Upload :size="16" />导入 CCSwitch</button><button class="primary" autofocus @click="closeSecret">我已保存</button></footer></section></div>
+  <div v-if="revealedKey" class="modal-backdrop"><section class="modal secret-modal" role="dialog" aria-modal="true" aria-labelledby="secret-title"><header><div><h2 id="secret-title">客户端密钥已创建</h2><p>仅可在此时复制</p></div></header><div class="secret-body"><p>密钥已隐藏。点击下方区域或复制按钮后立即保存；关闭后无法再次获取。</p><div class="secret-value" title="点击复制密钥" @click="copySecret"><input class="secret-mask" type="password" :value="revealedKey" readonly autocomplete="off" aria-label="已隐藏的客户端密钥，点击复制" @keydown.enter.prevent="copySecret" /><button class="icon" title="复制密钥" @click.stop="copySecret"><Clipboard :size="17" /></button></div><button class="text-button config-copy-button" @click="copyClientConfig"><Copy :size="15" />复制 OpenAI / Anthropic 接入配置</button></div><footer><button v-if="createdKeyForImport" class="secondary" @click="openCCSwitchFromSecret"><Upload :size="16" />导入 CCSwitch</button><button class="primary" autofocus @click="closeSecret">我已保存</button></footer></section></div>
 
   <div v-if="channelModal" class="modal-backdrop" @mousedown.self="channelModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="channel-title"><header><div><h2 id="channel-title">添加通知渠道</h2><p>将运行状态发送到外部渠道</p></div><button class="icon" title="关闭" @click="channelModal = false"><X :size="19" /></button></header><form @submit.prevent="saveChannel"><div class="form-section"><div class="form-grid">
     <label>名称<input v-model.trim="channelForm.name" required autofocus placeholder="运维告警" /></label><label>类型<select v-model="channelForm.kind"><option value="email">邮件</option><option value="webhook">Webhook</option></select></label>
