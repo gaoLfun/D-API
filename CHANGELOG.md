@@ -53,6 +53,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Fixed
 
+- Webhook delivery now detects common application-level rejection payloads even
+  when providers return an HTTP 2xx response.
 - Upstream create/update credential handling, conditional NewAPI balance fields,
   fetched-model selection, and model-aware connectivity checks.
 - Client-key copying after creation and CCSwitch imports that use the selected

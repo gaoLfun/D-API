@@ -247,6 +247,10 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 `notification_test` JSON 事件。接口只返回成功或失败状态，不会回显 URL、请求头
 或其他敏感配置；邮件渠道不支持该测试接口。
 
+Webhook 投递必须返回 2xx，且响应 JSON 不能明确表示应用层失败。服务会识别
+`success:false`、`ok:false`、非零 `errcode`，以及不是 `0`/`200`/`ok`/`success`
+的 `code`；这类响应会按投递失败处理，并进入现有的失败记录和重试流程。
+
 告警事件包括 `low_balance`、`balance_unavailable`、`error_rate` 和
 `latency`。规则的窗口至少 60 秒，冷却至少 60 秒；每条规则可绑定一个
 上游。`max_attempts` 位于 1-5，默认 3，控制一次客户端请求最多尝试几个

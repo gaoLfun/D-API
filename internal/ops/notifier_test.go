@@ -33,6 +33,28 @@ func TestWebhookNotifier(t *testing.T) {
 	}
 }
 
+func TestWebhookNotifierRejectsApplicationError(t *testing.T) {
+	for _, body := range []string{
+		`{"errcode":310000,"errmsg":"sign not match"}`,
+		`{"code":999,"msg":"rejected"}`,
+		`{"success":false}`,
+		`{"ok":false}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			notifier := NewWebhookNotifier(WebhookConfig{URL: server.URL}, server.Client())
+			if err := notifier.Notify(context.Background(), Event{Type: "test"}); err == nil {
+				t.Fatal("application-level rejection should return an error")
+			}
+		})
+	}
+}
+
 func TestMultiNotifierAcceptsPartialDelivery(t *testing.T) {
 	delivered := 0
 	notifier := MultiNotifier{

@@ -135,11 +135,55 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 		return fmt.Errorf("send webhook: %w", err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
 	}
+	if webhookResponseRejected(responseBody) {
+		return errors.New("webhook rejected request")
+	}
 	return nil
+}
+
+// Several webhook providers return HTTP 2xx for an application-level failure.
+// Treat only explicit failure fields as rejection so arbitrary successful
+// response bodies remain compatible.
+func webhookResponseRejected(body []byte) bool {
+	var response map[string]json.RawMessage
+	if json.Unmarshal(body, &response) != nil {
+		return false
+	}
+	for _, key := range []string{"success", "ok"} {
+		if raw, ok := response[key]; ok {
+			var value bool
+			if json.Unmarshal(raw, &value) == nil && !value {
+				return true
+			}
+		}
+	}
+	if raw, ok := response["errcode"]; ok && !webhookSuccessCode(raw, false) {
+		return true
+	}
+	if raw, ok := response["code"]; ok && !webhookSuccessCode(raw, true) {
+		return true
+	}
+	return false
+}
+
+func webhookSuccessCode(raw json.RawMessage, allowHTTPStatus bool) bool {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return true
+	}
+	switch value := value.(type) {
+	case float64:
+		return value == 0 || (allowHTTPStatus && value == 200)
+	case string:
+		value = strings.ToLower(strings.TrimSpace(value))
+		return value == "0" || (allowHTTPStatus && value == "200") || value == "ok" || value == "success"
+	default:
+		return true
+	}
 }
 
 func isHopHeader(name string) bool {
