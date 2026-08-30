@@ -94,12 +94,37 @@ func (r AlertRepository) observeBalance(ctx context.Context, rule alerts.Rule) (
 			if record.Balance.Available != nil {
 				observation.Value = *record.Balance.Available
 			}
+			if record.Balance.Status != "ok" || (!record.Balance.Unlimited && record.Balance.Available == nil) {
+				observation.Ignore = true
+				observation.Message = fmt.Sprintf("上游 %s 当前余额状态：%s", record.Name, record.Balance.Status)
+				result = append(result, observation)
+				continue
+			}
 			observation.Active = record.Balance.Status == "ok" && !record.Balance.Unlimited && record.Balance.Available != nil && *record.Balance.Available < threshold
-			observation.Message = fmt.Sprintf("上游 %s 当前余额 %.2f %s，低于阈值 %.2f", record.Name, observation.Value, record.Balance.Currency, threshold)
-		} else {
-			observation.Active = record.Balance.Status == "unavailable"
 			if observation.Active {
+				observation.Message = fmt.Sprintf("上游 %s 当前余额 %.2f %s，低于阈值 %.2f", record.Name, observation.Value, record.Balance.Currency, threshold)
+			} else if record.Balance.Status == "ok" && record.Balance.Unlimited {
+				observation.Message = fmt.Sprintf("上游 %s 余额已恢复，当前为无限额", record.Name)
+				observation.RecoveryMessage = observation.Message
+			} else if record.Balance.Status == "ok" && record.Balance.Available != nil {
+				if observation.Value > threshold {
+					observation.Message = fmt.Sprintf("上游 %s 当前余额 %.2f %s，已高于阈值 %.2f", record.Name, observation.Value, record.Balance.Currency, threshold)
+				} else {
+					observation.Message = fmt.Sprintf("上游 %s 当前余额 %.2f %s，已达到阈值 %.2f", record.Name, observation.Value, record.Balance.Currency, threshold)
+				}
+				observation.RecoveryMessage = observation.Message
+			} else {
+				observation.Message = fmt.Sprintf("上游 %s 当前余额状态：%s", record.Name, record.Balance.Status)
+			}
+		} else {
+			switch record.Balance.Status {
+			case "unavailable":
+				observation.Active = true
 				observation.Value = 1
+			case "ok":
+				observation.RecoveryMessage = fmt.Sprintf("上游 %s 余额查询已恢复", record.Name)
+			default:
+				observation.Ignore = true
 			}
 			observation.Message = fmt.Sprintf("上游 %s 余额查询状态：%s", record.Name, record.Balance.Status)
 		}

@@ -106,13 +106,13 @@ type WebhookNotifier struct {
 var webhookTimezone = time.FixedZone("UTC+8", 8*60*60)
 
 func NewWebhookNotifier(config WebhookConfig, client *http.Client) *WebhookNotifier {
+	if config.Timeout <= 0 {
+		config.Timeout = 10 * time.Second
+	}
 	if client == nil {
 		client = netguard.NewHTTPClient(config.Timeout)
 	}
 	client = withoutRedirects(client)
-	if config.Timeout <= 0 {
-		config.Timeout = 10 * time.Second
-	}
 	return &WebhookNotifier{config: config, client: client}
 }
 
@@ -167,6 +167,9 @@ func webhookPayload(provider, rawURL string, event Event) ([]byte, error) {
 	case "discord":
 		return json.Marshal(map[string]string{"content": text})
 	default:
+		if !event.At.IsZero() {
+			event.At = event.At.In(webhookTimezone)
+		}
 		return json.Marshal(event)
 	}
 }
@@ -203,7 +206,7 @@ func IsWebhookProvider(provider string) bool {
 }
 
 func webhookEventText(event Event) string {
-	lines := []string{"【D-API】通知", "事件：" + webhookEventLabel(event.Type)}
+	lines := []string{"【D-API】通知", "事件：" + webhookEventLabelForEvent(event)}
 	if event.UpstreamName != "" {
 		lines = append(lines, "上游："+event.UpstreamName)
 	}
@@ -285,6 +288,18 @@ func webhookEventLabel(eventType string) string {
 	}
 }
 
+func webhookEventLabelForEvent(event Event) string {
+	if event.State == "resolved" {
+		switch event.Type {
+		case "low_balance":
+			return "上游余额恢复"
+		case "balance_unavailable":
+			return "上游余额查询恢复"
+		}
+	}
+	return webhookEventLabel(event.Type)
+}
+
 func webhookStateLabel(state string) string {
 	labels := map[string]string{
 		"healthy":           "正常",
@@ -293,6 +308,8 @@ func webhookStateLabel(state string) string {
 		"failed":            "失败",
 		"firing":            "触发",
 		"resolved":          "已恢复",
+		"suspended":         "已暂停路由",
+		"resumed":           "已恢复路由",
 		"active":            "已启用",
 		"paused":            "已暂停",
 		"balance_suspended": "已暂停路由",

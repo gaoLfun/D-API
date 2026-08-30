@@ -46,6 +46,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Changed
 
+- Bounded and coalesced pending operational notifications, with up to three
+  in-task retries for persisted security and state-transition events.
 - Separated notification and system-settings views in the admin console, with
   dedicated controls for routing attempts and administrator password changes.
 - Improved upstream bulk-selection feedback with accessible indeterminate states
@@ -63,6 +65,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Fixed
 
+- Alert state now ignores unknown balance observations, sends explicit recovery
+  messages, and preserves failed firing or recovery notifications for retry.
 - Webhook delivery now detects common application-level rejection payloads even
   when providers return an HTTP 2xx response.
 - Upstream create/update credential handling, conditional NewAPI balance fields,

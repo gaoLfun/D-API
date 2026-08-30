@@ -157,6 +157,129 @@ func TestEngineNotifiesRecovery(t *testing.T) {
 	}
 }
 
+func TestEngineUsesRecoveryMessageWithoutRefiring(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventLowBalance, Enabled: true, Cooldown: time.Hour}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true, Message: "余额低于阈值", UpstreamID: 7, UpstreamName: "primary"}}},
+		states:       make(map[string]State),
+	}
+	var events []ops.Event
+	engine := newTestEngine(repository, now, &events)
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	repository.observations[1][0] = Observation{
+		Key: "upstream:7", Active: false, Message: "当前余额 10.00 USD，已高于阈值 5.00",
+		RecoveryMessage: "当前余额 10.00 USD，已高于阈值 5.00", UpstreamID: 7, UpstreamName: "primary",
+	}
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].State != "firing" || events[1].State != "resolved" || events[1].Message != "当前余额 10.00 USD，已高于阈值 5.00" {
+		t.Fatalf("events=%#v", events)
+	}
+}
+
+func TestEngineKeepsStateWhenObservationIsIgnored(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventLowBalance, Enabled: true}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Ignore: true, Message: "余额查询暂不可用"}}},
+		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true, NotificationCount: 2}},
+	}
+	var events []ops.Event
+	if err := newTestEngine(repository, now, &events).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := repository.states[stateKey(1, "upstream:7")]
+	if len(events) != 0 || !state.Active || state.NotificationCount != 2 {
+		t.Fatalf("events=%#v state=%#v", events, state)
+	}
+}
+
+func TestEngineDoesNotResolveOnUnknownObservation(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventBalanceUnavailable, Enabled: true}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Ignore: true, Message: "余额查询状态：unknown"}}},
+		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true}},
+	}
+	var events []ops.Event
+	if err := newTestEngine(repository, now, &events).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 || !repository.states[stateKey(1, "upstream:7")].Active {
+		t.Fatalf("events=%#v state=%#v", events, repository.states[stateKey(1, "upstream:7")])
+	}
+}
+
+func TestEnginePersistsFailedNotificationForCooldownRetry(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventLatency, Enabled: true, Cooldown: time.Hour, MaxNotifications: 2}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true}}},
+		states:       make(map[string]State),
+	}
+	attempts := 0
+	engine := NewEngine(repository, ops.NotifierFunc(func(context.Context, ops.Event) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("webhook unavailable")
+		}
+		return nil
+	}))
+	engine.now = func() time.Time { return now }
+	if err := engine.RunOnce(context.Background()); err == nil {
+		t.Fatal("first notification should fail")
+	}
+	state := repository.states[stateKey(1, "upstream:7")]
+	if !state.Active || state.NotificationCount != 1 || state.LastNotifiedAt == nil {
+		t.Fatalf("failed notification state = %#v", state)
+	}
+	engine.now = func() time.Time { return now.Add(time.Hour) }
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || repository.states[stateKey(1, "upstream:7")].NotificationCount != 2 {
+		t.Fatalf("attempts=%d state=%#v", attempts, repository.states[stateKey(1, "upstream:7")])
+	}
+}
+
+func TestEngineKeepsRecoveryPendingWhenNotificationFails(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	repository := &testRepository{
+		rules:        []Rule{{ID: 1, Event: EventLowBalance, Enabled: true, Cooldown: time.Hour}},
+		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: false}}},
+		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true}},
+	}
+	attempts := 0
+	engine := NewEngine(repository, ops.NotifierFunc(func(context.Context, ops.Event) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("webhook unavailable")
+		}
+		return nil
+	}))
+	engine.now = func() time.Time { return now }
+	if err := engine.RunOnce(context.Background()); err == nil {
+		t.Fatal("first recovery notification should fail")
+	}
+	if !repository.states[stateKey(1, "upstream:7")].Active {
+		t.Fatal("failed recovery should remain pending")
+	}
+	engine.now = func() time.Time { return now.Add(time.Hour) }
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || repository.states[stateKey(1, "upstream:7")].Active {
+		t.Fatalf("attempts=%d state=%#v", attempts, repository.states[stateKey(1, "upstream:7")])
+	}
+}
+
 func TestEngineContinuesAfterRuleFailure(t *testing.T) {
 	repository := &testRepository{
 		rules: []Rule{

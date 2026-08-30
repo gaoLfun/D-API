@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -223,5 +224,28 @@ func TestMonitorQueuesNewTransitionBehindFailedNotification(t *testing.T) {
 	}
 	if len(monitor.pending[1]) != 0 || len(delivered) != 2 || delivered[0] != "upstream_health" || delivered[1] != "upstream_balance_protection" {
 		t.Fatalf("delivered=%#v pending=%#v", delivered, monitor.pending[1])
+	}
+}
+
+func TestMonitorBoundsAndCoalescesPendingTransitions(t *testing.T) {
+	monitor := NewMonitor(nil, nil, nil, MonitorConfig{Concurrency: 1})
+	for index := 0; index < maxPendingEventsPerUpstream+4; index++ {
+		monitor.setPending(Event{Type: "event-" + strconv.Itoa(index), UpstreamID: 1})
+	}
+	if got := len(monitor.pending[1]); got != maxPendingEventsPerUpstream {
+		t.Fatalf("pending length = %d, want %d", got, maxPendingEventsPerUpstream)
+	}
+	monitor.setPending(Event{Type: "event-" + strconv.Itoa(maxPendingEventsPerUpstream+2), State: "latest", UpstreamID: 1})
+	found := false
+	for _, event := range monitor.pending[1] {
+		if event.Type == "event-"+strconv.Itoa(maxPendingEventsPerUpstream+2) {
+			found = true
+			if event.State != "latest" {
+				t.Fatalf("coalesced state = %q", event.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("coalesced event was dropped")
 	}
 }

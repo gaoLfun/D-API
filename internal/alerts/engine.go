@@ -32,12 +32,14 @@ type Rule struct {
 }
 
 type Observation struct {
-	Key          string  `json:"key"`
-	Active       bool    `json:"active"`
-	Value        float64 `json:"value"`
-	Message      string  `json:"message"`
-	UpstreamID   int64   `json:"upstream_id,omitempty"`
-	UpstreamName string  `json:"upstream_name,omitempty"`
+	Key             string  `json:"key"`
+	Active          bool    `json:"active"`
+	Ignore          bool    `json:"ignore,omitempty"`
+	Value           float64 `json:"value"`
+	Message         string  `json:"message"`
+	RecoveryMessage string  `json:"recovery_message,omitempty"`
+	UpstreamID      int64   `json:"upstream_id,omitempty"`
+	UpstreamName    string  `json:"upstream_name,omitempty"`
 }
 
 type State struct {
@@ -111,6 +113,9 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 		keys := make([]string, 0, len(observations))
 		for _, observation := range observations {
 			keys = append(keys, observation.Key)
+			if observation.Ignore {
+				continue
+			}
 			if err := e.handle(ctx, rule, observation); err != nil {
 				errs = append(errs, fmt.Errorf("rule %d observation %q: %w", rule.ID, observation.Key, err))
 			}
@@ -151,18 +156,40 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 		}
 		if resolved {
 			event.State, event.Previous = "resolved", "active"
-		}
-		if e.Notifier != nil {
-			if err := e.Notifier.Notify(ctx, event); err != nil {
-				return fmt.Errorf("notify: %w", err)
+			if observation.RecoveryMessage != "" {
+				event.Message = observation.RecoveryMessage
 			}
 		}
+		var notifyErr error
+		if e.Notifier != nil {
+			notifyErr = e.Notifier.Notify(ctx, event)
+		}
 		state.LastNotifiedAt = &now
-		if resolved {
+		if resolved && notifyErr == nil {
 			state.NotificationCount = 0
 		} else {
 			state.NotificationCount++
 		}
+		if notifyErr != nil {
+			// Keep an active state for failed recoveries so the recovery is retried
+			// after the cooldown instead of being lost.
+			state.Active = true
+		} else {
+			state.Active = observation.Active
+		}
+		state.Value = observation.Value
+		state.Message = observation.Message
+		state.LastObservedAt = now
+		if err := e.Repository.SaveState(ctx, rule.ID, observation.Key, state); err != nil {
+			if notifyErr != nil {
+				return errors.Join(fmt.Errorf("notify: %w", notifyErr), fmt.Errorf("save state: %w", err))
+			}
+			return fmt.Errorf("save state: %w", err)
+		}
+		if notifyErr != nil {
+			return fmt.Errorf("notify: %w", notifyErr)
+		}
+		return nil
 	}
 	state.Active = observation.Active
 	state.Value = observation.Value

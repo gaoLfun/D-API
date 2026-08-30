@@ -158,7 +158,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			slog.Error("failed login audit write failed", "error", err)
 		}
 		if blocked {
-			s.notifySecurity(ops.Event{Type: "login_failure", State: "firing", Message: "administrator login failed repeatedly from " + ip, At: time.Now()})
+			s.notifySecurity(ops.Event{Type: "login_failure", State: "firing", Message: "管理员登录失败次数过多，来源 IP：" + ip, At: time.Now()})
 		}
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
@@ -188,7 +188,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		slog.Error("login audit write failed", "error", err)
 	}
 	if knownIPErr == nil && !knownIP {
-		s.notifySecurity(ops.Event{Type: "new_login_ip", State: "firing", Message: "administrator logged in from a new IP: " + ip, At: time.Now()})
+		s.notifySecurity(ops.Event{Type: "new_login_ip", State: "firing", Message: "管理员从新的 IP 登录：" + ip, At: time.Now()})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"username": admin.Username})
 }
@@ -228,7 +228,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "admin.password_changed", "admin", admin.ID, nil)
-	s.notifySecurity(ops.Event{Type: "password_changed", State: "firing", Message: "administrator password was changed", At: time.Now()})
+	s.notifySecurity(ops.Event{Type: "password_changed", State: "firing", Message: "管理员密码已修改", At: time.Now()})
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1, HttpOnly: true, Secure: isHTTPS(r), SameSite: http.SameSiteStrictMode})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1031,6 +1031,7 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		Message: "D-API Webhook 连通性测试",
 		At:      time.Now().UTC(),
 	}); err != nil {
+		slog.Warn("webhook test failed", "channel_id", id, "provider", config.Provider, "error", err)
 		writeError(w, http.StatusBadGateway, "channel_test_failed", "Webhook 测试失败，请检查地址、响应状态和网络策略")
 		return
 	}
@@ -1393,11 +1394,22 @@ func (s *Server) notifyPersistedEvent(event ops.Event) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := s.notifier.Notify(ctx, event); err != nil {
-			slog.Error("event notification failed", "event", event.Type, "error", err)
+		var lastErr error
+		for attempt, delay := 1, time.Second; attempt <= 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := s.notifier.Notify(ctx, event)
+			cancel()
+			if err == nil {
+				return
+			}
+			lastErr = err
+			if attempt < 3 {
+				timer := time.NewTimer(delay)
+				<-timer.C
+				delay *= 2
+			}
 		}
+		slog.Error("event notification failed", "event", event.Type, "attempts", 3, "error", lastErr)
 	}()
 }
 

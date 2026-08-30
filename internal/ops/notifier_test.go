@@ -106,6 +106,39 @@ func TestWebhookEventTextUsesUTC8(t *testing.T) {
 	}
 }
 
+func TestGenericWebhookPayloadUsesUTC8(t *testing.T) {
+	body, err := webhookPayload("generic", "", Event{
+		Type: "notification_test",
+		At:   time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload Event
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload.At.Format("2006-01-02 15:04:05 -0700"); got != "2026-08-29 20:00:00 +0800" {
+		t.Fatalf("generic webhook time = %q", got)
+	}
+}
+
+func TestWebhookEventTextUsesRecoveryLabel(t *testing.T) {
+	text := webhookEventText(Event{
+		Type: "low_balance", State: "resolved", Previous: "firing",
+		UpstreamName: "primary", Message: "当前余额 10.00 USD，已高于阈值 5.00",
+	})
+	if !strings.Contains(text, "事件：上游余额恢复") || strings.Contains(text, "事件：上游余额不足") {
+		t.Fatalf("text = %q", text)
+	}
+	if !strings.Contains(text, "详情：当前余额 10.00 USD，已高于阈值 5.00") {
+		t.Fatalf("recovery detail missing: %q", text)
+	}
+	if got := webhookStateLabel("resumed"); got != "已恢复路由（resumed）" {
+		t.Fatalf("resumed label = %q", got)
+	}
+}
+
 func mustJSON(event Event) []byte {
 	body, err := json.Marshal(event)
 	if err != nil {

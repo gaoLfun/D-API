@@ -48,6 +48,8 @@ type Monitor struct {
 	pending    map[int64][]Event
 }
 
+const maxPendingEventsPerUpstream = 16
+
 func NewMonitor(repository Repository, prober ProbeService, notifier Notifier, config MonitorConfig) *Monitor {
 	if config.HealthEvery <= 0 {
 		config.HealthEvery = 30 * time.Second
@@ -146,8 +148,20 @@ func (m *Monitor) retryPending(ctx context.Context, upstreamID int64) error {
 
 func (m *Monitor) setPending(event Event) {
 	m.pendingMu.Lock()
-	m.pending[event.UpstreamID] = append(m.pending[event.UpstreamID], event)
-	m.pendingMu.Unlock()
+	defer m.pendingMu.Unlock()
+	events := m.pending[event.UpstreamID]
+	// Keep only the latest pending transition for each event type.
+	for index := range events {
+		if events[index].Type == event.Type {
+			events[index] = event
+			m.pending[event.UpstreamID] = events
+			return
+		}
+	}
+	if len(events) >= maxPendingEventsPerUpstream {
+		events = events[len(events)-maxPendingEventsPerUpstream+1:]
+	}
+	m.pending[event.UpstreamID] = append(events, event)
 }
 
 func (m *Monitor) ackPending(upstreamID int64, count int) {
