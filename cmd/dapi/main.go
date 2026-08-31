@@ -59,7 +59,8 @@ func run() error {
 	mux := http.NewServeMux()
 	prober := ops.NewProber(nil, 10*time.Second)
 	operations := app.Operations{Store: db, Prober: prober}
-	notifier := app.ChannelNotifier{Store: db}
+	delivery := app.ChannelNotifier{Store: db}
+	notifier := app.NewOutboxNotifier(db)
 	httpapi.New(db, cfg, operations, notifier).Register(mux)
 	mux.Handle("/v1/", gateway.NewSecureHandler(app.GatewayRepository{Store: db}, gateway.Limits{
 		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
@@ -87,6 +88,7 @@ func run() error {
 			slog.Error("operations monitor stopped", "error", err)
 		}
 	}()
+	go app.RunNotificationWorker(ctx, db, delivery)
 	alertEngine := alerts.NewEngine(app.AlertRepository{Store: db}, notifier)
 	go func() {
 		if err := alertEngine.Run(ctx, time.Minute); err != nil && ctx.Err() == nil {

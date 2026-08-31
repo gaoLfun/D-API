@@ -39,6 +39,8 @@ All notable changes to D-API will be documented in this file. The format is base
   login IPs, with persistent per-rule notification caps and recovery notices.
 - Localized webhook event labels and UTC+8 timestamps, including DingTalk
   Markdown formatting for operational alerts.
+- Durable PostgreSQL notification outbox delivery with event aggregation,
+  per-channel retries, and dead-letter retention after five attempts.
 - Global/per-key concurrency limits, per-key request-rate limits, and a maximum
   gateway request lifetime.
 - Management API, troubleshooting guide, documentation index, release guide,
@@ -46,6 +48,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Changed
 
+- Alert latency observations now average each upstream attempt and remain
+  unknown when the window has no request samples.
 - Bounded and coalesced pending operational notifications, with up to three
   in-task retries for persisted security and state-transition events.
 - Separated notification and system-settings views in the admin console, with

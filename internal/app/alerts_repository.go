@@ -154,7 +154,7 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 				AVG(duration_ms) AS latency
 			FROM attempts GROUP BY upstream_id
 		)
-		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),COALESCE(m.latency,0)
+		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),m.latency
 		FROM upstreams u LEFT JOIN metrics m ON m.upstream_id=u.id
 		WHERE u.enabled AND ($2=0 OR u.id=$2)
 			AND ($2<>0 OR NOT EXISTS (SELECT 1 FROM alert_rules ar WHERE ar.event=$3 AND ar.upstream_id=u.id AND ar.enabled))
@@ -167,21 +167,41 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 	for rows.Next() {
 		var id, count int64
 		var name string
-		var errorRate, latency float64
+		var errorRate float64
+		var latency sql.NullFloat64
 		if err := rows.Scan(&id, &name, &count, &errorRate, &latency); err != nil {
 			return nil, err
 		}
 		value := errorRate
 		active := count >= 5 && errorRate >= threshold(rule, 20)
 		message := fmt.Sprintf("上游 %s 在 %d 秒内错误率为 %.1f%%", name, window, errorRate)
+		recoveryMessage := ""
 		if rule.Event == alerts.EventLatency {
-			value = latency
-			active = count > 0 && latency >= threshold(rule, 30000)
-			message = fmt.Sprintf("上游 %s 在 %d 秒内平均延迟 %.0fms", name, window, latency)
+			if count == 0 || !latency.Valid {
+				result = append(result, alerts.Observation{
+					Key: "upstream:" + strconv.FormatInt(id, 10), Ignore: true,
+					Message:    fmt.Sprintf("上游 %s 最近 %d 秒内没有可用请求样本，暂不判断延迟", name, window),
+					UpstreamID: id, UpstreamName: name,
+				})
+				continue
+			}
+			value = latency.Float64
+			latencyThreshold := threshold(rule, 30000)
+			active = latency.Float64 >= latencyThreshold
+			latencyText := fmt.Sprintf("%.0fms", latency.Float64)
+			if latency.Float64 < 1 {
+				latencyText = "<1ms"
+			}
+			if active {
+				message = fmt.Sprintf("上游 %s 最近 %d 秒收到 %d 次请求尝试，平均延迟 %s，达到阈值 %.0fms", name, window, count, latencyText, latencyThreshold)
+			} else {
+				message = fmt.Sprintf("上游 %s 最近 %d 秒收到 %d 次请求尝试，平均延迟 %s，低于阈值 %.0fms", name, window, count, latencyText, latencyThreshold)
+				recoveryMessage = message
+			}
 		}
 		result = append(result, alerts.Observation{
 			Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Value: value,
-			Message: message, UpstreamID: id, UpstreamName: name,
+			Message: message, RecoveryMessage: recoveryMessage, UpstreamID: id, UpstreamName: name,
 		})
 	}
 	return result, rows.Err()

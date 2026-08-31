@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/smtp"
@@ -207,8 +208,12 @@ func IsWebhookProvider(provider string) bool {
 
 func webhookEventText(event Event) string {
 	lines := []string{"【D-API】通知", "事件：" + webhookEventLabelForEvent(event)}
+	lines = append(lines, "级别："+webhookSeverityLabel(event))
 	if event.UpstreamName != "" {
 		lines = append(lines, "上游："+event.UpstreamName)
+	}
+	if event.Count > 1 {
+		lines = append(lines, fmt.Sprintf("数量：%d 条", event.Count))
 	}
 	if event.State != "" {
 		lines = append(lines, "状态："+webhookStateLabel(event.State))
@@ -300,6 +305,23 @@ func webhookEventLabelForEvent(event Event) string {
 	return webhookEventLabel(event.Type)
 }
 
+func webhookSeverityLabel(event Event) string {
+	if event.State == "resolved" {
+		return "恢复"
+	}
+	if event.Severity != "" {
+		return event.Severity
+	}
+	switch event.Type {
+	case "login_failure", "new_login_ip", "password_changed":
+		return "安全"
+	case "upstream_health", "upstream_balance_protection":
+		return "严重"
+	default:
+		return "告警"
+	}
+}
+
 func webhookStateLabel(state string) string {
 	labels := map[string]string{
 		"healthy":           "正常",
@@ -316,7 +338,7 @@ func webhookStateLabel(state string) string {
 		"balance_resumed":   "已恢复路由",
 	}
 	if label, ok := labels[state]; ok {
-		return label + "（" + state + "）"
+		return label
 	}
 	return state
 }
@@ -444,9 +466,11 @@ func (n *SMTPNotifier) Notify(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	payload, _ := json.MarshalIndent(event, "", "  ")
-	subject := cleanHeader(fmt.Sprintf("[D-API] %s %s", event.UpstreamName, event.State))
-	message := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n", cleanHeader(n.config.From), cleanHeader(strings.Join(n.config.To, ", ")), subject, payload)
+	// 邮件和各类 Webhook 使用同一套中文正文与 UTC+8 时间，避免不同渠道展示不一致。
+	body := webhookEventText(event)
+	subjectText := fmt.Sprintf("[D-API] %s · %s", webhookEventLabelForEvent(event), webhookSeverityLabel(event))
+	subject := mime.QEncoding.Encode("UTF-8", cleanHeader(subjectText))
+	message := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n", cleanHeader(n.config.From), cleanHeader(strings.Join(n.config.To, ", ")), subject, body)
 	if _, err := writer.Write([]byte(message)); err != nil {
 		writer.Close()
 		return err

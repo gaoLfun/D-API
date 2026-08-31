@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -135,69 +136,109 @@ func (n ChannelNotifier) Notify(ctx context.Context, event ops.Event) error {
 		return err
 	}
 	notifiers := make(ops.MultiNotifier, 0, len(channels))
+	var configErrors []error
 	for _, channel := range channels {
 		if !channel.Enabled {
 			continue
 		}
-		switch channel.Kind {
-		case "webhook":
-			var config struct {
-				URL      string            `json:"url"`
-				Provider string            `json:"provider"`
-				Headers  map[string]string `json:"headers"`
-			}
-			if json.Unmarshal(channel.Config, &config) == nil && config.URL != "" {
-				notifiers = append(notifiers, ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Provider: config.Provider, Headers: config.Headers}, nil))
-			}
-		case "email":
-			var config struct {
-				Address     string          `json:"address"`
-				SMTPHost    string          `json:"smtp_host"`
-				SMTPPort    int             `json:"smtp_port"`
-				Username    string          `json:"username"`
-				Password    string          `json:"password"`
-				From        string          `json:"from"`
-				To          json.RawMessage `json:"to"`
-				ImplicitTLS bool            `json:"implicit_tls"`
-			}
-			if json.Unmarshal(channel.Config, &config) == nil {
-				if config.Address == "" && config.SMTPHost != "" {
-					config.Address = net.JoinHostPort(config.SMTPHost, strconv.Itoa(config.SMTPPort))
-				}
-				var recipients []string
-				if len(config.To) > 0 && config.To[0] == '[' {
-					_ = json.Unmarshal(config.To, &recipients)
-				} else {
-					var recipientList string
-					if json.Unmarshal(config.To, &recipientList) == nil {
-						for _, recipient := range strings.Split(recipientList, ",") {
-							if recipient = strings.TrimSpace(recipient); recipient != "" {
-								recipients = append(recipients, recipient)
-							}
-						}
-					}
-				}
-				if config.From == "" {
-					config.From = config.Username
-				}
-				if config.From == "" && len(recipients) > 0 {
-					config.From = recipients[0]
-				}
-				if config.Address == "" || config.From == "" || len(recipients) == 0 {
-					continue
-				}
-				notifiers = append(notifiers, ops.NewSMTPNotifier(ops.SMTPConfig{
-					Address: config.Address, Username: config.Username, Password: config.Password,
-					From: config.From, To: recipients, ImplicitTLS: config.ImplicitTLS,
-				}))
-			}
+		notifier, configErr := n.notifierForChannel(channel)
+		if configErr != nil {
+			configErrors = append(configErrors, fmt.Errorf("channel %d: %w", channel.ID, configErr))
+			continue
+		}
+		if notifier != nil {
+			notifiers = append(notifiers, notifier)
 		}
 	}
-	return notifiers.Notify(ctx, event)
+	if err := notifiers.Notify(ctx, event); err != nil {
+		configErrors = append(configErrors, err)
+	}
+	return errors.Join(configErrors...)
+}
+
+// NotifyChannel is used by the outbox worker so every channel has an
+// independent retry lifecycle. Deleted or disabled channels are complete by
+// design: they are no longer a valid destination for an old event.
+func (n ChannelNotifier) NotifyChannel(ctx context.Context, channelID int64, event ops.Event) error {
+	channel, err := n.Store.ChannelByID(ctx, channelID)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && !channel.Enabled) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	notifier, err := n.notifierForChannel(channel)
+	if err != nil {
+		return err
+	}
+	if notifier == nil {
+		return errors.New("notification channel is not configured")
+	}
+	return notifier.Notify(ctx, event)
+}
+
+func (n ChannelNotifier) notifierForChannel(channel store.NotificationChannel) (ops.Notifier, error) {
+	switch channel.Kind {
+	case "webhook":
+		var config struct {
+			URL      string            `json:"url"`
+			Provider string            `json:"provider"`
+			Headers  map[string]string `json:"headers"`
+		}
+		if err := json.Unmarshal(channel.Config, &config); err != nil || strings.TrimSpace(config.URL) == "" {
+			return nil, errors.New("invalid webhook configuration")
+		}
+		return ops.NewWebhookNotifier(ops.WebhookConfig{URL: config.URL, Provider: config.Provider, Headers: config.Headers}, nil), nil
+	case "email":
+		var config struct {
+			Address     string          `json:"address"`
+			SMTPHost    string          `json:"smtp_host"`
+			SMTPPort    int             `json:"smtp_port"`
+			Username    string          `json:"username"`
+			Password    string          `json:"password"`
+			From        string          `json:"from"`
+			To          json.RawMessage `json:"to"`
+			ImplicitTLS bool            `json:"implicit_tls"`
+		}
+		if err := json.Unmarshal(channel.Config, &config); err != nil {
+			return nil, errors.New("invalid email configuration")
+		}
+		if config.Address == "" && config.SMTPHost != "" {
+			config.Address = net.JoinHostPort(config.SMTPHost, strconv.Itoa(config.SMTPPort))
+		}
+		var recipients []string
+		if len(config.To) > 0 && config.To[0] == '[' {
+			_ = json.Unmarshal(config.To, &recipients)
+		} else {
+			var recipientList string
+			if json.Unmarshal(config.To, &recipientList) == nil {
+				for _, recipient := range strings.Split(recipientList, ",") {
+					if recipient = strings.TrimSpace(recipient); recipient != "" {
+						recipients = append(recipients, recipient)
+					}
+				}
+			}
+		}
+		if config.From == "" {
+			config.From = config.Username
+		}
+		if config.From == "" && len(recipients) > 0 {
+			config.From = recipients[0]
+		}
+		if config.Address == "" || config.From == "" || len(recipients) == 0 {
+			return nil, errors.New("invalid email configuration")
+		}
+		return ops.NewSMTPNotifier(ops.SMTPConfig{
+			Address: config.Address, Username: config.Username, Password: config.Password,
+			From: config.From, To: recipients, ImplicitTLS: config.ImplicitTLS,
+		}), nil
+	default:
+		return nil, fmt.Errorf("unsupported notification channel kind %q", channel.Kind)
+	}
 }
 
 func NewMonitor(database *store.Store, prober *ops.Prober, healthEvery, balanceEvery time.Duration) *ops.Monitor {
-	notifier := ops.NewCooldownNotifier(ChannelNotifier{Store: database}, 30*time.Minute)
+	notifier := ops.NewCooldownNotifier(NewOutboxNotifier(database), 30*time.Minute)
 	return ops.NewMonitor(OpsRepository{Store: database}, prober, notifier, ops.MonitorConfig{
 		HealthEvery: healthEvery, BalanceEvery: balanceEvery, Concurrency: 8,
 	})

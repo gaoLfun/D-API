@@ -62,11 +62,11 @@ func TestWebhookPayloadAdapters(t *testing.T) {
 		provider string
 		want     string
 	}{
-		{"dingtalk", `{"markdown":{"text":"【D-API】通知\n\n**事件：**上游健康状态变更\n\n**上游：**primary\n\n**状态：**异常（unhealthy）\n\n**之前：**正常（healthy）\n\n**详情：**上游状态已从正常（healthy）变更为异常（unhealthy）","title":"D-API 通知"},"msgtype":"markdown"}`},
-		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"},"msg_type":"text"}`},
-		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}}`},
-		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}`},
-		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n上游：primary\n状态：异常（unhealthy）\n之前：正常（healthy）\n详情：上游状态已从正常（healthy）变更为异常（unhealthy）"}`},
+		{"dingtalk", `{"markdown":{"text":"【D-API】通知\n\n**事件：**上游健康状态变更\n\n**级别：**严重\n\n**上游：**primary\n\n**状态：**异常\n\n**之前：**正常\n\n**详情：**上游状态已从正常变更为异常","title":"D-API 通知"},"msgtype":"markdown"}`},
+		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"},"msg_type":"text"}`},
+		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}}`},
+		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}`},
+		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
@@ -134,7 +134,7 @@ func TestWebhookEventTextUsesRecoveryLabel(t *testing.T) {
 	if !strings.Contains(text, "详情：当前余额 10.00 USD，已高于阈值 5.00") {
 		t.Fatalf("recovery detail missing: %q", text)
 	}
-	if got := webhookStateLabel("resumed"); got != "已恢复路由（resumed）" {
+	if got := webhookStateLabel("resumed"); got != "已恢复路由" {
 		t.Fatalf("resumed label = %q", got)
 	}
 }

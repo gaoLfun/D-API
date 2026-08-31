@@ -97,8 +97,13 @@ but the committed stream cannot be replayed safely.
   per day and updates the managed OpenAI, Anthropic, and Google Gemini profiles
   atomically. Custom profiles remain user-managed and provide the fallback for
   models not covered by LiteLLM.
-- Alert rules are evaluated once per minute and can deliver email or webhook
-  notifications.
+- Alert rules are evaluated once per minute and enqueue email or webhook
+  notifications in the PostgreSQL outbox. A worker polls every five seconds,
+  waits ten seconds to aggregate up to 50 ready jobs, and groups events by
+  type, state, severity, and channel. Each channel retries failed deliveries
+  after 10 seconds, one minute, and five minutes, then keeps the job as a
+  dead letter after five attempts. Latency alerts average each upstream
+  attempt in the observation window and remain unknown when no samples exist.
 - Request logs older than the configured retention are removed once per day.
   Daily usage aggregates, audit entries, and alert events are retained for the
   configured `DAPI_LOG_RETENTION` window and removed in bounded batches.

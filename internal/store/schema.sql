@@ -264,6 +264,20 @@ CREATE TABLE IF NOT EXISTS alert_events (
 );
 CREATE INDEX IF NOT EXISTS alert_events_created_idx ON alert_events(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id BIGINT REFERENCES notification_channels(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error TEXT NOT NULL DEFAULT '',
+    dead_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS channel_id BIGINT REFERENCES notification_channels(id) ON DELETE CASCADE;
+ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS dead_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS notification_outbox_pending_idx ON notification_outbox(next_attempt_at, id);
+
 CREATE TABLE IF NOT EXISTS alert_states (
     rule_id BIGINT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
     observation_key TEXT NOT NULL,

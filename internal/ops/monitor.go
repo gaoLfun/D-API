@@ -15,6 +15,8 @@ type Event struct {
 	Type         string    `json:"type"`
 	State        string    `json:"state"`
 	Previous     string    `json:"previous,omitempty"`
+	Severity     string    `json:"severity,omitempty"`
+	Count        int       `json:"count,omitempty"`
 	UpstreamID   int64     `json:"upstream_id,omitempty"`
 	UpstreamName string    `json:"upstream_name,omitempty"`
 	Message      string    `json:"message"`
