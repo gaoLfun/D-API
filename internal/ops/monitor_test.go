@@ -118,32 +118,26 @@ func TestMonitorEmitsHealthTransition(t *testing.T) {
 	}
 }
 
-func TestMonitorUsesPersistedHealthStateAndRetriesNotification(t *testing.T) {
+func TestMonitorDoesNotNotifyDegradedHealth(t *testing.T) {
 	repository := &monitorRepository{
 		upstreams: []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "healthy"}},
 		status:    "degraded",
 	}
 	prober := monitorProber{health: Health{Status: "unhealthy", CheckedAt: time.Now(), Error: "HTTP 503"}}
-	attempts := 0
+	notifications := 0
 	monitor := NewMonitor(repository, prober, NotifierFunc(func(context.Context, Event) error {
-		attempts++
-		if attempts == 1 {
-			return errors.New("webhook unavailable")
-		}
-		return nil
+		notifications++
+		return errors.New("degraded notification should not be sent")
 	}), MonitorConfig{Concurrency: 1})
 
-	if err := monitor.RunHealth(context.Background()); err == nil {
-		t.Fatal("first notification should fail")
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if len(repository.events) != 1 || repository.events[0].State != "degraded" {
 		t.Fatalf("events = %#v", repository.events)
 	}
-	if err := monitor.RunHealth(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if attempts != 2 || len(repository.events) != 1 {
-		t.Fatalf("attempts=%d events=%#v", attempts, repository.events)
+	if notifications != 0 {
+		t.Fatalf("notifications=%d", notifications)
 	}
 }
 

@@ -48,6 +48,8 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Changed
 
+- Increased the default upstream first-byte timeout to 180 seconds for longer
+  model generations, and stopped pushing transient degraded health states.
 - Alert latency observations now average each upstream attempt and remain
   unknown when the window has no request samples.
 - Bounded and coalesced pending operational notifications, with up to three

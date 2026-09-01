@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
     models_locked BOOLEAN NOT NULL DEFAULT FALSE,
     model_aliases JSONB NOT NULL DEFAULT '{}',
     connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
-    first_byte_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+    first_byte_timeout_ms INTEGER NOT NULL DEFAULT 180000,
     idle_timeout_ms INTEGER NOT NULL DEFAULT 300000,
     failure_threshold INTEGER NOT NULL DEFAULT 3,
     cooldown_seconds INTEGER NOT NULL DEFAULT 60,
@@ -57,6 +57,7 @@ ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT 
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_protection_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_suspended BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS zero_balance_checks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE upstreams ALTER COLUMN first_byte_timeout_ms SET DEFAULT 180000;
 
 CREATE TABLE IF NOT EXISTS pricing_profiles (
     id BIGSERIAL PRIMARY KEY,

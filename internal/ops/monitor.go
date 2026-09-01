@@ -114,6 +114,11 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 		if err := m.Repository.SaveEvent(ctx, event); err != nil {
 			return errors.Join(pendingErr, err)
 		}
+		// 降级是短暂的观察状态，只记录状态变化，不发送推送；
+		// 只有最终异常或恢复才通知，避免短时抖动造成噪声。
+		if status == "degraded" {
+			return pendingErr
+		}
 		if m.Notifier != nil {
 			if pendingErr != nil {
 				m.setPending(event)

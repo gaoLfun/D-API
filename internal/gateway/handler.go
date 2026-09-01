@@ -499,7 +499,7 @@ func (h *Handler) client(upstream core.Upstream) *http.Client {
 		key.connect = 5 * time.Second
 	}
 	if key.firstByte <= 0 {
-		key.firstByte = 60 * time.Second
+		key.firstByte = 180 * time.Second
 	}
 	if key.idle <= 0 {
 		key.idle = 90 * time.Second
@@ -579,7 +579,7 @@ func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, respon
 func (h *Handler) relayStreamWithMetrics(ctx context.Context, w http.ResponseWriter, response *http.Response, requestID, upstreamName string, attempts int, firstByteTimeout, idleTimeout time.Duration, protocol string, attemptStarted time.Time) (bool, core.Usage, *int64, *int64, error) {
 	defer response.Body.Close()
 	if firstByteTimeout <= 0 {
-		firstByteTimeout = 60 * time.Second
+		firstByteTimeout = 180 * time.Second
 	}
 	if idleTimeout <= 0 {
 		idleTimeout = 5 * time.Minute
@@ -691,7 +691,7 @@ func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idl
 
 func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteTimeout, idleTimeout time.Duration, started time.Time) ([]byte, *int64, error) {
 	if firstByteTimeout <= 0 {
-		firstByteTimeout = 60 * time.Second
+		firstByteTimeout = 180 * time.Second
 	}
 	if idleTimeout <= 0 {
 		idleTimeout = 5 * time.Minute

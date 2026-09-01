@@ -75,7 +75,7 @@ Responses，但直接调用 API 时仍应显式传值。
 `models_locked`、`model_aliases`、`access_token`、`user_id`、
 `connect_timeout_ms`、`first_byte_timeout_ms`、`idle_timeout_ms`、
 `failure_threshold`、`cooldown_seconds`。默认值分别为
-优先级 100、连接 5000 ms、首包 60000 ms、空闲 300000 ms、失败阈值 3、
+优先级 100、连接 5000 ms、首包 180000 ms、空闲 300000 ms、失败阈值 3、
 冷却 60 s。仅 NewAPI 使用 `access_token` 和 `user_id` 做兼容的余额查询；
 Sub2API 会忽略这两个字段。
 

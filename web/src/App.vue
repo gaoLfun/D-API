@@ -285,7 +285,7 @@ const upstreamForm = reactive({
   name: '', kind: 'sub2api' as 'newapi' | 'sub2api', base_url: '', api_key: '', access_token: '', user_id: '',
   user_agent_mode: 'default' as UpstreamUserAgentMode, user_agent: '',
   enabled: true, balance_protection_enabled: true, priority: 100, protocols: [...DEFAULT_UPSTREAM_PROTOCOLS] as string[], models: '', aliases: '', connect_timeout_ms: 5000,
-  first_byte_timeout_ms: 60000, idle_timeout_ms: 300000, failure_threshold: 3, cooldown_seconds: 60, clear_balance_credentials: false, pricing_profile_id: 0,
+  first_byte_timeout_ms: 180000, idle_timeout_ms: 300000, failure_threshold: 3, cooldown_seconds: 60, clear_balance_credentials: false, pricing_profile_id: 0,
 })
 const keyModal = ref(false)
 const editingKey = ref<number | null>(null)
@@ -1261,7 +1261,7 @@ function openUpstream(item?: Upstream) {
     user_agent_mode: userAgentMode(item.user_agent || ''), user_agent: item.user_agent || '',
     priority: item.priority, protocols: [...(item.protocols || [])], models: (item.models || []).join(', '),
     aliases: Object.entries(item.model_aliases || {}).map(([from, to]) => `${from}=${to}`).join('\n'),
-    connect_timeout_ms: item.connect_timeout_ms ?? 5000, first_byte_timeout_ms: item.first_byte_timeout_ms ?? 60000,
+    connect_timeout_ms: item.connect_timeout_ms ?? 5000, first_byte_timeout_ms: item.first_byte_timeout_ms ?? 180000,
     idle_timeout_ms: item.idle_timeout_ms ?? 300000, failure_threshold: item.failure_threshold ?? 3,
     cooldown_seconds: item.cooldown_seconds ?? 60, clear_balance_credentials: false,
     pricing_profile_id: item.pricing_profile_id ?? 0,
@@ -1269,7 +1269,7 @@ function openUpstream(item?: Upstream) {
     name: '', kind: 'sub2api', base_url: '', api_key: '', access_token: '', user_id: '', enabled: true, priority: 100,
     balance_protection_enabled: true,
     user_agent_mode: 'default', user_agent: '',
-    protocols: [...DEFAULT_UPSTREAM_PROTOCOLS], models: '', aliases: '', connect_timeout_ms: 5000, first_byte_timeout_ms: 60000,
+    protocols: [...DEFAULT_UPSTREAM_PROTOCOLS], models: '', aliases: '', connect_timeout_ms: 5000, first_byte_timeout_ms: 180000,
     idle_timeout_ms: 300000, failure_threshold: 3, cooldown_seconds: 60, clear_balance_credentials: false, pricing_profile_id: 0,
   })
   upstreamModal.value = true

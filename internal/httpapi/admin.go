@@ -1474,7 +1474,7 @@ func (p upstreamPayload) upstream(id int64, existing core.Upstream) (core.Upstre
 		Priority: priority, Protocols: p.Protocols, Models: cleanStrings(p.Models),
 		ModelsLocked: modelsLocked, ModelAliases: p.ModelAliases, ConnectTimeout: time.Duration(defaultInt(p.ConnectTimeoutMS, 5000)) * time.Millisecond,
 		PricingProfileID: pricingProfileID,
-		FirstByteTimeout: time.Duration(defaultInt(p.FirstByteTimeoutMS, 60000)) * time.Millisecond,
+		FirstByteTimeout: time.Duration(defaultInt(p.FirstByteTimeoutMS, 180000)) * time.Millisecond,
 		IdleTimeout:      time.Duration(defaultInt(p.IdleTimeoutMS, 300000)) * time.Millisecond,
 		FailureThreshold: defaultInt(p.FailureThreshold, 3), Cooldown: time.Duration(defaultInt(p.CooldownSeconds, 60)) * time.Second,
 	}, nil

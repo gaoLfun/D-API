@@ -104,6 +104,8 @@ but the committed stream cannot be replayed safely.
   after 10 seconds, one minute, and five minutes, then keeps the job as a
   dead letter after five attempts. Latency alerts average each upstream
   attempt in the observation window and remain unknown when no samples exist.
+- Transient degraded health states are persisted without pushing a notification;
+  only final unhealthy and recovery transitions are delivered.
 - Request logs older than the configured retention are removed once per day.
   Daily usage aggregates, audit entries, and alert events are retained for the
   configured `DAPI_LOG_RETENTION` window and removed in bounded batches.
