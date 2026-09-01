@@ -713,7 +713,10 @@ function toggleSort(table: string, key: string) {
 }
 
 function sortValue(item: Json, key: string): string | number {
-  if (key === 'balance') return Number(item.balance?.available ?? -1)
+  if (key === 'balance') {
+    const entries = Array.isArray(item.items) ? item.items as Upstream[] : [item as Upstream]
+    return Math.max(...entries.map((entry) => balanceRank(entry)))
+  }
   if (key === 'models') return Number(item.models?.length || 0)
   if (key === 'tokens') return Number(item.usage?.input_tokens || 0) + Number(item.usage?.output_tokens || 0)
   const value = key.split('.').reduce<any>((result, part) => result?.[part], item)
@@ -1967,12 +1970,39 @@ function usageRowKey(row: Json, index: number) {
   return `${row.day || row.date || index}-${usageDimensionLabel(row)}`
 }
 
-function fmtBalance(upstream: Upstream) {
-  const balance = upstream.balance
+function balanceRank(upstream?: Upstream) {
+  const balance = upstream?.balance
+  if (!balance) return -3
+  if (balance.status === 'unsupported') return -2
+  if (balance.available == null && !balance.unlimited) return -1
+  // Unlimited is intentionally the lowest usable balance so a numeric
+  // account remains the representative when accounts are mixed.
+  if (balance.unlimited) return 0
+  const available = Number(balance.available)
+  return Number.isFinite(available) ? available + 1 : -1
+}
+
+function maxBalanceUpstream(items: Upstream[]) {
+  if (!items.length) return undefined
+  return items.reduce((best, item) => balanceRank(item) > balanceRank(best) ? item : best, items[0])
+}
+
+function fmtBalance(upstream?: Upstream) {
+  const balance = upstream?.balance
   if (!balance || balance.status === 'unsupported') return '不支持'
   if (balance.unlimited) return '无限额'
   if (balance.available == null) return '未知'
   return `${balance.currency || '$'} ${balance.available.toFixed(2)}`
+}
+
+function groupBalance(group: UpstreamGroup) {
+  return fmtBalance(group.total > 1 ? maxBalanceUpstream(group.items) : group.items[0])
+}
+
+function groupBalanceMeta(group: UpstreamGroup) {
+  if (group.total <= 1) return fmtDate(group.items[0]?.balance?.updated_at)
+  const selected = maxBalanceUpstream(group.items)
+  return selected ? `取最高账号：${selected.name || `#${selected.id}`}` : '暂无可用余额'
 }
 
 function fmtBalanceUsed(upstream: Upstream) {
@@ -2157,7 +2187,7 @@ onBeforeUnmount(() => {
                   <td><strong class="usage-value">{{ fmtNumber(item.today_tokens) }} Token</strong><small>{{ fmtNumber(item.today_requests) }} 次请求</small></td>
                     <td><strong>{{ item.total > 1 ? '多账号' : fmtBalanceUsed(item.items[0]) }}</strong><small>{{ item.total > 1 ? '展开后按 Key 查看' : fmtDate(balanceUsedUpdatedAt(item.items[0])) }}</small></td>
                     <td><strong>{{ item.total > 1 ? '多账号' : officialCostDetail(item.items[0], 'today') }}</strong><small>{{ item.total > 1 ? '不聚合不同账号' : `历史 ${officialCostDetail(item.items[0], 'lifetime')}` }}</small></td>
-                    <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small v-if="item.total > 1">展开查看余额</small></td>
+                    <td><strong class="balance">{{ groupBalance(item) }}</strong><small>{{ groupBalanceMeta(item) }}</small></td>
                     <td><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></td>
                     <td class="muted nowrap">{{ fmtDate(item.last_check_at) }}</td>
                   </tr>
@@ -2261,7 +2291,7 @@ onBeforeUnmount(() => {
                 <td><div class="tag-row"><span class="tag" v-for="protocol in item.protocols" :key="protocol">{{ protocol }}</span></div><small>{{ item.models?.length || 0 }} 个模型</small></td>
                 <td><strong>{{ item.total > 1 ? '多账号' : fmtBalanceUsed(item.items[0]) }}</strong><small>{{ item.total > 1 ? '抽屉内分别展示' : fmtDate(balanceUsedUpdatedAt(item.items[0])) }}</small></td>
                 <td><strong>{{ item.total > 1 ? '多账号' : officialCostDetail(item.items[0], 'today') }}</strong><small>{{ item.total > 1 ? '不聚合不同账号' : `历史 ${officialCostDetail(item.items[0], 'lifetime')}` }}</small></td>
-                <td><strong class="balance">{{ item.total > 1 ? '多 Key' : fmtBalance(item.items[0]) }}</strong><small>{{ item.total > 1 ? '抽屉内分别展示' : fmtDate(item.items[0].balance?.updated_at) }}</small></td>
+                <td><strong class="balance">{{ groupBalance(item) }}</strong><small>{{ groupBalanceMeta(item) }}</small></td>
                 <td><small>{{ groupCircuitText(item) }}</small><small v-if="item.balance_suspended">{{ item.balance_suspended }} 个余额暂停</small><small v-else-if="item.total > item.enabled">{{ item.total - item.enabled }} 个停用</small></td>
                 <td class="menu-cell"><div class="row-actions">
                   <button class="icon" title="查看 Key" @click.stop="openUpstreamGroup(item)"><MoreHorizontal :size="16" /></button>
