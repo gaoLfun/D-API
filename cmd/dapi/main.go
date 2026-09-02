@@ -62,12 +62,20 @@ func run() error {
 	delivery := app.ChannelNotifier{Store: db}
 	notifier := app.NewOutboxNotifier(db)
 	httpapi.New(db, cfg, operations, notifier).Register(mux)
-	mux.Handle("/v1/", gateway.NewSecureHandler(app.GatewayRepository{Store: db}, gateway.Limits{
+	gatewayHandler := gateway.NewSecureHandler(app.GatewayRepository{Store: db}, gateway.Limits{
 		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
 		MaxConcurrentPerKey:   cfg.MaxConcurrentPerKey,
 		MaxRequestsPerMinute:  cfg.MaxRequestsPerMinute,
 		MaxRequestDuration:    cfg.MaxRequestDuration,
-	}))
+	})
+	defer func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer flushCancel()
+		if err := gatewayHandler.Close(flushCtx); err != nil {
+			slog.Error("request log flush failed", "error", err)
+		}
+	}()
+	mux.Handle("/v1/", gatewayHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		payload := map[string]string{"status": "ok"}

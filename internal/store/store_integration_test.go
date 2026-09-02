@@ -323,6 +323,15 @@ func TestStoreLifecycle(t *testing.T) {
 	if key, err := database.AuthenticateAPIKey(ctx, rawKey); err != nil || key.ID != keyID {
 		t.Fatalf("API key authentication failed: %#v %v", key, err)
 	}
+	if err := database.UpdateAPIKey(ctx, core.APIKey{ID: keyID, Name: "client", Enabled: false, Protocols: []string{core.ProtocolChat}, Models: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.AuthenticateAPIKey(ctx, rawKey); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled cached API key authentication error=%v", err)
+	}
+	if err := database.UpdateAPIKey(ctx, core.APIKey{ID: keyID, Name: "client", Enabled: true, Protocols: []string{core.ProtocolChat}, Models: []string{}}); err != nil {
+		t.Fatal(err)
+	}
 	input, output := int64(12), int64(3)
 	if err := database.RecordRequest(ctx, core.RequestLog{
 		RequestID: "request-1", APIKeyID: keyID, UpstreamID: &upstreamID, Protocol: core.ProtocolChat,
@@ -337,6 +346,26 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 	if got := todayUsage[upstreamID]; got.Requests != 1 || got.Tokens != 15 || got.CostKnownRequests != 1 || got.LifetimeRequests != 1 || got.LifetimeKnownRequests != 1 || got.CostUSD != 0.000012 || got.LifetimeCostUSD != 0.000012 {
 		t.Fatalf("today upstream usage=%#v", got)
+	}
+	batchInputA, batchInputB := int64(2), int64(4)
+	batchCreatedAt := time.Now()
+	batchEntries := []core.RequestLog{
+		{RequestID: "request-batch-1", APIKeyID: keyID, UpstreamID: &upstreamID, Protocol: core.ProtocolChat, Model: "model", StatusCode: 200, Usage: core.Usage{InputTokens: &batchInputA}, CreatedAt: batchCreatedAt},
+		{RequestID: "request-batch-1", APIKeyID: keyID, UpstreamID: &upstreamID, Protocol: core.ProtocolChat, Model: "model", StatusCode: 200, Usage: core.Usage{InputTokens: &batchInputA}, CreatedAt: batchCreatedAt},
+		{RequestID: "request-batch-2", APIKeyID: keyID, UpstreamID: &upstreamID, Protocol: core.ProtocolResponses, Model: "model", StatusCode: 500, Usage: core.Usage{InputTokens: &batchInputB}, CreatedAt: batchCreatedAt},
+	}
+	if err := database.RecordRequests(ctx, batchEntries); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordRequests(ctx, batchEntries); err != nil {
+		t.Fatalf("idempotent batch retry: %v", err)
+	}
+	todayUsage, err = database.TodayUpstreamUsage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := todayUsage[upstreamID]; got.Requests != 3 || got.Tokens != 21 || got.CostKnownRequests != 3 || got.LifetimeRequests != 3 || got.LifetimeKnownRequests != 3 || got.CostUSD != 0.000018 || got.LifetimeCostUSD != 0.000018 {
+		t.Fatalf("batched upstream usage=%#v", got)
 	}
 	backfillAt := time.Now().Add(time.Second)
 	if err := database.RecordRequest(ctx, core.RequestLog{
@@ -391,7 +420,7 @@ func TestStoreLifecycle(t *testing.T) {
 	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&totalRows); err != nil {
 		t.Fatal(err)
 	}
-	if groupedRows != 1 || totalRows != 3 {
+	if groupedRows != 1 || totalRows != 4 {
 		t.Fatalf("daily usage rows grouped=%d total=%d", groupedRows, totalRows)
 	}
 	if err := database.DeleteAPIKey(ctx, keyID); err != nil {
@@ -416,8 +445,40 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var usageRows int
-	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&usageRows); err != nil || usageRows != 3 {
+	if err := database.DB().QueryRowContext(ctx, `SELECT count(*) FROM daily_usage`).Scan(&usageRows); err != nil || usageRows != 4 {
 		t.Fatalf("historical usage rows=%d err=%v", usageRows, err)
+	}
+	aggregateRequests := func() (int64, int64, int64) {
+		t.Helper()
+		var daily, hourly, lifetime int64
+		if err := database.DB().QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0) FROM daily_usage WHERE api_key_id=$1 AND upstream_id=$2`, keyID, upstreamID).Scan(&daily); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.DB().QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0) FROM hourly_usage WHERE api_key_id=$1 AND upstream_id=$2`, keyID, upstreamID).Scan(&hourly); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.DB().QueryRowContext(ctx, `SELECT requests FROM upstream_lifetime_usage WHERE upstream_id=$1`, upstreamID).Scan(&lifetime); err != nil {
+			t.Fatal(err)
+		}
+		return daily, hourly, lifetime
+	}
+	dailyBefore, hourlyBefore, lifetimeBefore := aggregateRequests()
+	if err := database.RecordRequests(ctx, []core.RequestLog{{
+		RequestID: "request-after-delete", APIKeyID: keyID, UpstreamID: &upstreamID,
+		Protocol: core.ProtocolChat, Model: "deleted-model", StatusCode: 200, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("batch with deleted references: %v", err)
+	}
+	var keyReferenceMissing, upstreamReferenceMissing bool
+	if err := database.DB().QueryRowContext(ctx, `
+		SELECT api_key_id IS NULL,upstream_id IS NULL FROM request_logs WHERE request_id='request-after-delete'`,
+	).Scan(&keyReferenceMissing, &upstreamReferenceMissing); err != nil || !keyReferenceMissing || !upstreamReferenceMissing {
+		t.Fatalf("deleted log references key_missing=%t upstream_missing=%t err=%v", keyReferenceMissing, upstreamReferenceMissing, err)
+	}
+	dailyAfter, hourlyAfter, lifetimeAfter := aggregateRequests()
+	if dailyAfter != dailyBefore || hourlyAfter != hourlyBefore || lifetimeAfter != lifetimeBefore {
+		t.Fatalf("deleted references changed aggregates: daily=%d->%d hourly=%d->%d lifetime=%d->%d",
+			dailyBefore, dailyAfter, hourlyBefore, hourlyAfter, lifetimeBefore, lifetimeAfter)
 	}
 
 	rules, err := database.ListAlertRules(ctx)

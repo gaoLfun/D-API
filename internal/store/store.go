@@ -16,10 +16,17 @@ import (
 var schema string
 
 type Store struct {
-	db           *sql.DB
-	box          *cryptox.SecretBox
-	pricingMu    sync.RWMutex
-	pricingCache map[pricingCacheKey]pricingCacheEntry
+	db             *sql.DB
+	box            *cryptox.SecretBox
+	pricingMu      sync.RWMutex
+	pricingCache   map[pricingCacheKey]pricingCacheEntry
+	cacheMu        sync.RWMutex
+	authCache      map[string]authCacheEntry
+	routeCache     map[routeCacheKey]routeCacheEntry
+	maxAttempts    maxAttemptsCacheEntry
+	authGen        uint64
+	routeGen       uint64
+	maxAttemptsGen uint64
 }
 
 func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Store, error) {
@@ -34,7 +41,12 @@ func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Sto
 		db.Close()
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
-	return &Store{db: db, box: box, pricingCache: make(map[pricingCacheKey]pricingCacheEntry)}, nil
+	return &Store{
+		db: db, box: box,
+		pricingCache: make(map[pricingCacheKey]pricingCacheEntry),
+		authCache:    make(map[string]authCacheEntry),
+		routeCache:   make(map[routeCacheKey]routeCacheEntry),
+	}, nil
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

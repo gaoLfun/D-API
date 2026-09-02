@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,36 @@ type fakeRepository struct {
 	logs           []core.RequestLog
 	successes      []int64
 	failures       []int64
+	batches        int
+	batchFailures  int
+	batchErr       error
+}
+
+type blockingHealthRepository struct {
+	*fakeRepository
+	failureStarted chan struct{}
+	releaseFailure chan struct{}
+}
+
+func (r *blockingHealthRepository) MarkUpstreamFailure(ctx context.Context, id int64, status int, reason string) error {
+	close(r.failureStarted)
+	select {
+	case <-r.releaseFailure:
+		return r.fakeRepository.MarkUpstreamFailure(ctx, id, status, reason)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type blockingBatchRepository struct {
+	*fakeRepository
+	started chan struct{}
+}
+
+func (r *blockingBatchRepository) RecordRequests(ctx context.Context, _ []core.RequestLog) error {
+	close(r.started)
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (f *fakeRepository) Authenticate(_ context.Context, token string) (core.APIKey, error) {
@@ -61,6 +92,18 @@ func (f *fakeRepository) RecordRequest(_ context.Context, entry core.RequestLog)
 	return nil
 }
 
+func (f *fakeRepository) RecordRequests(_ context.Context, entries []core.RequestLog) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batches++
+	if f.batchFailures > 0 {
+		f.batchFailures--
+		return f.batchErr
+	}
+	f.logs = append(f.logs, entries...)
+	return nil
+}
+
 func (f *fakeRepository) MarkUpstreamSuccess(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -87,6 +130,173 @@ func TestUpstreamRequestUserAgentPolicy(t *testing.T) {
 	out, err = upstreamRequest(in, core.Upstream{BaseURL: "https://upstream.example/v1", APIKey: "secret"}, []byte(`{}`), core.ProtocolResponses)
 	if err != nil || out.Header.Get("User-Agent") != "caller/1.0" {
 		t.Fatalf("forwarded User-Agent = %q, %v", out.Header.Get("User-Agent"), err)
+	}
+}
+
+func TestHealthyUpstreamSuccessSkipsStateWrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream core.Upstream
+		want     bool
+	}{
+		{name: "healthy", upstream: core.Upstream{HealthStatus: "healthy"}},
+		{name: "healthy after failure", upstream: core.Upstream{HealthStatus: "healthy", ConsecutiveFailure: 1}, want: true},
+		{name: "degraded", upstream: core.Upstream{HealthStatus: "degraded"}, want: true},
+		{name: "unknown", upstream: core.Upstream{HealthStatus: "unknown"}, want: true},
+		{name: "unhealthy awaits probe", upstream: core.Upstream{HealthStatus: "unhealthy"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := needsSuccessWrite(test.upstream); got != test.want {
+				t.Fatalf("needsSuccessWrite() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSuccessWritesAfterConcurrentFailureFromHealthySnapshot(t *testing.T) {
+	repo := &blockingHealthRepository{
+		fakeRepository: &fakeRepository{}, failureStarted: make(chan struct{}), releaseFailure: make(chan struct{}),
+	}
+	handler := NewHandler(repo)
+	upstream := core.Upstream{ID: 7, HealthStatus: "healthy"}
+	failureDone := make(chan struct{})
+	go func() {
+		handler.markFailure(upstream.ID, http.StatusBadGateway, "failed")
+		close(failureDone)
+	}()
+	<-repo.failureStarted
+	successDone := make(chan struct{})
+	go func() {
+		handler.markSuccess(upstream)
+		close(successDone)
+	}()
+	select {
+	case <-successDone:
+		t.Fatal("success bypassed an in-flight failure write")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(repo.releaseFailure)
+	<-failureDone
+	<-successDone
+	handler.markSuccess(upstream)
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.failures) != 1 || len(repo.successes) != 1 {
+		t.Fatalf("failures=%v successes=%v", repo.failures, repo.successes)
+	}
+	handler.healthMu.Lock()
+	defer handler.healthMu.Unlock()
+	if len(handler.health) != 0 {
+		t.Fatalf("idle health states=%d, want 0", len(handler.health))
+	}
+}
+
+func TestRequestRecorderFlushesBatchOnClose(t *testing.T) {
+	repo := &fakeRepository{}
+	recorder := newRequestRecorder(repo)
+	for i := range 3 {
+		if !recorder.Submit(core.RequestLog{RequestID: strconv.Itoa(i)}) {
+			t.Fatal("Submit() rejected an available queue slot")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.logs) != 3 || repo.batches != 1 {
+		t.Fatalf("logs = %d, batches = %d", len(repo.logs), repo.batches)
+	}
+	if recorder.Submit(core.RequestLog{}) {
+		t.Fatal("Submit() accepted an entry after Close()")
+	}
+}
+
+func TestRequestRecorderRetriesBatch(t *testing.T) {
+	repo := &fakeRepository{batchFailures: 1, batchErr: errors.New("temporary database error")}
+	recorder := newRequestRecorderWithRetryDelays(repo, []time.Duration{0})
+	if !recorder.Submit(core.RequestLog{RequestID: "retry"}) {
+		t.Fatal("Submit() rejected an available queue slot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if repo.batches != 2 || len(repo.logs) != 1 || recorder.Dropped() != 0 {
+		t.Fatalf("batches=%d logs=%d dropped=%d", repo.batches, len(repo.logs), recorder.Dropped())
+	}
+}
+
+func TestRequestRecorderReportsDroppedBatch(t *testing.T) {
+	repo := &fakeRepository{batchFailures: 1, batchErr: errors.New("database unavailable")}
+	recorder := newRequestRecorderWithRetryDelays(repo, nil)
+	if !recorder.Submit(core.RequestLog{RequestID: "dropped"}) {
+		t.Fatal("Submit() rejected an available queue slot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err == nil {
+		t.Fatal("Close() did not report a permanently failed flush")
+	}
+	if recorder.Dropped() != 1 {
+		t.Fatalf("dropped=%d", recorder.Dropped())
+	}
+}
+
+func TestRequestRecorderStopsWorkerWhenCloseDeadlineExpires(t *testing.T) {
+	repo := &blockingBatchRepository{fakeRepository: &fakeRepository{}, started: make(chan struct{})}
+	recorder := newRequestRecorderWithRetryDelays(repo, defaultRequestLogRetryDelays)
+	for i := range requestLogBatchSize + 6 {
+		if !recorder.Submit(core.RequestLog{RequestID: strconv.Itoa(i)}) {
+			t.Fatal("Submit() rejected an available queue slot")
+		}
+	}
+	<-repo.started
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := recorder.Close(ctx); err == nil {
+		t.Fatal("Close() did not report its expired deadline")
+	}
+	if got := recorder.Dropped(); got != requestLogBatchSize+6 {
+		t.Fatalf("dropped=%d, want %d", got, requestLogBatchSize+6)
+	}
+	select {
+	case <-recorder.done:
+	default:
+		t.Fatal("Close() returned before the recorder worker stopped")
+	}
+}
+
+type benchmarkRepository struct{ *fakeRepository }
+
+func (*benchmarkRepository) RecordRequest(context.Context, core.RequestLog) error { return nil }
+
+func (*benchmarkRepository) RecordRequests(context.Context, []core.RequestLog) error { return nil }
+
+func BenchmarkHealthyProxyRequest(b *testing.B) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"ok","usage":{"input_tokens":10,"output_tokens":4}}`)
+	}))
+	b.Cleanup(upstreamServer.Close)
+	u := upstream(1, upstreamServer.URL)
+	u.HealthStatus = "healthy"
+	repo := &benchmarkRepository{fakeRepository: &fakeRepository{
+		key: core.APIKey{ID: 1, Enabled: true}, candidates: []core.Upstream{u},
+	}}
+	handler := NewHandler(repo, Limits{MaxRequestsPerMinute: 100000})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, requestWithAuth(http.MethodPost, "/v1/responses", `{"model":"m"}`))
+		if recorder.Code != http.StatusOK {
+			b.Fatalf("status = %d", recorder.Code)
+		}
 	}
 }
 

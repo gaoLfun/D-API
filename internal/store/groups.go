@@ -79,6 +79,7 @@ func (s *Store) CreateGroup(ctx context.Context, group core.Group) (int64, error
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.invalidateRouteCache()
 	return id, nil
 }
 
@@ -118,7 +119,12 @@ func (s *Store) UpdateGroup(ctx context.Context, group core.Group) error {
 			return ErrInvalidGroup
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateRouteCache()
+	s.invalidateAuthCache()
+	return nil
 }
 
 func (s *Store) DeleteGroup(ctx context.Context, id int64) error {
@@ -137,6 +143,8 @@ func (s *Store) DeleteGroup(ctx context.Context, id int64) error {
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidateRouteCache()
+	s.invalidateAuthCache()
 	return nil
 }
 

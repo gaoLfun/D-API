@@ -260,5 +260,8 @@ func (s *Store) SetMaxAttempts(ctx context.Context, attempts int) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO settings(key,value) VALUES('max_attempts',$1)
 		ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, value)
+	if err == nil {
+		s.invalidateMaxAttemptsCache()
+	}
 	return err
 }

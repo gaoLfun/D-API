@@ -43,6 +43,10 @@ func (r GatewayRepository) RecordRequest(ctx context.Context, entry core.Request
 	return r.Store.RecordRequest(ctx, entry)
 }
 
+func (r GatewayRepository) RecordRequests(ctx context.Context, entries []core.RequestLog) error {
+	return r.Store.RecordRequests(ctx, entries)
+}
+
 func (r GatewayRepository) MarkUpstreamSuccess(ctx context.Context, id int64) error {
 	_, err := r.Store.SaveHealth(ctx, id, true, "", false)
 	return err

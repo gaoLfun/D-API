@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -29,9 +30,52 @@ type RequestLogView struct {
 }
 
 func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error {
-	attempts, err := json.Marshal(entry.Attempts)
+	prepared, err := s.prepareRequest(ctx, entry)
 	if err != nil {
 		return err
+	}
+	return recordPreparedRequest(ctx, s.db, prepared)
+}
+
+// RecordRequests commits a batch atomically, amortizing transaction commits
+// while preserving the same log and aggregate updates as RecordRequest.
+func (s *Store) RecordRequests(ctx context.Context, entries []core.RequestLog) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	prepared := make([]preparedRequest, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, duplicate := seen[entry.RequestID]; duplicate {
+			continue
+		}
+		seen[entry.RequestID] = struct{}{}
+		item, err := s.prepareRequest(ctx, entry)
+		if err != nil {
+			return err
+		}
+		prepared = append(prepared, item)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := recordPreparedBatch(ctx, tx, prepared); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type preparedRequest struct {
+	entry    core.RequestLog
+	attempts []byte
+}
+
+func (s *Store) prepareRequest(ctx context.Context, entry core.RequestLog) (preparedRequest, error) {
+	attempts, err := json.Marshal(entry.Attempts)
+	if err != nil {
+		return preparedRequest{}, err
 	}
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
@@ -39,10 +83,19 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 	if entry.UpstreamID != nil {
 		entry.CostUSD, err = s.RequestCost(ctx, *entry.UpstreamID, entry.Model, entry.Usage, entry.CreatedAt)
 		if err != nil {
-			return err
+			return preparedRequest{}, err
 		}
 	}
-	_, err = s.db.ExecContext(ctx, `
+	return preparedRequest{entry: entry, attempts: attempts}, nil
+}
+
+type requestLogExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func recordPreparedRequest(ctx context.Context, executor requestLogExecer, prepared preparedRequest) error {
+	entry := prepared.entry
+	_, err := executor.ExecContext(ctx, `
 		WITH inserted AS (
 			INSERT INTO request_logs(
 				request_id,api_key_id,group_id,upstream_id,protocol,model,status_code,duration_ms,ttfb_ms,ttft_ms,
@@ -115,14 +168,11 @@ func (s *Store) RecordRequest(ctx context.Context, entry core.RequestLog) error 
 			cost_usd=hourly_usage.cost_usd+EXCLUDED.cost_usd,
 			cost_known_requests=hourly_usage.cost_known_requests+EXCLUDED.cost_known_requests`,
 		entry.RequestID, nullableID(entry.APIKeyID), entry.GroupID, entry.UpstreamID, entry.Protocol, entry.Model,
-		entry.StatusCode, entry.DurationMS, entry.TTFBMS, entry.TTFTMS, attempts, entry.Usage.InputTokens, entry.Usage.OutputTokens,
+		entry.StatusCode, entry.DurationMS, entry.TTFBMS, entry.TTFTMS, prepared.attempts, entry.Usage.InputTokens, entry.Usage.OutputTokens,
 		entry.Usage.CachedInputTokens, entry.Usage.CacheCreationInputTokens, entry.Usage.UncachedInputTokens,
 		entry.CostUSD, entry.ErrorCode, entry.ClientIP, entry.CreatedAt,
 	)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]RequestLogView, error) {

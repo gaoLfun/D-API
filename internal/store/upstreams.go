@@ -45,6 +45,11 @@ func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 // credentials. Circuit state is included so the gateway does not pay the
 // decryption cost for entries it will immediately reject.
 func (s *Store) ListRouteUpstreams(ctx context.Context, groupID int64, protocol, model string) ([]core.Upstream, error) {
+	cacheKey := routeCacheKey{groupID: groupID, protocol: protocol, model: model}
+	cached, ok, generation := s.cachedRoutes(cacheKey, time.Now())
+	if ok {
+		return cached, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT u.*
 		FROM (SELECT `+upstreamColumns+` FROM upstreams
@@ -67,7 +72,11 @@ func (s *Store) ListRouteUpstreams(ctx context.Context, groupID int64, protocol,
 		}
 		result = append(result, record.Upstream)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.cacheRoutes(cacheKey, result, time.Now(), generation)
+	return result, nil
 }
 
 func (s *Store) ListUpstreamRecords(ctx context.Context) ([]UpstreamRecord, error) {
@@ -116,6 +125,7 @@ func (s *Store) CreateUpstream(ctx context.Context, upstream core.Upstream) (int
 	).Scan(&id)
 	if err == nil {
 		s.invalidatePricingCache()
+		s.invalidateRouteCache()
 	}
 	return id, err
 }
@@ -190,6 +200,7 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) (cor
 		return core.BalanceUnchanged, err
 	}
 	s.invalidatePricingCache()
+	s.invalidateRouteCache()
 	return transition, nil
 }
 
@@ -221,16 +232,24 @@ func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
 		return err
 	}
 	s.invalidatePricingCache()
+	s.invalidateRouteCache()
+	s.invalidateAuthCache()
 	return nil
 }
 
 func (s *Store) SaveModels(ctx context.Context, id int64, models []string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, models_locked=true, updated_at=now() WHERE id=$2`, pq.Array(models), id)
+	if err == nil {
+		s.invalidateRouteCache()
+	}
 	return err
 }
 
 func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, updated_at=now() WHERE id=$2 AND models_locked=false`, pq.Array(models), id)
+	if err == nil {
+		s.invalidateRouteCache()
+	}
 	return err
 }
 
@@ -298,6 +317,7 @@ func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance,
 	if err := tx.Commit(); err != nil {
 		return core.BalanceUnchanged, err
 	}
+	s.invalidateRouteCache()
 	return transition, nil
 }
 
@@ -401,6 +421,9 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", ErrNotFound
 		}
+		if err == nil {
+			s.invalidateRouteCache()
+		}
 		return status, pendingHealthNotification(status, notified), err
 	}
 	err := s.db.QueryRowContext(ctx, `
@@ -414,6 +437,9 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 		WHERE id=$1 RETURNING health_status,health_notified_status`, id, message, authFailure).Scan(&status, &notified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrNotFound
+	}
+	if err == nil {
+		s.invalidateRouteCache()
 	}
 	return status, pendingHealthNotification(status, notified), err
 }

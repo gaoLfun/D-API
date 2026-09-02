@@ -52,6 +52,10 @@ type Repository interface {
 	MarkUpstreamFailure(context.Context, int64, int, string) error
 }
 
+type batchRepository interface {
+	RecordRequests(context.Context, []core.RequestLog) error
+}
+
 type Handler struct {
 	repo       Repository
 	mux        *http.ServeMux
@@ -61,6 +65,15 @@ type Handler struct {
 	gate       requestGate
 	rate       requestRateLimiter
 	secure     bool
+	recorder   *requestRecorder
+	healthMu   sync.Mutex
+	health     map[int64]*upstreamHealthState
+}
+
+type upstreamHealthState struct {
+	mu             sync.Mutex
+	references     int
+	pendingFailure bool
 }
 
 // Limits bounds resource use by authenticated clients. Zero values use safe defaults.
@@ -188,12 +201,34 @@ func newHandler(repo Repository, secure bool, configured ...Limits) *Handler {
 	if limits.MaxRequestDuration > 24*time.Hour {
 		limits.MaxRequestDuration = 24 * time.Hour
 	}
-	h := &Handler{repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*http.Client), limits: limits, secure: secure}
+	h := &Handler{
+		repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*http.Client),
+		limits: limits, secure: secure, health: make(map[int64]*upstreamHealthState),
+	}
+	if secure {
+		h.recorder = newRequestRecorder(repo)
+	}
 	h.mux.HandleFunc("POST /v1/responses", h.proxy(core.ProtocolResponses))
 	h.mux.HandleFunc("POST /v1/messages", h.proxy(core.ProtocolMessages))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.proxy(core.ProtocolChat))
 	h.mux.HandleFunc("GET /v1/models", h.models)
 	return h
+}
+
+// Close flushes queued request logs. Call it after the HTTP server has stopped
+// accepting requests and before closing the repository.
+func (h *Handler) Close(ctx context.Context) error {
+	if h.recorder == nil {
+		return nil
+	}
+	return h.recorder.Close(ctx)
+}
+
+func (h *Handler) DroppedRequestLogs() uint64 {
+	if h.recorder == nil {
+		return 0
+	}
+	return h.recorder.Dropped()
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +378,7 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 								} else if streamErr != nil {
 									logEntry.ErrorCode = "client_closed"
 								} else if streamErr == nil {
-									h.markSuccess(upstream.ID)
+									h.markSuccess(upstream)
 								}
 								return
 							}
@@ -373,7 +408,7 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							logEntry.StatusCode = response.StatusCode
 							logEntry.TTFBMS = ttfbMS
 							logEntry.Usage = parseUsageWithProtocol(responseBody, protocol)
-							h.markSuccess(upstream.ID)
+							h.markSuccess(upstream)
 							copyResponseHeaders(w.Header(), response.Header)
 							setGatewayHeaders(w.Header(), requestID, upstream.Name, len(logEntry.Attempts))
 							w.WriteHeader(response.StatusCode)
@@ -1158,6 +1193,9 @@ func newRequestID() string {
 func int64ptr(value int64) *int64 { return &value }
 
 func (h *Handler) record(entry core.RequestLog) {
+	if h.recorder != nil && h.recorder.Submit(entry) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := h.repo.RecordRequest(ctx, entry); err != nil {
@@ -1165,18 +1203,57 @@ func (h *Handler) record(entry core.RequestLog) {
 	}
 }
 
-func (h *Handler) markSuccess(upstreamID int64) {
+func (h *Handler) markSuccess(upstream core.Upstream) {
+	state := h.lockUpstreamHealth(upstream.ID)
+	defer h.unlockUpstreamHealth(upstream.ID, state)
+	if !needsSuccessWrite(upstream) && !state.pendingFailure {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := h.repo.MarkUpstreamSuccess(ctx, upstreamID); err != nil {
-		slog.Error("upstream success state write failed", "upstream_id", upstreamID, "error", err)
+	if err := h.repo.MarkUpstreamSuccess(ctx, upstream.ID); err != nil {
+		slog.Error("upstream success state write failed", "upstream_id", upstream.ID, "error", err)
+		return
 	}
+	state.pendingFailure = false
+}
+
+func needsSuccessWrite(upstream core.Upstream) bool {
+	return upstream.HealthStatus != "healthy" && upstream.HealthStatus != "unhealthy" ||
+		upstream.HealthStatus == "healthy" && upstream.ConsecutiveFailure > 0
 }
 
 func (h *Handler) markFailure(upstreamID int64, status int, reason string) {
+	state := h.lockUpstreamHealth(upstreamID)
+	defer h.unlockUpstreamHealth(upstreamID, state)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := h.repo.MarkUpstreamFailure(ctx, upstreamID, status, reason); err != nil {
 		slog.Error("upstream failure state write failed", "upstream_id", upstreamID, "status", status, "error", err)
+		return
 	}
+	state.pendingFailure = true
+}
+
+func (h *Handler) lockUpstreamHealth(upstreamID int64) *upstreamHealthState {
+	h.healthMu.Lock()
+	state := h.health[upstreamID]
+	if state == nil {
+		state = &upstreamHealthState{}
+		h.health[upstreamID] = state
+	}
+	state.references++
+	h.healthMu.Unlock()
+	state.mu.Lock()
+	return state
+}
+
+func (h *Handler) unlockUpstreamHealth(upstreamID int64, state *upstreamHealthState) {
+	h.healthMu.Lock()
+	state.references--
+	if state.references == 0 && !state.pendingFailure && h.health[upstreamID] == state {
+		delete(h.health, upstreamID)
+	}
+	h.healthMu.Unlock()
+	state.mu.Unlock()
 }

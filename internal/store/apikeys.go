@@ -70,6 +70,9 @@ func (s *Store) insertAPIKey(ctx context.Context, name, prefix string, hash, enc
 			VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
 			name, prefix, hash, nullableID(groupID), pq.Array(protocols), pq.Array(models),
 		).Scan(&id)
+		if err == nil {
+			s.invalidateAuthCache()
+		}
 		return id, err
 	}
 	err := s.db.QueryRowContext(ctx, `
@@ -77,6 +80,9 @@ func (s *Store) insertAPIKey(ctx context.Context, name, prefix string, hash, enc
 		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
 		name, prefix, hash, encrypted, nullableID(groupID), pq.Array(protocols), pq.Array(models),
 	).Scan(&id)
+	if err == nil {
+		s.invalidateAuthCache()
+	}
 	return id, err
 }
 
@@ -126,6 +132,7 @@ func (s *Store) UpdateAPIKey(ctx context.Context, key core.APIKey) error {
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidateAuthCache()
 	return nil
 }
 
@@ -138,16 +145,24 @@ func (s *Store) DeleteAPIKey(ctx context.Context, id int64) error {
 	if count == 0 {
 		return ErrNotFound
 	}
+	s.invalidateAuthCache()
 	return nil
 }
 
 func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (core.APIKey, error) {
+	hash := auth.HashToken(raw)
+	cacheKey := string(hash)
+	now := time.Now()
+	cached, ok, generation := s.cachedAPIKey(cacheKey, now)
+	if ok {
+		return cached, nil
+	}
 	var key core.APIKey
 	err := s.db.QueryRowContext(ctx, `
 		SELECT k.id,k.name,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.enabled,false),k.key_prefix,k.enabled,k.protocols,k.models,k.last_used_at,k.created_at
 		FROM api_keys k LEFT JOIN groups g ON g.id=k.group_id
 		WHERE k.key_hash=$1 AND k.enabled=true`,
-		auth.HashToken(raw),
+		hash,
 	).Scan(&key.ID, &key.Name, &key.GroupID, &key.GroupName, &key.GroupEnabled, &key.Prefix, &key.Enabled, pq.Array(&key.Protocols), pq.Array(&key.Models), &key.LastUsed, &key.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.APIKey{}, ErrNotFound
@@ -162,6 +177,7 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (core.APIKey
 			UPDATE api_keys SET last_used_at=now()
 			WHERE id=$1 AND (last_used_at IS NULL OR last_used_at < now()-interval '1 minute')`, key.ID)
 	}
+	s.cacheAPIKey(cacheKey, key, now, generation)
 	return key, nil
 }
 
@@ -198,7 +214,12 @@ func (s *Store) AvailableModels(ctx context.Context, key core.APIKey) ([]string,
 }
 
 func (s *Store) MaxAttempts(ctx context.Context) (int, error) {
-	var attempts int
+	now := time.Now()
+	attempts, ok, generation := s.cachedMaxAttempts(now)
+	if ok {
+		return attempts, nil
+	}
+	attempts = 0
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COALESCE((SELECT (value #>> '{}')::int FROM settings WHERE key='max_attempts'), 3)`,
 	).Scan(&attempts)
@@ -211,6 +232,7 @@ func (s *Store) MaxAttempts(ctx context.Context) (int, error) {
 	if attempts > 5 {
 		attempts = 5
 	}
+	s.cacheMaxAttempts(attempts, now, generation)
 	return attempts, nil
 }
 

@@ -50,6 +50,11 @@ API keys. These authentication paths do not share credentials or permissions.
    client IP, and available token usage are recorded. The request and response
    bodies are not persisted.
 
+Client keys, route candidates, and `max_attempts` use short-lived in-process
+caches. Related admin mutations invalidate them immediately. Client-key and
+route caches are bounded to 4,096 and 1,024 entries respectively, and route
+entries expire within two seconds, so PostgreSQL remains the source of truth.
+
 Upstreams with the same priority retain database order. There is no weighted,
 random, cost-aware, or least-latency load balancing at present.
 
@@ -126,6 +131,17 @@ The record includes status, total duration, time to first byte, streaming time t
 first token when observable, token metadata, and the client IP. Bodies are
 deliberately excluded. Health failures update the upstream circuit in
 PostgreSQL, while gateway concurrency and login limits remain in process memory.
+
+The production gateway places request records in a bounded 2,048-entry queue and
+flushes after 64 entries or 100 milliseconds. Daily, hourly, and upstream lifetime
+increments are coalesced by dimension within each batch before PostgreSQL is
+updated. A full queue falls back to synchronous writes for backpressure, and a
+failed batch is retried with bounded backoff. Permanent failures increment a
+dropped-record counter and are returned by graceful shutdown, which flushes
+pending entries. If the shutdown deadline expires, the active write is canceled,
+remaining records are counted as dropped, and the recorder worker stops before
+the database is closed. A forced process termination can still lose the small
+number of records that have not yet been flushed.
 
 The admin dashboard's upstream panel provides a tabular view and a topology view.
 The topology groups upstream entries by normalized base URL and shows the
