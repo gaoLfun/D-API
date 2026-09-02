@@ -24,6 +24,7 @@ type Config struct {
 	BalanceEvery          time.Duration
 	HealthEvery           time.Duration
 	TrustProxy            bool
+	TrustedProxyCIDRs     []string
 	MaxConcurrentRequests int
 	MaxConcurrentPerKey   int
 	MaxRequestsPerMinute  int
@@ -42,6 +43,7 @@ func Load() (Config, error) {
 		BalanceEvery:          duration("DAPI_BALANCE_INTERVAL", 10*time.Minute),
 		HealthEvery:           duration("DAPI_HEALTH_INTERVAL", 30*time.Second),
 		TrustProxy:            boolean("DAPI_TRUST_PROXY", false),
+		TrustedProxyCIDRs:     csv("DAPI_TRUSTED_PROXY_CIDRS"),
 		MaxConcurrentRequests: Int("DAPI_MAX_CONCURRENT_REQUESTS", 256),
 		MaxConcurrentPerKey:   Int("DAPI_MAX_CONCURRENT_PER_KEY", 32),
 		MaxRequestsPerMinute:  Int("DAPI_MAX_REQUESTS_PER_MINUTE", 600),
@@ -68,6 +70,16 @@ func Load() (Config, error) {
 	}
 	cfg.MasterKey = key
 	return cfg, nil
+}
+
+func csv(name string) []string {
+	var result []string
+	for _, value := range strings.Split(os.Getenv(name), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func databaseURL() string {

@@ -176,15 +176,16 @@ func (s *Store) AvailableModels(ctx context.Context, key core.APIKey) ([]string,
 			continue
 		}
 		for _, model := range upstream.Models {
-			clientModel := model
+			models := []string{model}
 			for alias, mapped := range upstream.ModelAliases {
 				if mapped == model {
-					clientModel = alias
-					break
+					models = append(models, alias)
 				}
 			}
-			if len(key.Models) == 0 || hasString(key.Models, clientModel) {
-				seen[clientModel] = struct{}{}
+			for _, clientModel := range models {
+				if len(key.Models) == 0 || hasString(key.Models, clientModel) {
+					seen[clientModel] = struct{}{}
+				}
 			}
 		}
 	}

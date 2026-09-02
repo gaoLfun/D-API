@@ -28,6 +28,7 @@ D-API 从环境变量读取进程和数据库配置；上游、客户端 Key、�
 | `DAPI_HEALTH_INTERVAL` | `30s` | 自动健康检查间隔 |
 | `DAPI_MAX_REQUEST_DURATION` | `15m` | 单个代理请求最长生命周期 |
 | `DAPI_TRUST_PROXY` | `false` | 是否信任 Caddy 写入的 `X-Real-IP` |
+| `DAPI_TRUSTED_PROXY_CIDRS` | 空 | 可选的受信代理 CIDR 列表，逗号分隔 |
 
 网关资源限制：
 

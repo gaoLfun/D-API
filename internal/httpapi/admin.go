@@ -1663,7 +1663,13 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-func ProxyHeaders(next http.Handler, trusted bool) http.Handler {
+func ProxyHeaders(next http.Handler, trusted bool, trustedCIDRs ...string) http.Handler {
+	var networks []*net.IPNet
+	for _, raw := range trustedCIDRs {
+		if _, network, err := net.ParseCIDR(strings.TrimSpace(raw)); err == nil {
+			networks = append(networks, network)
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !trusted {
 			r.Header.Del("Forwarded")
@@ -1673,13 +1679,36 @@ func ProxyHeaders(next http.Handler, trusted bool) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
-			clone := r.Clone(r.Context())
-			clone.RemoteAddr = net.JoinHostPort(ip.String(), "0")
-			r = clone
+		proxyIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			proxyIP = r.RemoteAddr
+		}
+		remoteIP := net.ParseIP(strings.TrimSpace(proxyIP))
+		trustedPeer := len(networks) == 0 && isPrivateProxyPeer(remoteIP)
+		for _, network := range networks {
+			if remoteIP != nil && network.Contains(remoteIP) {
+				trustedPeer = true
+				break
+			}
+		}
+		if trustedPeer {
+			if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+				clone := r.Clone(r.Context())
+				clone.RemoteAddr = net.JoinHostPort(ip.String(), "0")
+				r = clone
+			}
+		} else {
+			r.Header.Del("Forwarded")
+			r.Header.Del("X-Forwarded-For")
+			r.Header.Del("X-Forwarded-Proto")
+			r.Header.Del("X-Real-IP")
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isPrivateProxyPeer(ip net.IP) bool {
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
 }
 
 func isHTTPS(r *http.Request) bool {

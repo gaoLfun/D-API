@@ -100,7 +100,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.ProxyHeaders(httpapi.SecurityHeaders(mux), cfg.TrustProxy),
+		Handler:           httpapi.ProxyHeaders(httpapi.SecurityHeaders(mux), cfg.TrustProxy, cfg.TrustedProxyCIDRs...),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       2 * time.Minute,

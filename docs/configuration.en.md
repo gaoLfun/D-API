@@ -47,6 +47,7 @@ command documented in [Deployment](deployment.en.md).
 | `DAPI_HEALTH_INTERVAL` | `30s` | Automatic upstream health-check interval |
 | `DAPI_BALANCE_INTERVAL` | `10m` | Automatic balance-check interval |
 | `DAPI_TRUST_PROXY` | `false` | Trust a valid `X-Real-IP` supplied by the immediate proxy |
+| `DAPI_TRUSTED_PROXY_CIDRS` | empty | Optional comma-separated CIDRs whose peers may supply `X-Real-IP` |
 <!-- markdownlint-enable MD013 -->
 
 Gateway resource limits:
