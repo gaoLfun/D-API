@@ -143,8 +143,61 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatalf("second failure status=%q err=%v", status, err)
 	}
 	status, err = database.SaveHealth(ctx, upstreamID, true, "", false)
-	if err != nil || status != "healthy" {
-		t.Fatalf("health recovery status=%q err=%v", status, err)
+	if err != nil || status != "unhealthy" {
+		t.Fatalf("gateway success closed incident status=%q err=%v", status, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil || record.ConsecutiveSuccess != 0 || record.LastError != "HTTP 503" {
+		t.Fatalf("gateway success changed recovery state: %#v err=%v", record.Upstream, err)
+	}
+	status, notification, err := database.SaveProbeHealth(ctx, upstreamID, true, "", false)
+	if err != nil || status != "unhealthy" || notification != "unhealthy" {
+		t.Fatalf("first recovery confirmation status=%q notification=%q err=%v", status, notification, err)
+	}
+	if err := database.AcknowledgeHealthNotification(ctx, upstreamID, notification); err != nil {
+		t.Fatal(err)
+	}
+	status, notification, err = database.SaveProbeHealth(ctx, upstreamID, true, "", false)
+	if err != nil || status != "unhealthy" || notification != "" {
+		t.Fatalf("second recovery confirmation status=%q notification=%q err=%v", status, notification, err)
+	}
+	status, notification, err = database.SaveProbeHealth(ctx, upstreamID, true, "", false)
+	if err != nil || status != "healthy" || notification != "healthy" {
+		t.Fatalf("confirmed health recovery status=%q notification=%q err=%v", status, notification, err)
+	}
+	if err := database.AcknowledgeHealthNotification(ctx, upstreamID, notification); err != nil {
+		t.Fatal(err)
+	}
+	if status, err = database.SaveHealth(ctx, upstreamID, false, "HTTP 503", false); err != nil || status != "degraded" {
+		t.Fatalf("new incident first failure status=%q err=%v", status, err)
+	}
+	if status, err = database.SaveHealth(ctx, upstreamID, false, "HTTP 503", false); err != nil || status != "unhealthy" {
+		t.Fatalf("new incident status=%q err=%v", status, err)
+	}
+	if err := database.AcknowledgeHealthNotification(ctx, upstreamID, "unhealthy"); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, err = database.SaveProbeHealth(ctx, upstreamID, true, "", false); err != nil || status != "unhealthy" {
+		t.Fatalf("new incident recovery confirmation status=%q err=%v", status, err)
+	}
+	if status, err = database.SaveHealth(ctx, upstreamID, false, "HTTP 503", false); err != nil || status != "unhealthy" {
+		t.Fatalf("recovery interruption status=%q err=%v", status, err)
+	}
+	record, err = database.Upstream(ctx, upstreamID)
+	if err != nil || record.ConsecutiveSuccess != 0 || record.RecoveryStartedAt != nil {
+		t.Fatalf("recovery progress was not reset: %#v err=%v", record.Upstream, err)
+	}
+	if status, _, err = database.SaveProbeHealth(ctx, upstreamID, true, "", false); err != nil || status != "unhealthy" {
+		t.Fatalf("timed recovery start status=%q err=%v", status, err)
+	}
+	if _, err := database.db.ExecContext(ctx, `UPDATE upstreams SET recovery_started_at=now()-interval '3 minutes' WHERE id=$1`, upstreamID); err != nil {
+		t.Fatal(err)
+	}
+	if status, err = database.SaveHealth(ctx, upstreamID, true, "", false); err != nil || status != "unhealthy" {
+		t.Fatalf("gateway success bypassed timed recovery status=%q err=%v", status, err)
+	}
+	if status, notification, err = database.SaveProbeHealth(ctx, upstreamID, true, "", false); err != nil || status != "healthy" || notification != "healthy" {
+		t.Fatalf("timed health recovery status=%q err=%v", status, err)
 	}
 
 	secondaryID, err := database.CreateUpstream(ctx, core.Upstream{

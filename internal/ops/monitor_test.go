@@ -16,6 +16,8 @@ type monitorRepository struct {
 	health            []Health
 	events            []Event
 	status            string
+	notification      string
+	acknowledged      []string
 	balanceTransition core.BalanceTransition
 	balanceImmediate  bool
 }
@@ -25,8 +27,11 @@ type boundedMonitorRepository struct{ upstreams []core.Upstream }
 func (r boundedMonitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {
 	return r.upstreams, nil
 }
-func (boundedMonitorRepository) SaveHealth(context.Context, int64, Health) (string, error) {
-	return "healthy", nil
+func (boundedMonitorRepository) SaveHealth(context.Context, int64, Health) (string, string, error) {
+	return "healthy", "", nil
+}
+func (boundedMonitorRepository) AcknowledgeHealthNotification(context.Context, int64, string) error {
+	return nil
 }
 func (boundedMonitorRepository) SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error) {
 	return core.BalanceUnchanged, nil
@@ -72,7 +77,7 @@ func TestMonitorParallelUsesBoundedWorkers(t *testing.T) {
 func (r *monitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {
 	return r.upstreams, nil
 }
-func (r *monitorRepository) SaveHealth(_ context.Context, id int64, health Health) (string, error) {
+func (r *monitorRepository) SaveHealth(_ context.Context, id int64, health Health) (string, string, error) {
 	r.health = append(r.health, health)
 	status := r.status
 	if status == "" {
@@ -83,7 +88,12 @@ func (r *monitorRepository) SaveHealth(_ context.Context, id int64, health Healt
 			r.upstreams[index].HealthStatus = status
 		}
 	}
-	return status, nil
+	return status, r.notification, nil
+}
+func (r *monitorRepository) AcknowledgeHealthNotification(_ context.Context, _ int64, status string) error {
+	r.acknowledged = append(r.acknowledged, status)
+	r.notification = ""
+	return nil
 }
 func (r *monitorRepository) SaveBalance(_ context.Context, _ int64, _ core.Balance, immediate bool) (core.BalanceTransition, error) {
 	r.balanceImmediate = immediate
@@ -102,7 +112,10 @@ func (monitorProber) CheckBalance(context.Context, core.Upstream) core.Balance {
 }
 
 func TestMonitorEmitsHealthTransition(t *testing.T) {
-	repository := &monitorRepository{upstreams: []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "healthy"}}}
+	repository := &monitorRepository{
+		upstreams:    []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "healthy"}},
+		notification: "unhealthy",
+	}
 	prober := monitorProber{health: Health{Status: "unhealthy", CheckedAt: time.Now(), Error: "HTTP 503"}}
 	notifications := 0
 	monitor := NewMonitor(repository, prober, NotifierFunc(func(context.Context, Event) error {
@@ -113,7 +126,7 @@ func TestMonitorEmitsHealthTransition(t *testing.T) {
 	if err := monitor.RunHealth(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(repository.health) != 1 || len(repository.events) != 1 || repository.events[0].State != "unhealthy" || notifications != 1 {
+	if len(repository.health) != 1 || len(repository.events) != 1 || repository.events[0].State != "unhealthy" || notifications != 1 || len(repository.acknowledged) != 1 {
 		t.Fatalf("health=%d events=%#v notifications=%d", len(repository.health), repository.events, notifications)
 	}
 }
@@ -138,6 +151,100 @@ func TestMonitorDoesNotNotifyDegradedHealth(t *testing.T) {
 	}
 	if notifications != 0 {
 		t.Fatalf("notifications=%d", notifications)
+	}
+}
+
+func TestMonitorDoesNotNotifyRecoveryFromDegradedHealth(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams: []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "degraded"}},
+		status:    "healthy",
+	}
+	notifications := 0
+	monitor := NewMonitor(repository, monitorProber{health: Health{Status: "healthy", CheckedAt: time.Now()}}, NotifierFunc(func(context.Context, Event) error {
+		notifications++
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repository.events) != 1 || repository.events[0].Previous != "degraded" || repository.events[0].State != "healthy" {
+		t.Fatalf("events = %#v", repository.events)
+	}
+	if notifications != 0 {
+		t.Fatalf("notifications=%d", notifications)
+	}
+}
+
+func TestMonitorNotifiesConfirmedRecoveryFromUnhealthy(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:    []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "unhealthy"}},
+		status:       "healthy",
+		notification: "healthy",
+	}
+	notifications := 0
+	monitor := NewMonitor(repository, monitorProber{health: Health{Status: "healthy", CheckedAt: time.Now()}}, NotifierFunc(func(_ context.Context, event Event) error {
+		notifications++
+		if event.Previous != "unhealthy" || event.State != "healthy" {
+			t.Fatalf("event = %#v", event)
+		}
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 1 || len(repository.acknowledged) != 1 || repository.acknowledged[0] != "healthy" {
+		t.Fatalf("notifications=%d", notifications)
+	}
+}
+
+func TestMonitorDeliversGatewayTransitionPendingInStore(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:    []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "unhealthy"}},
+		status:       "unhealthy",
+		notification: "unhealthy",
+	}
+	var delivered Event
+	monitor := NewMonitor(repository, monitorProber{health: Health{Status: "unhealthy", CheckedAt: time.Now()}}, NotifierFunc(func(_ context.Context, event Event) error {
+		delivered = event
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if delivered.State != "unhealthy" || delivered.Previous != "healthy" || len(repository.acknowledged) != 1 {
+		t.Fatalf("delivered=%#v acknowledged=%v", delivered, repository.acknowledged)
+	}
+}
+
+func TestMonitorRetriesUnacknowledgedHealthNotification(t *testing.T) {
+	repository := &monitorRepository{
+		upstreams:    []core.Upstream{{ID: 1, Name: "primary", Enabled: true, HealthStatus: "unhealthy"}},
+		status:       "unhealthy",
+		notification: "unhealthy",
+	}
+	attempts := 0
+	monitor := NewMonitor(repository, monitorProber{health: Health{Status: "unhealthy", CheckedAt: time.Now()}}, NotifierFunc(func(context.Context, Event) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("notification unavailable")
+		}
+		return nil
+	}), MonitorConfig{Concurrency: 1})
+
+	if err := monitor.RunHealth(context.Background()); err == nil {
+		t.Fatal("first notification should fail")
+	}
+	if len(repository.acknowledged) != 0 || repository.notification != "unhealthy" {
+		t.Fatalf("notification was acknowledged after failure: %#v", repository)
+	}
+	if err := monitor.RunHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || len(repository.acknowledged) != 1 || repository.notification != "" {
+		t.Fatalf("attempts=%d acknowledged=%v notification=%q", attempts, repository.acknowledged, repository.notification)
 	}
 }
 

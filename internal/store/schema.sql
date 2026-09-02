@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS upstreams (
     cooldown_seconds INTEGER NOT NULL DEFAULT 60,
     health_status TEXT NOT NULL DEFAULT 'unknown',
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_successes INTEGER NOT NULL DEFAULT 0,
+    recovery_started_at TIMESTAMPTZ,
+    health_notified_status TEXT NOT NULL DEFAULT 'healthy',
     circuit_open_until TIMESTAMPTZ,
     last_check_at TIMESTAMPTZ,
     last_error TEXT NOT NULL DEFAULT '',
@@ -57,6 +60,9 @@ ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT 
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_protection_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS balance_suspended BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS zero_balance_checks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS consecutive_successes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS recovery_started_at TIMESTAMPTZ;
+ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS health_notified_status TEXT NOT NULL DEFAULT 'healthy';
 ALTER TABLE upstreams ALTER COLUMN first_byte_timeout_ms SET DEFAULT 180000;
 
 CREATE TABLE IF NOT EXISTS pricing_profiles (

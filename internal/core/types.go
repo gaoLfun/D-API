@@ -56,6 +56,9 @@ type Upstream struct {
 	Cooldown           time.Duration     `json:"-"`
 	HealthStatus       string            `json:"health_status"`
 	ConsecutiveFailure int               `json:"consecutive_failures"`
+	ConsecutiveSuccess int               `json:"consecutive_successes"`
+	RecoveryStartedAt  *time.Time        `json:"recovery_started_at,omitempty"`
+	HealthNotified     string            `json:"-"`
 	CircuitOpenUntil   *time.Time        `json:"circuit_open_until,omitempty"`
 	LastCheckAt        *time.Time        `json:"last_check_at,omitempty"`
 	LastError          string            `json:"last_error,omitempty"`

@@ -25,7 +25,8 @@ const upstreamColumns = `
 	enabled, balance_protection_enabled, balance_suspended, zero_balance_checks,
 	priority, protocols, models, models_locked, model_aliases, connect_timeout_ms,
 	first_byte_timeout_ms, idle_timeout_ms, failure_threshold, cooldown_seconds,
-	health_status, consecutive_failures, circuit_open_until, last_check_at, last_error,
+	health_status, consecutive_failures, consecutive_successes, recovery_started_at, health_notified_status,
+	circuit_open_until, last_check_at, last_error,
 	balance, created_at, updated_at, pricing_profile_id`
 
 func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
@@ -350,29 +351,97 @@ func writeBalanceAlertEvent(ctx context.Context, tx *sql.Tx, id int64, name stri
 }
 
 func (s *Store) SaveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool) (string, error) {
+	status, _, err := s.saveHealth(ctx, id, healthy, message, authFailure, false)
+	return status, err
+}
+
+// SaveProbeHealth advances recovery confirmation. Ordinary gateway successes
+// deliberately use SaveHealth so traffic bursts cannot prematurely close an incident.
+func (s *Store) SaveProbeHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool) (string, string, error) {
+	return s.saveHealth(ctx, id, healthy, message, authFailure, true)
+}
+
+func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure, confirmRecovery bool) (string, string, error) {
 	var status string
+	var notified string
 	if healthy {
 		err := s.db.QueryRowContext(ctx, `
-			UPDATE upstreams SET health_status='healthy', consecutive_failures=0,
-				circuit_open_until=NULL, last_check_at=now(), last_error='', updated_at=now()
-			WHERE id=$1 RETURNING health_status`, id).Scan(&status)
+			UPDATE upstreams SET
+				health_status=CASE
+					WHEN health_status='unhealthy'
+						AND (NOT $2 OR (consecutive_successes + 1 < 3
+							AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')))
+					THEN 'unhealthy' ELSE 'healthy' END,
+				consecutive_failures=0,
+				consecutive_successes=CASE
+					WHEN health_status='unhealthy' AND NOT $2 THEN consecutive_successes
+					WHEN health_status='unhealthy'
+						AND consecutive_successes + 1 < 3
+						AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')
+					THEN consecutive_successes + 1 ELSE 0 END,
+				recovery_started_at=CASE
+					WHEN health_status='unhealthy' AND NOT $2 THEN recovery_started_at
+					WHEN health_status='unhealthy'
+						AND consecutive_successes + 1 < 3
+						AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')
+					THEN COALESCE(recovery_started_at,now()) ELSE NULL END,
+				circuit_open_until=CASE
+					WHEN health_status='unhealthy'
+						AND (NOT $2 OR (consecutive_successes + 1 < 3
+							AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')))
+					THEN circuit_open_until ELSE NULL END,
+				last_check_at=now(),
+				last_error=CASE
+					WHEN health_status='unhealthy'
+						AND (NOT $2 OR (consecutive_successes + 1 < 3
+							AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')))
+					THEN last_error ELSE '' END,
+				updated_at=now()
+			WHERE id=$1 RETURNING health_status,health_notified_status`, id, confirmRecovery).Scan(&status, &notified)
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrNotFound
+			return "", "", ErrNotFound
 		}
-		return status, err
+		return status, pendingHealthNotification(status, notified), err
 	}
 	err := s.db.QueryRowContext(ctx, `
 		UPDATE upstreams SET
-			health_status=CASE WHEN $3 OR consecutive_failures + 1 >= failure_threshold THEN 'unhealthy' ELSE 'degraded' END,
+			health_status=CASE WHEN health_status='unhealthy' OR $3 OR consecutive_failures + 1 >= failure_threshold THEN 'unhealthy' ELSE 'degraded' END,
 			consecutive_failures=consecutive_failures + 1,
-			circuit_open_until=CASE WHEN $3 OR consecutive_failures + 1 >= failure_threshold
+			consecutive_successes=0, recovery_started_at=NULL,
+			circuit_open_until=CASE WHEN health_status='unhealthy' OR $3 OR consecutive_failures + 1 >= failure_threshold
 				THEN now() + make_interval(secs => cooldown_seconds) ELSE circuit_open_until END,
 			last_check_at=now(), last_error=$2, updated_at=now()
-		WHERE id=$1 RETURNING health_status`, id, message, authFailure).Scan(&status)
+		WHERE id=$1 RETURNING health_status,health_notified_status`, id, message, authFailure).Scan(&status, &notified)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
+		return "", "", ErrNotFound
 	}
-	return status, err
+	return status, pendingHealthNotification(status, notified), err
+}
+
+func pendingHealthNotification(status, notified string) string {
+	if status == "unhealthy" && notified != "unhealthy" {
+		return "unhealthy"
+	}
+	if status == "healthy" && notified == "unhealthy" {
+		return "healthy"
+	}
+	return ""
+}
+
+func (s *Store) AcknowledgeHealthNotification(ctx context.Context, id int64, status string) error {
+	if status != "healthy" && status != "unhealthy" {
+		return errors.New("invalid health notification status")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE upstreams SET health_notified_status=$2 WHERE id=$1`, id, status)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) encryptUpstream(upstream core.Upstream) ([]byte, []byte, []byte, []byte, error) {
@@ -405,7 +474,8 @@ func (s *Store) scanUpstream(row scanner) (UpstreamRecord, error) {
 		&record.Enabled, &record.BalanceProtection, &record.BalanceSuspended, &record.ZeroBalanceChecks,
 		&record.Priority, pq.Array(&record.Protocols), pq.Array(&record.Models), &record.ModelsLocked, &aliases,
 		&connectMS, &firstByteMS, &idleMS, &record.FailureThreshold, &cooldownSeconds,
-		&record.HealthStatus, &record.ConsecutiveFailure, &record.CircuitOpenUntil, &record.LastCheckAt,
+		&record.HealthStatus, &record.ConsecutiveFailure, &record.ConsecutiveSuccess, &record.RecoveryStartedAt, &record.HealthNotified,
+		&record.CircuitOpenUntil, &record.LastCheckAt,
 		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt, &record.PricingProfileID,
 	)
 	if err != nil {

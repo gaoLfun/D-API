@@ -59,18 +59,22 @@ func (r OpsRepository) ListUpstreams(ctx context.Context) ([]core.Upstream, erro
 	return r.Store.ListUpstreams(ctx)
 }
 
-func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Health) (string, error) {
+func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Health) (string, string, error) {
 	healthy := health.Status == "healthy"
-	status, err := r.Store.SaveHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden)
+	status, notification, err := r.Store.SaveProbeHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if healthy && health.Models != nil {
 		if err := r.Store.SaveDiscoveredModels(ctx, id, health.Models); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
-	return status, nil
+	return status, notification, nil
+}
+
+func (r OpsRepository) AcknowledgeHealthNotification(ctx context.Context, id int64, status string) error {
+	return r.Store.AcknowledgeHealthNotification(ctx, id, status)
 }
 
 func (r OpsRepository) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
@@ -96,7 +100,7 @@ func (o Operations) Check(ctx context.Context, id int64) (ops.Health, error) {
 		return ops.Health{}, err
 	}
 	health := o.Prober.CheckHealth(ctx, upstream.Upstream)
-	if _, err := (OpsRepository{Store: o.Store}).SaveHealth(ctx, id, health); err != nil {
+	if _, _, err := (OpsRepository{Store: o.Store}).SaveHealth(ctx, id, health); err != nil {
 		return ops.Health{}, err
 	}
 	return health, nil

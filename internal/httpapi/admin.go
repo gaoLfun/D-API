@@ -293,6 +293,8 @@ type upstreamView struct {
 	CooldownSeconds      int64             `json:"cooldown_seconds"`
 	HealthStatus         string            `json:"health_status"`
 	ConsecutiveFailures  int               `json:"consecutive_failures"`
+	ConsecutiveSuccesses int               `json:"consecutive_successes"`
+	RecoveryStartedAt    *time.Time        `json:"recovery_started_at,omitempty"`
 	CircuitOpenUntil     *time.Time        `json:"circuit_open_until,omitempty"`
 	LastCheckAt          *time.Time        `json:"last_check_at,omitempty"`
 	LastError            string            `json:"last_error,omitempty"`
@@ -1490,6 +1492,7 @@ func viewUpstream(record store.UpstreamRecord) upstreamView {
 		FirstByteTimeoutMS: record.FirstByteTimeout.Milliseconds(), IdleTimeoutMS: record.IdleTimeout.Milliseconds(),
 		FailureThreshold: record.FailureThreshold, CooldownSeconds: int64(record.Cooldown.Seconds()),
 		HealthStatus: record.HealthStatus, ConsecutiveFailures: record.ConsecutiveFailure,
+		ConsecutiveSuccesses: record.ConsecutiveSuccess, RecoveryStartedAt: record.RecoveryStartedAt,
 		CircuitOpenUntil: record.CircuitOpenUntil, LastCheckAt: record.LastCheckAt, LastError: record.LastError,
 		Balance: record.Balance, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}

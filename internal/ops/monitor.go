@@ -25,7 +25,8 @@ type Event struct {
 
 type Repository interface {
 	ListUpstreams(context.Context) ([]core.Upstream, error)
-	SaveHealth(context.Context, int64, Health) (string, error)
+	SaveHealth(context.Context, int64, Health) (string, string, error)
+	AcknowledgeHealthNotification(context.Context, int64, string) error
 	SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error)
 	SaveEvent(context.Context, Event) error
 }
@@ -95,42 +96,52 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 	return m.parallel(ctx, upstreams, func(ctx context.Context, upstream core.Upstream) error {
 		pendingErr := m.retryPending(ctx, upstream.ID)
 		health := m.Prober.CheckHealth(ctx, upstream)
-		status, err := m.Repository.SaveHealth(ctx, upstream.ID, health)
+		status, notification, err := m.Repository.SaveHealth(ctx, upstream.ID, health)
 		if err != nil {
 			return errors.Join(pendingErr, err)
 		}
-		if upstream.HealthStatus == "" || upstream.HealthStatus == "unknown" || upstream.HealthStatus == status {
+		transitioned := upstream.HealthStatus != "" && upstream.HealthStatus != "unknown" && upstream.HealthStatus != status
+		var transitionEvent *Event
+		if transitioned {
+			event := healthEvent(upstream, upstream.HealthStatus, status, health.CheckedAt)
+			if err := m.Repository.SaveEvent(ctx, event); err != nil {
+				return errors.Join(pendingErr, err)
+			}
+			transitionEvent = &event
+		}
+		if notification == "" {
 			return pendingErr
 		}
-		event := Event{
-			Type:         "upstream_health",
-			State:        status,
-			Previous:     upstream.HealthStatus,
-			UpstreamID:   upstream.ID,
-			UpstreamName: upstream.Name,
-			Message:      fmt.Sprintf("上游 %s 状态从 %s 变更为 %s", upstream.Name, upstream.HealthStatus, status),
-			At:           health.CheckedAt,
+		previous := "healthy"
+		if notification == "healthy" {
+			previous = "unhealthy"
 		}
-		if err := m.Repository.SaveEvent(ctx, event); err != nil {
-			return errors.Join(pendingErr, err)
-		}
-		// 降级是短暂的观察状态，只记录状态变化，不发送推送；
-		// 只有最终异常或恢复才通知，避免短时抖动造成噪声。
-		if status == "degraded" {
-			return pendingErr
+		event := healthEvent(upstream, previous, notification, health.CheckedAt)
+		if transitionEvent != nil && transitionEvent.State == notification {
+			event = *transitionEvent
+		} else {
+			if err := m.Repository.SaveEvent(ctx, event); err != nil {
+				return errors.Join(pendingErr, err)
+			}
 		}
 		if m.Notifier != nil {
-			if pendingErr != nil {
-				m.setPending(event)
-				return pendingErr
-			}
 			if err := m.Notifier.Notify(ctx, event); err != nil {
-				m.setPending(event)
-				return err
+				return errors.Join(pendingErr, err)
 			}
+		}
+		if err := m.Repository.AcknowledgeHealthNotification(ctx, upstream.ID, notification); err != nil {
+			return errors.Join(pendingErr, err)
 		}
 		return pendingErr
 	})
+}
+
+func healthEvent(upstream core.Upstream, previous, status string, at time.Time) Event {
+	return Event{
+		Type: "upstream_health", State: status, Previous: previous,
+		UpstreamID: upstream.ID, UpstreamName: upstream.Name,
+		Message: fmt.Sprintf("上游 %s 状态从 %s 变更为 %s", upstream.Name, previous, status), At: at,
+	}
 }
 
 func (m *Monitor) retryPending(ctx context.Context, upstreamID int64) error {
