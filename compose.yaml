@@ -51,6 +51,8 @@ services:
 
   caddy:
     image: caddy:2.10-alpine
+    # 本机由宿主 caddy 统一接管 80/443，此处自带 caddy 默认不启用；需要独立域名入口时: docker compose --profile caddy up -d
+    profiles: ["caddy"]
     restart: unless-stopped
     environment:
       DAPI_DOMAIN: ${DAPI_DOMAIN:-localhost}
