@@ -167,7 +167,7 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 		state.LastNotifiedAt = &now
 		if resolved && notifyErr == nil {
 			state.NotificationCount = 0
-		} else {
+		} else if notifyErr == nil {
 			state.NotificationCount++
 		}
 		if notifyErr != nil {

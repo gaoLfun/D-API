@@ -4,12 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+type brokenWebhookBody struct{}
+
+func (brokenWebhookBody) Read(p []byte) (int, error) {
+	return copy(p, `{"errcode":`), io.ErrUnexpectedEOF
+}
+func (brokenWebhookBody) Close() error { return nil }
+
+type webhookTransport func(*http.Request) (*http.Response, error)
+
+func (f webhookTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestWebhookRejectsUnreadableBody(t *testing.T) {
+	for _, body := range []io.ReadCloser{brokenWebhookBody{}, io.NopCloser(strings.NewReader(strings.Repeat("x", (64<<10)+1)))} {
+		client := &http.Client{Transport: webhookTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: body}, nil
+		})}
+		notifier := NewWebhookNotifier(WebhookConfig{URL: "https://example.com"}, client)
+		if err := notifier.Notify(context.Background(), Event{}); err == nil {
+			t.Fatal("unreadable response marked successful")
+		}
+	}
+}
 
 func TestWebhookNotifier(t *testing.T) {
 	var received Event

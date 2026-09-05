@@ -55,6 +55,11 @@ caches. Related admin mutations invalidate them immediately. Client-key and
 route caches are bounded to 4,096 and 1,024 entries respectively, and route
 entries expire within two seconds, so PostgreSQL remains the source of truth.
 
+Concurrent cache misses for the same key reuse the completed load. Probes that
+do not change routing no longer invalidate routes. Bounded price histories are
+evaluated at request start time, and dashboard results are cached for three
+seconds without changing metric definitions. See [performance](performance.md).
+
 Upstreams with the same priority retain database order. There is no weighted,
 random, cost-aware, or least-latency load balancing at present.
 

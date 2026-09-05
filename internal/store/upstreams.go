@@ -50,6 +50,14 @@ func (s *Store) ListRouteUpstreams(ctx context.Context, groupID int64, protocol,
 	if ok {
 		return cached, nil
 	}
+	release, err := s.routeLoads.acquire(ctx, cacheKey)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if cached, ok, generation = s.cachedRoutes(cacheKey, time.Now()); ok {
+		return cached, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT u.*
 		FROM (SELECT `+upstreamColumns+` FROM upstreams
@@ -246,9 +254,11 @@ func (s *Store) SaveModels(ctx context.Context, id int64, models []string) error
 }
 
 func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, updated_at=now() WHERE id=$2 AND models_locked=false`, pq.Array(models), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, updated_at=now() WHERE id=$2 AND models_locked=false AND models IS DISTINCT FROM $1`, pq.Array(models), id)
 	if err == nil {
-		s.invalidateRouteCache()
+		if count, _ := result.RowsAffected(); count > 0 {
+			s.invalidateRouteCache()
+		}
 	}
 	return err
 }
@@ -317,7 +327,9 @@ func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance,
 	if err := tx.Commit(); err != nil {
 		return core.BalanceUnchanged, err
 	}
-	s.invalidateRouteCache()
+	if transition != core.BalanceUnchanged {
+		s.invalidateRouteCache()
+	}
 	return transition, nil
 }
 
@@ -385,7 +397,12 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 	var status string
 	var notified string
 	if healthy {
+		var changed bool
 		err := s.db.QueryRowContext(ctx, `
+			WITH previous AS MATERIALIZED (
+				SELECT id,health_status AS old_status,consecutive_failures AS old_failures,
+					circuit_open_until AS old_circuit FROM upstreams WHERE id=$1 FOR UPDATE
+			)
 			UPDATE upstreams SET
 				health_status=CASE
 					WHEN health_status='unhealthy'
@@ -417,11 +434,15 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 							AND (recovery_started_at IS NULL OR recovery_started_at > now()-interval '2 minutes')))
 					THEN last_error ELSE '' END,
 				updated_at=now()
-			WHERE id=$1 RETURNING health_status,health_notified_status`, id, confirmRecovery).Scan(&status, &notified)
+			FROM previous WHERE upstreams.id=previous.id
+			RETURNING health_status,health_notified_status,
+				health_status IS DISTINCT FROM previous.old_status OR
+				consecutive_failures IS DISTINCT FROM previous.old_failures OR
+				circuit_open_until IS DISTINCT FROM previous.old_circuit`, id, confirmRecovery).Scan(&status, &notified, &changed)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", ErrNotFound
 		}
-		if err == nil {
+		if err == nil && changed {
 			s.invalidateRouteCache()
 		}
 		return status, pendingHealthNotification(status, notified), err

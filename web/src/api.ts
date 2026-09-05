@@ -21,8 +21,8 @@ export async function request<T>(path: string, options: RequestInit = {}, timeou
 
     const contentType = response.headers.get('content-type') || ''
     const body = contentType.includes('application/json')
-      ? await response.json().catch(() => null)
-      : await response.text().catch(() => '')
+      ? await response.json()
+      : await response.text()
     if (!response.ok) {
       const error = typeof body === 'object' && body ? body.error : null
       const message = typeof body === 'object' && body

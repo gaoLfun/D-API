@@ -16,17 +16,24 @@ import (
 var schema string
 
 type Store struct {
-	db             *sql.DB
-	box            *cryptox.SecretBox
-	pricingMu      sync.RWMutex
-	pricingCache   map[pricingCacheKey]pricingCacheEntry
-	cacheMu        sync.RWMutex
-	authCache      map[string]authCacheEntry
-	routeCache     map[routeCacheKey]routeCacheEntry
-	maxAttempts    maxAttemptsCacheEntry
-	authGen        uint64
-	routeGen       uint64
-	maxAttemptsGen uint64
+	db               *sql.DB
+	box              *cryptox.SecretBox
+	pricingMu        sync.RWMutex
+	pricingCache     map[pricingCacheKey]pricingCacheEntry
+	cacheMu          sync.RWMutex
+	authCache        map[string]authCacheEntry
+	routeCache       map[routeCacheKey]routeCacheEntry
+	maxAttempts      maxAttemptsCacheEntry
+	authGen          uint64
+	routeGen         uint64
+	maxAttemptsGen   uint64
+	routeLoads       loadGate[routeCacheKey]
+	authLoads        loadGate[string]
+	pricingLoads     loadGate[pricingCacheKey]
+	pricingGen       uint64
+	dashboardLoads   loadGate[int]
+	dashboardValue   Dashboard
+	dashboardExpires time.Time
 }
 
 func Open(ctx context.Context, databaseURL string, box *cryptox.SecretBox) (*Store, error) {

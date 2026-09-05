@@ -157,8 +157,17 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, raw string) (core.APIKey
 	if ok {
 		return cached, nil
 	}
+	release, err := s.authLoads.acquire(ctx, cacheKey)
+	if err != nil {
+		return core.APIKey{}, err
+	}
+	defer release()
+	now = time.Now()
+	if cached, ok, generation = s.cachedAPIKey(cacheKey, now); ok {
+		return cached, nil
+	}
 	var key core.APIKey
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT k.id,k.name,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.enabled,false),k.key_prefix,k.enabled,k.protocols,k.models,k.last_used_at,k.created_at
 		FROM api_keys k LEFT JOIN groups g ON g.id=k.group_id
 		WHERE k.key_hash=$1 AND k.enabled=true`,

@@ -522,6 +522,10 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 			groups = other
 			otherDurations := make(map[usageGroupKey]durationStat)
 			for key, stat := range durationStats {
+				if keep[key.value] {
+					otherDurations[key] = stat
+					continue
+				}
 				if !keep[key.value] {
 					key.value = "__other__"
 				}

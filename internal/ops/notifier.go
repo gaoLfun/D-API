@@ -140,7 +140,13 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 		return fmt.Errorf("send webhook: %w", err)
 	}
 	defer resp.Body.Close()
-	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (64<<10)+1))
+	if err != nil {
+		return fmt.Errorf("read webhook response: %w", err)
+	}
+	if len(responseBody) > 64<<10 {
+		return errors.New("webhook response too large")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
 	}

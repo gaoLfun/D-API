@@ -94,11 +94,41 @@ func (s *Store) TodayUpstreamUsage(ctx context.Context) (map[int64]UpstreamUsage
 }
 
 func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
+	release, err := s.dashboardLoads.acquire(ctx, 0)
+	if err != nil {
+		return Dashboard{}, err
+	}
+	defer release()
+	if s.dashboardExpires.After(time.Now()) {
+		return cloneDashboard(s.dashboardValue), nil
+	}
+	value, err := s.loadDashboard(ctx)
+	if err != nil {
+		return Dashboard{}, err
+	}
+	s.dashboardValue = value
+	s.dashboardExpires = time.Now().Add(3 * time.Second)
+	return cloneDashboard(value), nil
+}
+
+func cloneDashboard(value Dashboard) Dashboard {
+	value.Daily = append([]DailyStat(nil), value.Daily...)
+	value.Hourly = append([]HourlyStat(nil), value.Hourly...)
+	for _, field := range []**float64{&value.CacheHitRate24H, &value.RequestHitRate24H, &value.CostCoverage24H} {
+		if *field != nil {
+			copy := **field
+			*field = &copy
+		}
+	}
+	return value
+}
+
+func (s *Store) loadDashboard(ctx context.Context) (Dashboard, error) {
 	var result Dashboard
 	err := s.db.QueryRowContext(ctx, `
 		WITH metrics AS (
 			SELECT count(*) AS requests,
-				COALESCE(100.0*count(*) FILTER (WHERE status_code BETWEEN 200 AND 399)/NULLIF(count(*),0),0) AS success_rate,
+				COALESCE(100.0*count(*) FILTER (WHERE status_code BETWEEN 200 AND 399 AND error_code='')/NULLIF(count(*),0),0) AS success_rate,
 				COALESCE(avg(duration_ms),0) AS average_latency,
 				COALESCE(sum(input_tokens),0) AS input_tokens,
 				COALESCE(sum(output_tokens),0) AS output_tokens,

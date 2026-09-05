@@ -220,7 +220,7 @@ func TestEngineDoesNotResolveOnUnknownObservation(t *testing.T) {
 func TestEnginePersistsFailedNotificationForCooldownRetry(t *testing.T) {
 	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	repository := &testRepository{
-		rules:        []Rule{{ID: 1, Event: EventLatency, Enabled: true, Cooldown: time.Hour, MaxNotifications: 2}},
+		rules:        []Rule{{ID: 1, Event: EventLatency, Enabled: true, Cooldown: time.Hour, MaxNotifications: 1}},
 		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true}}},
 		states:       make(map[string]State),
 	}
@@ -237,15 +237,23 @@ func TestEnginePersistsFailedNotificationForCooldownRetry(t *testing.T) {
 		t.Fatal("first notification should fail")
 	}
 	state := repository.states[stateKey(1, "upstream:7")]
-	if !state.Active || state.NotificationCount != 1 || state.LastNotifiedAt == nil {
+	if !state.Active || state.NotificationCount != 0 || state.LastNotifiedAt == nil {
 		t.Fatalf("failed notification state = %#v", state)
+	}
+	engine.now = func() time.Time { return now.Add(time.Minute) }
+	if err := engine.RunOnce(context.Background()); err != nil || attempts != 1 {
+		t.Fatalf("cooldown attempts=%d err=%v", attempts, err)
 	}
 	engine.now = func() time.Time { return now.Add(time.Hour) }
 	if err := engine.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if attempts != 2 || repository.states[stateKey(1, "upstream:7")].NotificationCount != 2 {
+	if attempts != 2 || repository.states[stateKey(1, "upstream:7")].NotificationCount != 1 {
 		t.Fatalf("attempts=%d state=%#v", attempts, repository.states[stateKey(1, "upstream:7")])
+	}
+	engine.now = func() time.Time { return now.Add(2 * time.Hour) }
+	if err := engine.RunOnce(context.Background()); err != nil || attempts != 2 {
+		t.Fatalf("limit attempts=%d err=%v", attempts, err)
 	}
 }
 

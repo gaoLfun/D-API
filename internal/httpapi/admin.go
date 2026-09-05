@@ -806,9 +806,6 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_key", "名称或协议无效")
 		return
 	}
-	if !s.requireAvailableGroup(w, r, input.GroupID) {
-		return
-	}
 	enabled := true
 	if input.Enabled != nil {
 		enabled = *input.Enabled
@@ -816,6 +813,9 @@ func (s *Server) updateKey(w http.ResponseWriter, r *http.Request) {
 	existing, err := s.store.APIKey(r.Context(), id)
 	if err != nil {
 		writeStoreError(w, err)
+		return
+	}
+	if (enabled || input.GroupID != existing.GroupID) && !s.requireAvailableGroup(w, r, input.GroupID) {
 		return
 	}
 	err = s.store.UpdateAPIKey(r.Context(), core.APIKey{ID: id, GroupID: input.GroupID, Name: strings.TrimSpace(input.Name), Enabled: enabled, Protocols: input.Protocols, Models: cleanStrings(input.Models)})

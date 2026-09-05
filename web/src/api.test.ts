@@ -4,6 +4,23 @@ import { ApiError, request } from './api'
 describe('request', () => {
   afterEach(() => vi.unstubAllGlobals())
 
+  it.each(['AbortError', 'TimeoutError', 'SyntaxError'])('响应头到达后传播 %s', async (name) => {
+    const failure = new DOMException('body failed', name)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      status: 200, ok: true, headers: new Headers({ 'content-type': 'application/json' }),
+      json: () => Promise.reject(failure),
+    }))
+    await expect(request('/api/admin/dashboard')).rejects.toBe(failure)
+  })
+
+  it('文本响应读取失败不能转换为空字符串', async () => {
+    const failure = new DOMException('body aborted', 'AbortError')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      status: 200, ok: true, headers: new Headers(), text: () => Promise.reject(failure),
+    }))
+    await expect(request('/api/admin/dashboard')).rejects.toBe(failure)
+  })
+
   it('带 cookie 请求并解析 API 错误', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ error: { code: 'invalid_credentials', message: '密码错误' } }),

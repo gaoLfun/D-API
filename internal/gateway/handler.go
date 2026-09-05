@@ -283,16 +283,14 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 			writeError(w, protocol, http.StatusBadRequest, "invalid_request", "invalid request body")
 			return
 		}
-		var payload struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
-		}
-		if err := json.Unmarshal(body, &payload); err != nil || strings.TrimSpace(payload.Model) == "" {
+		payload, err := parseRequestPayload(body)
+		if err != nil || strings.TrimSpace(payload.Model) == "" || strings.ContainsRune(payload.Model, '\x00') {
 			logEntry.StatusCode = http.StatusBadRequest
 			logEntry.ErrorCode = "invalid_request"
 			writeError(w, protocol, http.StatusBadRequest, "invalid_request", "model is required")
 			return
 		}
+		originalModel := payload.Model
 		payload.Model = strings.TrimSpace(payload.Model)
 		logEntry.Model = payload.Model
 		if !key.Allows(protocol, payload.Model) {
@@ -335,10 +333,11 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 		}
 
 		allRateLimited, allTimedOut := len(eligible) > 0, len(eligible) > 0
+		bodies := requestBodies{body: body, model: originalModel}
 		for _, upstream := range eligible {
 			attemptStarted := time.Now()
 			attempt := core.Attempt{UpstreamID: upstream.ID, UpstreamName: upstream.Name}
-			outBody, err := replaceModel(body, upstream.UpstreamModel(payload.Model))
+			outBody, err := bodies.forModel(upstream.UpstreamModel(payload.Model))
 			if err == nil {
 				var outReq *http.Request
 				outReq, err = upstreamRequest(r, upstream, outBody, protocol)
@@ -593,6 +592,86 @@ func upstreamRequest(in *http.Request, upstream core.Upstream, body []byte, prot
 	return out, nil
 }
 
+type requestBodies struct {
+	body      []byte
+	model     string
+	rewritten map[string][]byte
+}
+
+type requestPayload struct {
+	Model  string
+	Stream bool
+}
+
+// Inspect top-level keys before forwarding the original bytes. Different JSON
+// implementations must not choose different model or stream values.
+func parseRequestPayload(body []byte) (requestPayload, error) {
+	var result requestPayload
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return result, errors.New("request must be an object")
+	}
+	seenModel, seenStream := false, false
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return result, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return result, errors.New("invalid field")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return result, err
+		}
+		switch {
+		case strings.EqualFold(key, "model"):
+			if key != "model" || seenModel {
+				return result, errors.New("ambiguous model field")
+			}
+			seenModel = true
+			if err := json.Unmarshal(value, &result.Model); err != nil {
+				return result, err
+			}
+		case strings.EqualFold(key, "stream"):
+			if key != "stream" || seenStream {
+				return result, errors.New("ambiguous stream field")
+			}
+			seenStream = true
+			if err := json.Unmarshal(value, &result.Stream); err != nil {
+				return result, err
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return result, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return result, errors.New("trailing request data")
+	}
+	return result, nil
+}
+
+func (b *requestBodies) forModel(model string) ([]byte, error) {
+	if model == b.model {
+		return b.body, nil
+	}
+	if body, ok := b.rewritten[model]; ok {
+		return body, nil
+	}
+	body, err := replaceModel(b.body, model)
+	if err != nil {
+		return nil, err
+	}
+	if b.rewritten == nil {
+		b.rewritten = make(map[string][]byte)
+	}
+	b.rewritten[model] = body
+	return body, nil
+}
+
 func replaceModel(body []byte, model string) ([]byte, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -651,8 +730,10 @@ func (h *Handler) relayStreamWithMetrics(ctx context.Context, w http.ResponseWri
 	parser := sseUsageParser{protocol: protocol}
 	var ttfbMS, ttftMS *int64
 	timeout := firstByteTimeout
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	for {
-		timer := time.NewTimer(timeout)
+		timer.Reset(timeout)
 		select {
 		case result := <-results:
 			if !timer.Stop() {
@@ -735,15 +816,20 @@ func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteT
 		content []byte
 		err     error
 	}
-	results, done := make(chan readResult), make(chan struct{})
+	results, done, acknowledge := make(chan readResult), make(chan struct{}), make(chan struct{})
 	defer close(done)
 	go func() {
 		buffer := make([]byte, 32<<10)
 		for {
 			n, err := body.Read(buffer)
-			content := append([]byte(nil), buffer[:n]...)
+			content := buffer[:n]
 			select {
 			case results <- readResult{content: content, err: err}:
+			case <-done:
+				return
+			}
+			select {
+			case <-acknowledge:
 			case <-done:
 				return
 			}
@@ -756,8 +842,10 @@ func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteT
 	content := make([]byte, 0)
 	var ttfbMS *int64
 	timeout := firstByteTimeout
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	for {
-		timer := time.NewTimer(timeout)
+		timer.Reset(timeout)
 		select {
 		case result := <-results:
 			if !timer.Stop() {
@@ -778,6 +866,7 @@ func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteT
 				content = append(content, result.content...)
 				timeout = idleTimeout
 			}
+			acknowledge <- struct{}{}
 			if result.err != nil {
 				if errors.Is(result.err, io.EOF) {
 					return content, ttfbMS, nil
@@ -1193,7 +1282,10 @@ func newRequestID() string {
 func int64ptr(value int64) *int64 { return &value }
 
 func (h *Handler) record(entry core.RequestLog) {
-	if h.recorder != nil && h.recorder.Submit(entry) {
+	if h.recorder != nil {
+		if !h.recorder.Submit(entry) {
+			h.recorder.rememberFlushError(h.recorder.flush([]core.RequestLog{entry}))
+		}
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

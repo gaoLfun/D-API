@@ -50,6 +50,13 @@ type pricingCacheEntry struct {
 	input, output, cacheRead, cacheWrite float64
 	found                                bool
 	expires                              time.Time
+	prices                               []PricingModelPrice
+	partial                              bool
+	from, to                             *time.Time
+}
+
+func (entry pricingCacheEntry) covers(at time.Time) bool {
+	return !entry.partial || (entry.from == nil || !at.Before(*entry.from)) && (entry.to == nil || at.Before(*entry.to))
 }
 
 type PricingModelPrice struct {
@@ -491,46 +498,139 @@ func (s *Store) RequestCost(ctx context.Context, upstreamID int64, model string,
 }
 
 func (s *Store) pricingRate(ctx context.Context, upstreamID int64, model string, at time.Time) (pricingCacheEntry, error) {
+	at = at.Round(time.Microsecond)
 	key := pricingCacheKey{upstreamID: upstreamID, model: strings.TrimSpace(model)}
-	now := time.Now().UTC()
-	if at.After(now.Add(-2*time.Minute)) && at.Before(now.Add(2*time.Minute)) {
-		s.pricingMu.RLock()
-		cached, ok := s.pricingCache[key]
-		s.pricingMu.RUnlock()
-		if ok && cached.expires.After(now) {
-			return cached, nil
-		}
+	s.pricingMu.RLock()
+	cached, ok := s.pricingCache[key]
+	s.pricingMu.RUnlock()
+	if ok && cached.expires.After(time.Now()) && cached.covers(at) {
+		return selectPricingRate(cached, at), nil
 	}
-	var rate pricingCacheEntry
-	err := s.db.QueryRowContext(ctx, `
-		SELECT m.input_usd_per_million,m.output_usd_per_million,m.cache_read_usd_per_million,m.cache_write_usd_per_million
-		FROM upstreams u JOIN pricing_model_prices m ON m.profile_id=u.pricing_profile_id
-		WHERE u.id=$1 AND (m.model=$2 OR m.model=COALESCE(u.model_aliases ->> $2,$2))
-			AND m.valid_from <= $3 AND (m.valid_to IS NULL OR m.valid_to > $3)
-		ORDER BY CASE WHEN m.model=$2 THEN 0 ELSE 1 END,m.valid_from DESC LIMIT 1`,
-		upstreamID, key.model, at.UTC()).Scan(&rate.input, &rate.output, &rate.cacheRead, &rate.cacheWrite)
-	if errors.Is(err, sql.ErrNoRows) {
-		rate.expires = now.Add(30 * time.Second)
-	} else if err != nil {
+	release, err := s.pricingLoads.acquire(ctx, key)
+	if err != nil {
 		return pricingCacheEntry{}, err
-	} else {
-		rate.found = true
-		rate.expires = now.Add(5 * time.Minute)
 	}
-	if at.After(now.Add(-2*time.Minute)) && at.Before(now.Add(2*time.Minute)) {
-		s.pricingMu.Lock()
+	defer release()
+	now := time.Now()
+	s.pricingMu.RLock()
+	cached, ok = s.pricingCache[key]
+	generation := s.pricingGen
+	s.pricingMu.RUnlock()
+	if ok && cached.expires.After(now) && cached.covers(at) {
+		return selectPricingRate(cached, at), nil
+	}
+	entry := pricingCacheEntry{}
+	if cached.partial {
+		entry, err = s.loadPricingWindow(ctx, key, at)
+	} else {
+		entry, err = s.loadPricingHistory(ctx, key, at)
+	}
+	if err != nil {
+		return pricingCacheEntry{}, err
+	}
+	entry.expires = now.Add(30 * time.Second)
+	s.pricingMu.Lock()
+	defer s.pricingMu.Unlock()
+	if generation == s.pricingGen {
 		if s.pricingCache == nil {
 			s.pricingCache = make(map[pricingCacheKey]pricingCacheEntry)
 		}
-		s.pricingCache[key] = rate
-		s.pricingMu.Unlock()
+		if len(s.pricingCache) >= 1024 {
+			for key, value := range s.pricingCache {
+				if !value.expires.After(now) {
+					delete(s.pricingCache, key)
+				}
+			}
+			if len(s.pricingCache) >= 1024 {
+				clear(s.pricingCache)
+			}
+		}
+		s.pricingCache[key] = entry
 	}
-	return rate, nil
+	return selectPricingRate(entry, at), nil
+}
+
+func (s *Store) loadPricingHistory(ctx context.Context, key pricingCacheKey, at time.Time) (pricingCacheEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT m.input_usd_per_million,m.output_usd_per_million,m.cache_read_usd_per_million,m.cache_write_usd_per_million,m.valid_from,m.valid_to
+		FROM upstreams u JOIN pricing_model_prices m ON m.profile_id=u.pricing_profile_id
+		WHERE u.id=$1 AND (m.model=$2 OR m.model=COALESCE(u.model_aliases ->> $2,$2))
+		ORDER BY CASE WHEN m.model=$2 THEN 0 ELSE 1 END,m.valid_from DESC LIMIT 257`, key.upstreamID, key.model)
+	if err != nil {
+		return pricingCacheEntry{}, err
+	}
+	defer rows.Close()
+	entry := pricingCacheEntry{}
+	count := 0
+	for rows.Next() {
+		var price PricingModelPrice
+		if err := rows.Scan(&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheWriteUSDPerMillion, &price.ValidFrom, &price.ValidTo); err != nil {
+			return pricingCacheEntry{}, err
+		}
+		count++
+		if count <= 256 {
+			entry.prices = append(entry.prices, price)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return pricingCacheEntry{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return pricingCacheEntry{}, err
+	}
+	if count > 256 {
+		return s.loadPricingWindow(ctx, key, at)
+	}
+	return entry, nil
+}
+
+// Bound the returned history while retaining the interval in which the chosen
+// exact-model or alias rate cannot change. Empty intervals are cached too.
+func (s *Store) loadPricingWindow(ctx context.Context, key pricingCacheKey, at time.Time) (pricingCacheEntry, error) {
+	entry := pricingCacheEntry{partial: true}
+	var price PricingModelPrice
+	var found bool
+	err := s.db.QueryRowContext(ctx, `
+		WITH candidates AS MATERIALIZED (
+			SELECT m.* FROM upstreams u JOIN pricing_model_prices m ON m.profile_id=u.pricing_profile_id
+			WHERE u.id=$1 AND (m.model=$2 OR m.model=COALESCE(u.model_aliases ->> $2,$2))
+		), boundaries AS (
+			SELECT valid_from AS at FROM candidates UNION SELECT valid_to FROM candidates WHERE valid_to IS NOT NULL
+		), selected AS (
+			SELECT * FROM candidates WHERE valid_from <= $3 AND (valid_to IS NULL OR valid_to > $3)
+			ORDER BY CASE WHEN model=$2 THEN 0 ELSE 1 END,valid_from DESC LIMIT 1
+		)
+		SELECT p.id IS NOT NULL,COALESCE(p.input_usd_per_million,0),COALESCE(p.output_usd_per_million,0),
+			COALESCE(p.cache_read_usd_per_million,0),COALESCE(p.cache_write_usd_per_million,0),
+			(SELECT max(at) FROM boundaries WHERE at <= $3),(SELECT min(at) FROM boundaries WHERE at > $3)
+		FROM (SELECT 1) singleton LEFT JOIN selected p ON TRUE`, key.upstreamID, key.model, at.UTC()).Scan(
+		&found, &price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheWriteUSDPerMillion, &entry.from, &entry.to)
+	if err != nil {
+		return pricingCacheEntry{}, err
+	}
+	if found {
+		if entry.from != nil {
+			price.ValidFrom = *entry.from
+		}
+		price.ValidTo = entry.to
+		entry.prices = []PricingModelPrice{price}
+	}
+	return entry, nil
+}
+
+func selectPricingRate(entry pricingCacheEntry, at time.Time) pricingCacheEntry {
+	for _, price := range entry.prices {
+		if !at.Before(price.ValidFrom) && (price.ValidTo == nil || at.Before(*price.ValidTo)) {
+			return pricingCacheEntry{found: true, input: price.InputUSDPerMillion, output: price.OutputUSDPerMillion, cacheRead: price.CacheReadUSDPerMillion, cacheWrite: price.CacheWriteUSDPerMillion}
+		}
+	}
+	return pricingCacheEntry{}
 }
 
 func (s *Store) invalidatePricingCache() {
 	s.pricingMu.Lock()
 	s.pricingCache = make(map[pricingCacheKey]pricingCacheEntry)
+	s.pricingGen++
 	s.pricingMu.Unlock()
 }
 

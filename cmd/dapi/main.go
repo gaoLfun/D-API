@@ -68,13 +68,6 @@ func run() error {
 		MaxRequestsPerMinute:  cfg.MaxRequestsPerMinute,
 		MaxRequestDuration:    cfg.MaxRequestDuration,
 	})
-	defer func() {
-		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer flushCancel()
-		if err := gatewayHandler.Close(flushCtx); err != nil {
-			slog.Error("request log flush failed", "error", err)
-		}
-	}()
 	mux.Handle("/v1/", gatewayHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
@@ -106,9 +99,10 @@ func run() error {
 	go cleanup(ctx, db, cfg.LogRetention)
 	go refreshPricing(ctx, db)
 
+	drain := newRequestDrain()
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.ProxyHeaders(httpapi.SecurityHeaders(mux), cfg.TrustProxy, cfg.TrustedProxyCIDRs...),
+		Handler:           drain.wrap(httpapi.ProxyHeaders(httpapi.SecurityHeaders(mux), cfg.TrustProxy, cfg.TrustedProxyCIDRs...)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
@@ -121,15 +115,12 @@ func run() error {
 	}()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		return server.Shutdown(shutdownCtx)
-	case err := <-errCh:
+	case err = <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+			err = nil
 		}
-		return err
 	}
+	return errors.Join(err, shutdownServer(server, drain, gatewayHandler, 10*time.Second, 5*time.Second, 10*time.Second))
 }
 
 func refreshPricing(ctx context.Context, database *store.Store) {

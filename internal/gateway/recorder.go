@@ -30,6 +30,7 @@ type requestRecorder struct {
 	mu          sync.RWMutex
 	closed      bool
 	retryDelays []time.Duration
+	errMu       sync.Mutex
 	flushErr    error
 	dropped     atomic.Uint64
 }
@@ -74,11 +75,11 @@ func (r *requestRecorder) Close(ctx context.Context) error {
 	select {
 	case <-r.done:
 		r.cancel()
-		return r.flushErr
+		return r.flushError()
 	case <-ctx.Done():
 		r.cancel()
 		<-r.done
-		return errors.Join(ctx.Err(), r.flushErr)
+		return errors.Join(ctx.Err(), r.flushError())
 	}
 }
 
@@ -130,9 +131,28 @@ func (r *requestRecorder) dropRemaining(batch []core.RequestLog) {
 }
 
 func (r *requestRecorder) rememberFlushError(err error) {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
 	if err != nil && r.flushErr == nil {
 		r.flushErr = err
 	}
+}
+
+func (r *requestRecorder) flushError() error {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.flushErr
+}
+
+// Data and constraint errors will not improve on retry. Split only these
+// failures so database outages do not multiply writes for every queued entry.
+func isRecordDataError(err error) bool {
+	var state interface{ SQLState() string }
+	if !errors.As(err, &state) {
+		return false
+	}
+	code := state.SQLState()
+	return len(code) >= 2 && (code[:2] == "22" || code[:2] == "23")
 }
 
 func (r *requestRecorder) flush(entries []core.RequestLog) error {
@@ -147,6 +167,15 @@ func (r *requestRecorder) flush(entries []core.RequestLog) error {
 			cancel()
 			if err == nil {
 				return nil
+			}
+			if r.ctx.Err() == nil && isRecordDataError(err) {
+				if len(entries) > 1 {
+					middle := len(entries) / 2
+					leftErr := r.flush(entries[:middle])
+					rightErr := r.flush(entries[middle:])
+					return errors.Join(leftErr, rightErr)
+				}
+				break
 			}
 			if r.ctx.Err() != nil {
 				break
