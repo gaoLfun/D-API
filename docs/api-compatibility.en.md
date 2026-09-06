@@ -24,6 +24,23 @@ and is not part of the compatibility promise.
 
 Other `/v1/*` routes are not implemented.
 
+## Models Provided by NewAPI/Sub2API
+
+DeepSeek, Qwen, and other models exposed by a NewAPI/Sub2API upstream can be
+used without adding a provider type. Use the exact upstream model ID or a model
+alias, assign the upstream to the client key's group, and allow the required
+protocol and model on both the upstream and client key.
+
+For Chat-compatible models, send a request with `model` and `messages` to
+`/v1/chat/completions`. Responses clients require upstream Responses support;
+model names and aliases do not convert protocols. Balance checks continue to
+use the NewAPI/Sub2API account endpoints.
+
+DeepSeek Chat `reasoning_content` passes through unchanged. The
+`prompt_cache_hit_tokens` field is a fallback for cached input usage; normalized
+cache fields supplied by the upstream take precedence. Uncached input is total
+input minus cached input. TTFT remains time to visible text, excluding reasoning.
+
 ## Client Authentication
 
 Create client keys in the admin console. Upstream keys are never valid as D-API

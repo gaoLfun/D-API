@@ -1506,7 +1506,12 @@ async function removeUpstream(item: Upstream) {
 async function upstreamAction(item: Upstream, action: 'check' | 'balance' | 'models') {
   upstreamGroupDrawer.value = null
   try {
-    await api.post(`/api/admin/upstreams/${item.id}/${action}`)
+    const result = await api.post<Json>(`/api/admin/upstreams/${item.id}/${action}`)
+    if ((action === 'check' && result?.status !== 'healthy') || (action === 'balance' && result?.status !== 'ok')) {
+      notify(String(result?.error || (action === 'check' ? '连接检查失败' : '余额查询不可用')), true)
+      await loadCurrent()
+      return
+    }
     notify({ check: '连接检查完成', balance: '余额已刷新', models: '模型列表已刷新' }[action])
     await loadCurrent()
   } catch (error) { notify(errorMessage(error), true) }
@@ -1532,9 +1537,18 @@ async function bulkUpstreamAction(action: 'check' | 'balance') {
   if (!items.length) return notify('请先选择上游', true)
   saving.value = true
   try {
-    const results = await Promise.allSettled(items.map((item) => api.post(`/api/admin/upstreams/${item.id}/${action}`)))
-    const succeeded = results.filter((result) => result.status === 'fulfilled').length
-    const failed = results.length - succeeded
+    let next = 0
+    let succeeded = 0
+    await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+      while (next < items.length) {
+        const item = items[next++]!
+        try {
+          const result = await api.post<Json>(`/api/admin/upstreams/${item.id}/${action}`)
+          if (action === 'check' ? result?.status === 'healthy' : result?.status === 'ok') succeeded++
+        } catch { /* Count failed requests after all workers finish. */ }
+      }
+    }))
+    const failed = items.length - succeeded
     upstreamSelectedIds.value = []
     notify(failed
       ? `${action === 'check' ? '检查' : '刷新余额'}完成：${succeeded} 个成功，${failed} 个失败`

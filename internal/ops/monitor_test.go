@@ -106,6 +106,55 @@ func (r *monitorRepository) SaveEvent(_ context.Context, event Event) error {
 
 type monitorProber struct{ health Health }
 
+type slowBalanceProber struct {
+	started chan struct{}
+	health  chan struct{}
+}
+
+func (p *slowBalanceProber) CheckHealth(ctx context.Context, _ core.Upstream) Health {
+	select {
+	case p.health <- struct{}{}:
+	case <-ctx.Done():
+	}
+	return Health{Status: "healthy", CheckedAt: time.Now()}
+}
+
+func (p *slowBalanceProber) CheckBalance(ctx context.Context, _ core.Upstream) core.Balance {
+	close(p.started)
+	<-ctx.Done()
+	return core.Balance{Status: "unavailable"}
+}
+
+func TestHealthContinuesDuringSlowBalanceAndShutdownWaits(t *testing.T) {
+	p := &slowBalanceProber{started: make(chan struct{}), health: make(chan struct{}, 10)}
+	m := NewMonitor(boundedMonitorRepository{upstreams: []core.Upstream{{ID: 1, Enabled: true, HealthStatus: "healthy"}}}, p, nil, MonitorConfig{HealthEvery: 5 * time.Millisecond, BalanceEvery: time.Hour, Concurrency: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	select {
+	case <-p.started:
+	case <-time.After(time.Second):
+		t.Fatal("balance did not start")
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case <-p.health:
+		case <-time.After(time.Second):
+			t.Fatal("health stopped during balance probe")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not stop")
+	}
+}
+
 func (p monitorProber) CheckHealth(context.Context, core.Upstream) Health { return p.health }
 func (monitorProber) CheckBalance(context.Context, core.Upstream) core.Balance {
 	return core.Balance{Status: "unknown"}
@@ -348,5 +397,30 @@ func TestMonitorBoundsAndCoalescesPendingTransitions(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("coalesced event was dropped")
+	}
+}
+
+func TestPendingRetryPreservesConcurrentTransition(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	m := NewMonitor(nil, nil, NotifierFunc(func(context.Context, Event) error {
+		close(started)
+		<-release
+		return nil
+	}), MonitorConfig{})
+	m.setPending(Event{Type: "upstream_balance_protection", UpstreamID: 1, State: "suspended"})
+	done := make(chan error, 1)
+	go func() { done <- m.retryPending(context.Background(), 1) }()
+	<-started
+	duplicateErr := m.retryPending(context.Background(), 1)
+	m.setPending(Event{Type: "upstream_balance_protection", UpstreamID: 1, State: "resumed"})
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if duplicateErr == nil {
+		t.Fatal("concurrent retry should not deliver the same event")
+	}
+	if events := m.pending[1]; len(events) != 1 || events[0].State != "resumed" {
+		t.Fatalf("new transition lost: %+v", events)
 	}
 }

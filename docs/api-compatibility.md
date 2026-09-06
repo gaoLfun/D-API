@@ -16,6 +16,24 @@ D-API 提供 OpenAI 和 Anthropic 兼容协议的轻量转发子集。兼容表�
 
 其他 `/v1/*` 路由未实现。
 
+## 使用上游提供的 DeepSeek 等模型
+
+NewAPI/Sub2API 已提供的 DeepSeek、Qwen 等模型可以直接通过 D-API 使用，不需要新增供应商类型。
+使用上游模型列表中的准确 ID，或配置模型别名；将上游加入客户端 Key 所属分组，
+并在上游和客户端 Key 中放行所用协议与模型。例如，上游提供 Chat 接口时：
+
+```json
+{"model":"deepseek-reasoner","messages":[{"role":"user","content":"你好"}]}
+```
+
+将请求发送到 D-API 的 `/v1/chat/completions`，使用 D-API 客户端 Key 认证。
+示例模型 ID 必须替换为实际上游提供的 ID。仅支持 Responses 的客户端不能调用只提供 Chat 的
+上游模型；需要上游本身提供 Responses 接口。模型名称或别名不会触发协议转换。
+
+DeepSeek Chat 的 `reasoning_content` 原样透传；`prompt_cache_hit_tokens` 用作缓存读取 Token
+的兼容字段，以总输入减去缓存读取计算未缓存输入。上游已转换的标准缓存字段优先。
+TTFT 仍表示首个可见文本时间，不包含推理内容；余额查询仍使用 NewAPI/Sub2API 的账户接口。
+
 ## 客户端认证与分组
 
 所有路由接受 `Authorization: Bearer <DAPI_KEY>`；Messages 也接受 `x-api-key`。

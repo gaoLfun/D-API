@@ -112,6 +112,9 @@ func (o Operations) Check(ctx context.Context, id int64) (ops.Health, error) {
 		return ops.Health{}, err
 	}
 	health := o.Prober.CheckHealth(ctx, upstream.Upstream)
+	if ctx.Err() != nil {
+		return ops.Health{}, ctx.Err()
+	}
 	if _, _, err := (OpsRepository{Store: o.Store}).SaveHealth(ctx, id, health); err != nil {
 		return ops.Health{}, err
 	}
@@ -132,6 +135,9 @@ func (o Operations) Balance(ctx context.Context, id int64) (core.Upstream, core.
 		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, err
 	}
 	balance := o.Prober.CheckBalance(ctx, upstream.Upstream)
+	if ctx.Err() != nil {
+		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, ctx.Err()
+	}
 	transition, err := o.Store.SaveBalance(ctx, id, balance, true)
 	if err != nil {
 		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, err

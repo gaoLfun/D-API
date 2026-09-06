@@ -102,7 +102,7 @@ but the committed stream cannot be replayed safely.
   consume upstream quota.
 - Balance probes try known NewAPI/Sub2API-style endpoints. The default interval
   is 10 minutes; unsupported balance APIs are reported as unknown/unavailable.
-  Disabled upstreams are also checked so a recovered balance can clear a suspension.
+  Balance-suspended upstreams remain checked while enabled; manually disabled upstreams are skipped.
   Per-upstream balance protection pauses routing after two consecutive automatic
   zero-balance results (or one manual refresh), persists that state in PostgreSQL,
   and resumes after the first positive or unlimited balance result. Failed balance
@@ -132,8 +132,11 @@ but the committed stream cannot be replayed safely.
   with request recording and historical cost backfill, so the dashboard can show
   lifetime totals without scanning or retaining every request log.
 
-Health and balance jobs iterate over the upstream list; disabled upstreams still
-receive balance probes so a recovered balance can clear a suspension automatically.
+Health and balance jobs run independently, with at most eight concurrent probes
+per category, including manual probes. Successful non-subscription balance paths
+are remembered for one hour and rediscovered after failure or configuration changes.
+Subscription remains a fallback; balance results themselves are not cached.
+Health checks confirm model-list availability, not successful inference for every model.
 
 ## Observability and Failure Isolation
 

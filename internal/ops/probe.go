@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
@@ -58,9 +59,13 @@ type ModelTest struct {
 }
 
 type Prober struct {
-	Client  *http.Client
-	Timeout time.Duration
-	secure  bool
+	Client       *http.Client
+	Timeout      time.Duration
+	secure       bool
+	healthSlots  chan struct{}
+	balanceSlots chan struct{}
+	balanceMu    sync.Mutex
+	balancePaths map[[32]byte]balancePath
 }
 
 func NewProber(client *http.Client, timeout time.Duration) *Prober {
@@ -72,7 +77,9 @@ func NewProber(client *http.Client, timeout time.Duration) *Prober {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return &Prober{Client: client, Timeout: timeout, secure: secure}
+	return &Prober{Client: client, Timeout: timeout, secure: secure,
+		healthSlots: make(chan struct{}, 8), balanceSlots: make(chan struct{}, 8),
+		balancePaths: make(map[[32]byte]balancePath)}
 }
 
 func withoutRedirects(client *http.Client) *http.Client {
@@ -84,6 +91,11 @@ func withoutRedirects(client *http.Client) *http.Client {
 func (p *Prober) CheckHealth(ctx context.Context, upstream core.Upstream) Health {
 	started := time.Now()
 	result := Health{Status: "unhealthy", CheckedAt: started}
+	if err := acquireProbe(ctx, p.healthSlots); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer releaseProbe(p.healthSlots)
 	body, status, err := p.get(ctx, upstream, "/v1/models", upstream.APIKey, nil)
 	result.Latency = time.Since(started)
 	result.StatusCode = status
@@ -226,10 +238,21 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 	if strings.TrimSpace(upstream.BaseURL) == "" || strings.TrimSpace(upstream.APIKey) == "" {
 		return core.Balance{Status: "unknown", Error: "missing upstream URL or API key", UpdatedAt: &now}
 	}
+	if err := acquireProbe(ctx, p.balanceSlots); err != nil {
+		return core.Balance{Status: "unavailable", Error: err.Error(), UpdatedAt: &now}
+	}
+	defer releaseProbe(p.balanceSlots)
+	key := balancePathKey(upstream)
+	preferred := p.preferredBalancePath(key, now)
+	attempted := make(map[string]bool)
 
 	var failures []string
 	var subscription *core.Balance
 	try := func(path, credential string, headers map[string]string, parse func([]byte, time.Time) (core.Balance, error)) (core.Balance, bool) {
+		if attempted[path] || ctx.Err() != nil {
+			return core.Balance{}, false
+		}
+		attempted[path] = true
 		body, status, err := p.get(ctx, upstream, path, credential, headers)
 		if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
 			return core.Balance{}, false
@@ -243,7 +266,32 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
 			return core.Balance{}, false
 		}
+		if path != "/v1/dashboard/billing/subscription" {
+			p.rememberBalancePath(key, path, now)
+		}
 		return balance, true
+	}
+	credential := upstream.APIKey
+	headers := map[string]string(nil)
+	if upstream.AccessToken != "" && upstream.UserID != "" {
+		credential = upstream.AccessToken
+		headers = map[string]string{"New-Api-User": upstream.UserID}
+	}
+	var cached core.Balance
+	var ok bool
+	switch preferred {
+	case "/v1/usage":
+		cached, ok = try(preferred, upstream.APIKey, nil, parseSub2APIUsage)
+	case "/api/usage/token/":
+		cached, ok = try(preferred, upstream.APIKey, nil, parseTokenUsage)
+	case "/api/user/self":
+		cached, ok = try(preferred, credential, headers, parseUserSelf)
+	}
+	if ok {
+		return cached
+	}
+	if preferred != "" {
+		p.forgetBalancePath(key)
 	}
 
 	if upstream.Kind == "sub2api" {
@@ -258,12 +306,6 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 		return balance
 	}
 
-	credential := upstream.APIKey
-	headers := map[string]string(nil)
-	if upstream.AccessToken != "" && upstream.UserID != "" {
-		credential = upstream.AccessToken
-		headers = map[string]string{"New-Api-User": upstream.UserID}
-	}
 	if balance, ok := try("/api/user/self", credential, headers, parseUserSelf); ok {
 		return balance
 	}
@@ -274,6 +316,9 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 	}
 	if subscription != nil {
 		return *subscription
+	}
+	if ctx.Err() != nil {
+		return core.Balance{Status: "unavailable", Error: ctx.Err().Error(), UpdatedAt: &now}
 	}
 	if len(failures) == 0 {
 		return core.Balance{Status: "unknown", Error: "balance API unsupported", UpdatedAt: &now}

@@ -922,14 +922,15 @@ func parseUsageWithProtocol(body []byte, protocol string) core.Usage {
 }
 
 type usageFields struct {
-	Input         *int64 `json:"input_tokens"`
-	Output        *int64 `json:"output_tokens"`
-	Prompt        *int64 `json:"prompt_tokens"`
-	Completion    *int64 `json:"completion_tokens"`
-	Cached        *int64 `json:"cached_input_tokens"`
-	CacheRead     *int64 `json:"cache_read_input_tokens"`
-	CacheCreation *int64 `json:"cache_creation_input_tokens"`
-	InputDetails  struct {
+	Input          *int64 `json:"input_tokens"`
+	Output         *int64 `json:"output_tokens"`
+	Prompt         *int64 `json:"prompt_tokens"`
+	Completion     *int64 `json:"completion_tokens"`
+	Cached         *int64 `json:"cached_input_tokens"`
+	CacheRead      *int64 `json:"cache_read_input_tokens"`
+	CacheCreation  *int64 `json:"cache_creation_input_tokens"`
+	PromptCacheHit *int64 `json:"prompt_cache_hit_tokens"`
+	InputDetails   struct {
 		Cached *int64 `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
 	PromptDetails struct {
@@ -961,6 +962,9 @@ func parseUsageObjectForProtocol(body []byte, protocol string) core.Usage {
 	}
 	if usage.CachedInputTokens == nil {
 		usage.CachedInputTokens = fields.PromptDetails.Cached
+	}
+	if usage.CachedInputTokens == nil && protocol != core.ProtocolMessages {
+		usage.CachedInputTokens = fields.PromptCacheHit
 	}
 	return normalizeUsageForProtocol(usage, protocol)
 }

@@ -43,12 +43,13 @@ type MonitorConfig struct {
 }
 
 type Monitor struct {
-	Repository Repository
-	Prober     ProbeService
-	Notifier   Notifier
-	Config     MonitorConfig
-	pendingMu  sync.Mutex
-	pending    map[int64][]Event
+	Repository      Repository
+	Prober          ProbeService
+	Notifier        Notifier
+	Config          MonitorConfig
+	pendingMu       sync.Mutex
+	pending         map[int64][]Event
+	pendingInFlight map[int64]bool
 }
 
 const maxPendingEventsPerUpstream = 16
@@ -70,20 +71,29 @@ func (m *Monitor) Run(ctx context.Context) error {
 	if m.Repository == nil || m.Prober == nil {
 		return errors.New("ops monitor is not configured")
 	}
-	m.runAndLog(ctx, m.RunHealth, "health probe failed")
-	m.runAndLog(ctx, m.RunBalances, "balance probe failed")
-	healthTicker := time.NewTicker(m.Config.HealthEvery)
-	balanceTicker := time.NewTicker(m.Config.BalanceEvery)
-	defer healthTicker.Stop()
-	defer balanceTicker.Stop()
-	for {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		m.runLoop(ctx, m.Config.BalanceEvery, m.RunBalances, "balance probe failed")
+	}()
+	m.runLoop(ctx, m.Config.HealthEvery, m.RunHealth, "health probe failed")
+	wg.Wait()
+	return nil
+}
+
+func (m *Monitor) runLoop(ctx context.Context, every time.Duration, run func(context.Context) error, message string) {
+	if every <= 0 {
+		every = time.Minute
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		m.runAndLog(ctx, run, message)
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-healthTicker.C:
-			m.runAndLog(ctx, m.RunHealth, "health probe failed")
-		case <-balanceTicker.C:
-			m.runAndLog(ctx, m.RunBalances, "balance probe failed")
+			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -96,6 +106,9 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 	return m.parallel(ctx, upstreams, func(ctx context.Context, upstream core.Upstream) error {
 		pendingErr := m.retryPending(ctx, upstream.ID)
 		health := m.Prober.CheckHealth(ctx, upstream)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		status, notification, err := m.Repository.SaveHealth(ctx, upstream.ID, health)
 		if err != nil {
 			return errors.Join(pendingErr, err)
@@ -149,18 +162,31 @@ func (m *Monitor) retryPending(ctx context.Context, upstreamID int64) error {
 		return nil
 	}
 	m.pendingMu.Lock()
+	if m.pendingInFlight[upstreamID] {
+		m.pendingMu.Unlock()
+		return errors.New("pending notification retry in progress")
+	}
 	events := append([]Event(nil), m.pending[upstreamID]...)
-	m.pendingMu.Unlock()
 	if len(events) == 0 {
+		m.pendingMu.Unlock()
 		return nil
 	}
-	for index, event := range events {
+	if m.pendingInFlight == nil {
+		m.pendingInFlight = make(map[int64]bool)
+	}
+	m.pendingInFlight[upstreamID] = true
+	m.pendingMu.Unlock()
+	defer func() {
+		m.pendingMu.Lock()
+		delete(m.pendingInFlight, upstreamID)
+		m.pendingMu.Unlock()
+	}()
+	for _, event := range events {
 		if err := m.Notifier.Notify(ctx, event); err != nil {
-			m.ackPending(upstreamID, index)
 			return fmt.Errorf("retry notification: %w", err)
 		}
+		m.ackPending(event)
 	}
-	m.ackPending(upstreamID, len(events))
 	return nil
 }
 
@@ -182,18 +208,22 @@ func (m *Monitor) setPending(event Event) {
 	m.pending[event.UpstreamID] = append(events, event)
 }
 
-func (m *Monitor) ackPending(upstreamID int64, count int) {
-	if count == 0 {
-		return
-	}
+func (m *Monitor) ackPending(sent Event) {
 	m.pendingMu.Lock()
-	events := m.pending[upstreamID]
-	if count >= len(events) {
-		delete(m.pending, upstreamID)
-	} else {
-		m.pending[upstreamID] = append([]Event(nil), events[count:]...)
+	defer m.pendingMu.Unlock()
+	events := m.pending[sent.UpstreamID]
+	for index, event := range events {
+		// Do not acknowledge a newer transition queued during delivery.
+		if event == sent {
+			events = append(events[:index], events[index+1:]...)
+			break
+		}
 	}
-	m.pendingMu.Unlock()
+	if len(events) == 0 {
+		delete(m.pending, sent.UpstreamID)
+	} else {
+		m.pending[sent.UpstreamID] = events
+	}
 }
 
 func (m *Monitor) RunBalances(ctx context.Context) error {
@@ -204,6 +234,9 @@ func (m *Monitor) RunBalances(ctx context.Context) error {
 	return m.parallel(ctx, upstreams, func(ctx context.Context, upstream core.Upstream) error {
 		pendingErr := m.retryPending(ctx, upstream.ID)
 		balance := m.Prober.CheckBalance(ctx, upstream)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		transition, err := m.Repository.SaveBalance(ctx, upstream.ID, balance, false)
 		if err != nil {
 			return errors.Join(pendingErr, err)
@@ -271,6 +304,7 @@ func (m *Monitor) parallel(ctx context.Context, upstreams []core.Upstream, work 
 			}
 		}()
 	}
+dispatch:
 	for _, upstream := range upstreams {
 		if !upstream.Enabled {
 			continue
@@ -278,13 +312,16 @@ func (m *Monitor) parallel(ctx context.Context, upstreams []core.Upstream, work 
 		select {
 		case jobs <- upstream:
 		case <-ctx.Done():
-			break
+			break dispatch
 		}
 	}
 	close(jobs)
 	wg.Wait()
 	close(errs)
 	var joined []error
+	if ctx.Err() != nil {
+		joined = append(joined, ctx.Err())
+	}
 	for err := range errs {
 		joined = append(joined, err)
 	}

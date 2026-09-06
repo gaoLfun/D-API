@@ -3,6 +3,36 @@ import path from 'node:path'
 
 const reviewDir = path.resolve('..', '.impeccable', 'review')
 
+for (const width of [1440, 390]) {
+  test(`upstream balance refresh bounds concurrency and reports probe failures at ${width}px`, async ({ page }) => {
+    await mockApi(page)
+    await page.setViewportSize({ width, height: 900 })
+    const items = Array.from({ length: 10 }, (_, index) => ({ ...upstreams[0], id: index + 1, name: `test-${index}`, base_url: `https://upstream-${index}.example.com` }))
+    await page.route('**/api/admin/upstreams', route => route.fulfill({ json: items }))
+    let active = 0
+    let maximum = 0
+    let completed = 0
+    await page.route('**/api/admin/upstreams/*/balance', async route => {
+      active++
+      maximum = Math.max(maximum, active)
+      await new Promise(resolve => setTimeout(resolve, 80))
+      active--
+      completed++
+      const id = Number(new URL(route.request().url()).pathname.split('/').at(-2))
+      await route.fulfill({ json: id % 2 ? { status: 'ok', available: 10 } : { status: 'unavailable', error: 'balance probe failed' } })
+    })
+    await page.goto('/#upstreams')
+    await page.getByRole('checkbox', { name: '选择全部可见上游 Key' }).check()
+    await page.getByRole('button', { name: '批量刷新余额' }).click()
+    await expect(page.getByText('刷新余额完成：5 个成功，5 个失败')).toBeVisible()
+    expect(completed).toBe(10)
+    expect(maximum).toBeLessThanOrEqual(4)
+    await page.locator('.upstream-table tbody tr.clickable').filter({ hasText: 'upstream-1.example.com' }).click()
+    await page.locator('.upstream-group-drawer').getByTitle('刷新余额').first().click()
+    await expect(page.getByText('balance probe failed')).toBeVisible()
+  })
+}
+
 const upstreams = [
   { id: 1, name: '新加坡主线路', kind: 'newapi', base_url: 'https://sg-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: false, zero_balance_checks: 0, priority: 10, protocols: ['chat', 'responses'], models: ['gpt-5.6', 'claude-opus-4-6'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 0, today_requests: 1842, today_tokens: 2840150, today_cost_usd: 12.73, today_cost_coverage: 0.964, lifetime_requests: 52184, lifetime_cost_usd: 417.25, lifetime_cost_coverage: 0.942, last_check_at: '2026-08-25T15:28:00Z', balance: { status: 'ok', available: 82.47, used: 17.53, currency: '$', updated_at: '2026-08-25T15:25:00Z', last_success_at: '2026-08-25T15:25:00Z' } },
   { id: 2, name: '东京备用线路', kind: 'sub2api', base_url: 'https://jp-api.example.com', enabled: true, balance_protection_enabled: true, balance_suspended: false, zero_balance_checks: 0, priority: 20, protocols: ['chat', 'messages'], models: ['claude-opus-4-5'], model_aliases: {}, failure_threshold: 3, health_status: 'healthy', consecutive_failures: 1, today_requests: 734, today_tokens: 912420, last_check_at: '2026-08-25T15:27:00Z', balance: { status: 'unsupported' } },
