@@ -48,17 +48,11 @@ func (r AlertRepository) Observe(ctx context.Context, rule alerts.Rule) ([]alert
 
 func (r AlertRepository) LoadState(ctx context.Context, ruleID int64, key string) (alerts.State, bool, error) {
 	state, found, err := r.Store.AlertState(ctx, ruleID, key)
-	return alerts.State{
-		Active: state.Active, Value: state.Value, Message: state.Message,
-		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt, NotificationCount: state.NotificationCount,
-	}, found, err
+	return state, found, err
 }
 
 func (r AlertRepository) SaveState(ctx context.Context, ruleID int64, key string, state alerts.State) error {
-	return r.Store.SaveAlertState(ctx, ruleID, key, store.AlertState{
-		Active: state.Active, Value: state.Value, Message: state.Message,
-		LastObservedAt: state.LastObservedAt, LastNotifiedAt: state.LastNotifiedAt, NotificationCount: state.NotificationCount,
-	})
+	return r.Store.SaveAlertState(ctx, ruleID, key, state)
 }
 
 func (r AlertRepository) PruneStates(ctx context.Context, ruleID int64, keys []string) error {
@@ -173,21 +167,23 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 			return nil, err
 		}
 		value := errorRate
+		if count < 5 || (rule.Event == alerts.EventLatency && !latency.Valid) {
+			result = append(result, alerts.Observation{
+				Key: "upstream:" + strconv.FormatInt(id, 10), Ignore: true,
+				Message:    fmt.Sprintf("上游 %s 最近 %d 秒请求样本不足 5 次，暂不判断", name, window),
+				UpstreamID: id, UpstreamName: name,
+			})
+			continue
+		}
 		active := count >= 5 && errorRate >= threshold(rule, 20)
+		hold := !active && errorRate >= threshold(rule, 20)*0.75
 		message := fmt.Sprintf("上游 %s 在 %d 秒内错误率为 %.1f%%", name, window, errorRate)
 		recoveryMessage := ""
 		if rule.Event == alerts.EventLatency {
-			if count == 0 || !latency.Valid {
-				result = append(result, alerts.Observation{
-					Key: "upstream:" + strconv.FormatInt(id, 10), Ignore: true,
-					Message:    fmt.Sprintf("上游 %s 最近 %d 秒内没有可用请求样本，暂不判断延迟", name, window),
-					UpstreamID: id, UpstreamName: name,
-				})
-				continue
-			}
 			value = latency.Float64
 			latencyThreshold := threshold(rule, 30000)
 			active = latency.Float64 >= latencyThreshold
+			hold = !active && latency.Float64 >= latencyThreshold*0.8
 			latencyText := fmt.Sprintf("%.0fms", latency.Float64)
 			if latency.Float64 < 1 {
 				latencyText = "<1ms"
@@ -200,7 +196,7 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 			}
 		}
 		result = append(result, alerts.Observation{
-			Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Value: value,
+			Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Hold: hold, Value: value,
 			Message: message, RecoveryMessage: recoveryMessage, UpstreamID: id, UpstreamName: name,
 		})
 	}

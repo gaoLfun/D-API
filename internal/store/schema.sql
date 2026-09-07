@@ -299,6 +299,12 @@ CREATE TABLE IF NOT EXISTS alert_states (
 
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS max_notifications INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS notification_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS incident JSONB NOT NULL DEFAULT '{}';
+
+CREATE TABLE IF NOT EXISTS health_notification_states (
+    upstream_id BIGINT PRIMARY KEY REFERENCES upstreams(id) ON DELETE CASCADE,
+    state JSONB NOT NULL DEFAULT '{}'
+);
 
 CREATE UNIQUE INDEX IF NOT EXISTS alert_rules_global_event_idx ON alert_rules(event) WHERE upstream_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS alert_rules_upstream_event_idx ON alert_rules(event, upstream_id) WHERE upstream_id IS NOT NULL;

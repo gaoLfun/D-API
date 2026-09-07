@@ -30,6 +30,12 @@ Admin ---- HTTPS -------------| - API gateway        |
 
 Running multiple D-API replicas is not an officially supported topology.
 Some rate-limit and notification cooldown state is process-local.
+Upstream alert and health incident cooldowns, confirmation progress, and reminder
+budgets are persisted in PostgreSQL. Metric alerts require at least five attempts,
+two consecutive failing evaluations, and three recovery evaluations below 75%
+(error rate) or 80% (latency) of the firing threshold. Missing samples break
+confirmation without resolving an incident. Brief recurrences share the cooldown
+and reminder budget, which resets only after 30 minutes of observed normal health.
 
 The browser uses the same origin for the SPA and management API. The management
 surface uses a session cookie; client traffic uses independently created `dapi_`

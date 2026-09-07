@@ -57,7 +57,10 @@ func (r GatewayRepository) MarkUpstreamFailure(ctx context.Context, id int64, st
 	return err
 }
 
-type OpsRepository struct{ Store *store.Store }
+type OpsRepository struct {
+	Store       *store.Store
+	HealthEvery time.Duration
+}
 
 func (r OpsRepository) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 	return r.Store.ListUpstreams(ctx)
@@ -65,7 +68,7 @@ func (r OpsRepository) ListUpstreams(ctx context.Context) ([]core.Upstream, erro
 
 func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Health) (string, string, error) {
 	healthy := health.Status == "healthy"
-	status, notification, err := r.Store.SaveProbeHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden)
+	status, _, err := r.Store.SaveProbeHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden)
 	if err != nil {
 		return "", "", err
 	}
@@ -74,11 +77,16 @@ func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Heal
 			return "", "", err
 		}
 	}
-	return status, notification, nil
+	interval := r.HealthEvery
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	notification, err := r.Store.ObserveHealthNotification(ctx, id, status, interval)
+	return status, notification, err
 }
 
 func (r OpsRepository) AcknowledgeHealthNotification(ctx context.Context, id int64, status string) error {
-	return r.Store.AcknowledgeHealthNotification(ctx, id, status)
+	return r.Store.AcceptHealthNotification(ctx, id, status)
 }
 
 func (r OpsRepository) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
@@ -246,8 +254,15 @@ func (n ChannelNotifier) notifierForChannel(channel store.NotificationChannel) (
 }
 
 func NewMonitor(database *store.Store, prober *ops.Prober, healthEvery, balanceEvery time.Duration) *ops.Monitor {
-	notifier := ops.NewCooldownNotifier(NewOutboxNotifier(database), 30*time.Minute)
-	return ops.NewMonitor(OpsRepository{Store: database}, prober, notifier, ops.MonitorConfig{
+	outbox := NewOutboxNotifier(database)
+	cooldown := ops.NewCooldownNotifier(outbox, 30*time.Minute)
+	notifier := ops.NotifierFunc(func(ctx context.Context, event ops.Event) error {
+		if event.Type == "upstream_health" {
+			return outbox.Notify(ctx, event)
+		}
+		return cooldown.Notify(ctx, event)
+	})
+	return ops.NewMonitor(OpsRepository{Store: database, HealthEvery: healthEvery}, prober, notifier, ops.MonitorConfig{
 		HealthEvery: healthEvery, BalanceEvery: balanceEvery, Concurrency: 8,
 	})
 }

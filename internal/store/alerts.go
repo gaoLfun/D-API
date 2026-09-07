@@ -3,9 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
-	"time"
 
+	"github.com/gaoLfun/dapi/internal/ops"
 	"github.com/lib/pq"
 )
 
@@ -76,39 +77,38 @@ func (s *Store) DeleteAlertRule(ctx context.Context, id int64) error {
 	return nil
 }
 
-type AlertState struct {
-	Active            bool
-	Value             float64
-	Message           string
-	LastObservedAt    time.Time
-	LastNotifiedAt    *time.Time
-	NotificationCount int
-}
+type AlertState = ops.IncidentState
 
 func (s *Store) AlertState(ctx context.Context, ruleID int64, key string) (AlertState, bool, error) {
 	var state AlertState
+	var incident []byte
 	err := s.db.QueryRowContext(ctx, `
-		SELECT active,value,message,last_observed_at,last_notified_at,notification_count
+		SELECT active,value,message,last_observed_at,last_notified_at,notification_count,incident
 		FROM alert_states WHERE rule_id=$1 AND observation_key=$2`, ruleID, key,
-	).Scan(&state.Active, &state.Value, &state.Message, &state.LastObservedAt, &state.LastNotifiedAt, &state.NotificationCount)
+	).Scan(&state.Active, &state.Value, &state.Message, &state.LastObservedAt, &state.LastNotifiedAt, &state.NotificationCount, &incident)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AlertState{}, false, nil
 		}
 		return AlertState{}, false, err
 	}
-	return state, true, nil
+	err = json.Unmarshal(incident, &state.Incident)
+	return state, true, err
 }
 
 func (s *Store) SaveAlertState(ctx context.Context, ruleID int64, key string, state AlertState) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO alert_states(rule_id,observation_key,active,value,message,last_observed_at,last_notified_at,notification_count)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+	incident, err := json.Marshal(state.Incident)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO alert_states(rule_id,observation_key,active,value,message,last_observed_at,last_notified_at,notification_count,incident)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
 		ON CONFLICT(rule_id,observation_key) DO UPDATE SET
 			active=EXCLUDED.active,value=EXCLUDED.value,message=EXCLUDED.message,
 			last_observed_at=EXCLUDED.last_observed_at,last_notified_at=EXCLUDED.last_notified_at,
-			notification_count=EXCLUDED.notification_count`,
-		ruleID, key, state.Active, state.Value, state.Message, state.LastObservedAt, state.LastNotifiedAt, state.NotificationCount,
+			notification_count=EXCLUDED.notification_count,incident=EXCLUDED.incident`,
+		ruleID, key, state.Active, state.Value, state.Message, state.LastObservedAt, state.LastNotifiedAt, state.NotificationCount, incident,
 	)
 	return err
 }

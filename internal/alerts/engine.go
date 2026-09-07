@@ -35,6 +35,7 @@ type Observation struct {
 	Key             string  `json:"key"`
 	Active          bool    `json:"active"`
 	Ignore          bool    `json:"ignore,omitempty"`
+	Hold            bool    `json:"hold,omitempty"`
 	Value           float64 `json:"value"`
 	Message         string  `json:"message"`
 	RecoveryMessage string  `json:"recovery_message,omitempty"`
@@ -42,14 +43,7 @@ type Observation struct {
 	UpstreamName    string  `json:"upstream_name,omitempty"`
 }
 
-type State struct {
-	Active            bool       `json:"active"`
-	Value             float64    `json:"value"`
-	Message           string     `json:"message"`
-	LastObservedAt    time.Time  `json:"last_observed_at"`
-	LastNotifiedAt    *time.Time `json:"last_notified_at,omitempty"`
-	NotificationCount int        `json:"notification_count"`
-}
+type State = ops.IncidentState
 
 type Repository interface {
 	ListRules(context.Context) ([]Rule, error)
@@ -113,9 +107,6 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 		keys := make([]string, 0, len(observations))
 		for _, observation := range observations {
 			keys = append(keys, observation.Key)
-			if observation.Ignore {
-				continue
-			}
 			if err := e.handle(ctx, rule, observation); err != nil {
 				errs = append(errs, fmt.Errorf("rule %d observation %q: %w", rule.ID, observation.Key, err))
 			}
@@ -131,30 +122,35 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 	if observation.Key == "" {
 		return errors.New("observation key is empty")
 	}
-	state, exists, err := e.Repository.LoadState(ctx, rule.ID, observation.Key)
+	state, _, err := e.Repository.LoadState(ctx, rule.ID, observation.Key)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
 	now := e.now()
-	notify := observation.Active && (!exists || !state.Active)
-	if observation.Active && exists && state.Active && rule.Cooldown > 0 && (rule.MaxNotifications <= 0 || state.NotificationCount < rule.MaxNotifications) {
-		notify = state.LastNotifiedAt == nil || now.Sub(*state.LastNotifiedAt) >= rule.Cooldown
+	policy := ops.IncidentPolicy{
+		FiringConfirmations: 1, RecoveryConfirmations: 1,
+		Cooldown: rule.Cooldown, MaxNotifications: rule.MaxNotifications, Repeat: rule.Cooldown > 0,
 	}
-	resolved := !observation.Active && exists && state.Active
-	if observation.Active && (!exists || !state.Active) {
-		state.NotificationCount = 0
+	if observation.UpstreamID > 0 || rule.Event == EventLowBalance || rule.Event == EventBalanceUnavailable || rule.Event == EventErrorRate || rule.Event == EventLatency {
+		policy.StableFor = 30 * time.Minute
+		policy.MaxGap = 90 * time.Second
 	}
-	if notify || resolved {
+	if rule.Event == EventErrorRate || rule.Event == EventLatency {
+		policy.FiringConfirmations, policy.RecoveryConfirmations = 2, 3
+		policy.MaxGap = 90 * time.Second
+	}
+	notification := state.Observe(now, observation.Active, observation.Ignore, observation.Hold, policy)
+	if notification != "" {
 		event := ops.Event{
 			Type:         rule.Event,
-			State:        "firing",
+			State:        notification,
 			Previous:     "inactive",
 			UpstreamID:   observation.UpstreamID,
 			UpstreamName: observation.UpstreamName,
 			Message:      observation.Message,
 			At:           now,
 		}
-		if resolved {
+		if notification == "resolved" {
 			event.State, event.Previous = "resolved", "active"
 			if observation.RecoveryMessage != "" {
 				event.Message = observation.RecoveryMessage
@@ -164,18 +160,10 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 		if e.Notifier != nil {
 			notifyErr = e.Notifier.Notify(ctx, event)
 		}
-		state.LastNotifiedAt = &now
-		if resolved && notifyErr == nil {
-			state.NotificationCount = 0
-		} else if notifyErr == nil {
-			state.NotificationCount++
-		}
 		if notifyErr != nil {
-			// Keep an active state for failed recoveries so the recovery is retried
-			// after the cooldown instead of being lost.
-			state.Active = true
+			state.EnqueueFailed(now, rule.Cooldown)
 		} else {
-			state.Active = observation.Active
+			state.Accepted(now, notification)
 		}
 		state.Value = observation.Value
 		state.Message = observation.Message
@@ -191,7 +179,6 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 		}
 		return nil
 	}
-	state.Active = observation.Active
 	state.Value = observation.Value
 	state.Message = observation.Message
 	state.LastObservedAt = now
