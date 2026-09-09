@@ -17,7 +17,7 @@ Authorization: Bearer <创建时获得的专用凭据>
 
 第一版**不缓存认证、权限或响应**，返回 `Cache-Control: no-store` 和 `Vary: Authorization`。每次查询在同一事务中验证凭据并读取明确的白名单；权限编辑/撤销通过凭据行锁与查询串行化。撤销或缩权完成后开始的查询不可能获得旧权限数据；已经开始的查询可能完成其原快照，已被客户端收到的数据无法追回。不要在代理/CDN覆盖 `no-store`；插件也不应把上一次成功响应当作撤销后的新查询结果。
 
-白名单为空或所授权中转站均被删除时，返回 `stations: []`，不是所有中转站。停用、余额暂停的中转站仍在已授权查询范围内。
+白名单为空或所授权中转站均被删除时，返回 `stations: []`，不是所有中转站。仅返回已启用中转站；余额暂停但仍启用的中转站保留展示。按 priority 升序、ID 升序排列。每条 station 新增 enabled、priority、groups（id/name/enabled）字段，仅描述已授权可见站点的所属分组，不返回其他成员或密钥。
 
 ## 脱敏成功响应
 
@@ -165,3 +165,11 @@ go build ./cmd/dapi
 新二进制在独立回环端口完成健康检查、管理员登录、创建查询凭据、查询成功、撤销及撤销后 401 的实际 HTTP 验证；检查其日志没有查询凭据或测试管理员密码。余额/权限隔离、UTC 日界、缺失输出计数、币种来源等由单元和数据库集成测试覆盖。
 
 未创建生产查询凭据，未部署或重启生产服务，未修改防火墙，未修改 Paseo 插件仓库。测试应用和隔离数据库已停止。
+
+## 展示扩展（2026-09-09）
+
+- station.enabled、priority、groups 供客户端按 D-API 分组和优先级展示；groups 按 ID 排序，未分组为 []。一个站点可出现在多个分组，其 today 始终为上游全量统计，不是该分组独立统计。
+- today 新增 known_input_tokens、known_output_tokens、known_total_tokens：已有聚合记录的数量（合计不重复累加缓存 Token），不保证覆盖所有请求。原 input_tokens/output_tokens/total_tokens 仍严格表示完整统计，缺失时为 null。
+- input_coverage/output_coverage 为有完整性记录的请求占比，无请求时 null；迁移前输出完整性计数为 0，所以覆盖率可能保守偏低。
+- 客户端在 total_tokens 为 null 时可以显示 known_total_tokens，必须标注“已记录、不完整”，不得当作当天完整用量。历史未返回的 Token 不补造。
+- 配置 NewAPI 账户登录凭据时，余额探测优先 /api/user/self，再按原逻辑回退；避免已缓存的密钥“不限额”遮住账户余额。账户认证失效时仍可能回退密钥额度，不能把不限额当成账户余额。

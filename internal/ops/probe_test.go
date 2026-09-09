@@ -383,3 +383,29 @@ func TestSub2APIUsageDoesNotInventCurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountBalanceOverridesCachedUnlimitedToken(t *testing.T) {
+	paths := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/user/self":
+			if r.Header.Get("Authorization") != "Bearer session" || r.Header.Get("New-Api-User") != "42" {
+				t.Error("account credentials missing")
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"quota":1500000,"used_quota":500000}}`))
+		case "/api/usage/token/":
+			_, _ = w.Write([]byte(`{"data":{"total_available":0,"total_used":500000,"unlimited_quota":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	p := NewProber(server.Client(), time.Second)
+	u := core.Upstream{BaseURL: server.URL, APIKey: "secret", AccessToken: "session", UserID: "42"}
+	p.rememberBalancePath(balancePathKey(u), "/api/usage/token/", time.Now())
+	b := p.CheckBalance(context.Background(), u)
+	if b.Unlimited || b.Available == nil || *b.Available != 3 || len(paths) != 1 || paths[0] != "/api/user/self" {
+		t.Fatal("account balance lost to cached token quota")
+	}
+}

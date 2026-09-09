@@ -277,6 +277,12 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 		credential = upstream.AccessToken
 		headers = map[string]string{"New-Api-User": upstream.UserID}
 	}
+	// Explicit account credentials take precedence over a cached unlimited token quota.
+	if upstream.AccessToken != "" && upstream.UserID != "" {
+		if balance, ok := try("/api/user/self", credential, headers, parseUserSelf); ok {
+			return balance
+		}
+	}
 	var cached core.Balance
 	var ok bool
 	switch preferred {

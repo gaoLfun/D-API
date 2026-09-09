@@ -79,7 +79,7 @@ func TestReadonlyUsageAccessAndManagement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, err := db.CreateUpstream(ctx, core.Upstream{Name: "B", Kind: "sub2api", BaseURL: "https://example.com", APIKey: secret, Protocols: []string{}, Models: []string{}})
+	id2, err := db.CreateUpstream(ctx, core.Upstream{Name: "B", Enabled: true, Kind: "sub2api", BaseURL: "https://example.com", APIKey: secret, Protocols: []string{}, Models: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestReadonlyUTCStatisticsAndUnknownCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	today = query()
-	if today.Input == nil || *today.Input != 300 || today.Output != nil || today.Total != nil {
+	if today.Input == nil || *today.Input != 300 || today.Output != nil || today.Total != nil || today.KnownTotal != 340 {
 		t.Fatal("unknown output replaced with zero")
 	}
 	missing = entry("missing-input", now.Add(3*time.Second))
@@ -398,7 +398,7 @@ func TestReadonlyLegacyCurrencyAndMissingUnit(t *testing.T) {
 	db := readonlyDB(t)
 	ctx := context.Background()
 	raw := randomUsageSecret(t)
-	id, err := db.CreateUpstream(ctx, core.Upstream{Name: "currency", Kind: "sub2api", BaseURL: "https://example.com", APIKey: raw, Protocols: []string{}, Models: []string{}})
+	id, err := db.CreateUpstream(ctx, core.Upstream{Name: "currency", Enabled: true, Kind: "sub2api", BaseURL: "https://example.com", APIKey: raw, Protocols: []string{}, Models: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,5 +429,47 @@ func TestReadonlyLegacyCurrencyAndMissingUnit(t *testing.T) {
 	}
 	if result.Stations[0].Balance.Currency != nil {
 		t.Fatal("missing unit inherited historical USD")
+	}
+}
+
+func TestReadonlyEnabledPriorityGroups(t *testing.T) {
+	db := readonlyDB(t)
+	ctx := context.Background()
+	raw := randomUsageSecret(t)
+	makeStation := func(name string, priority int, enabled bool) int64 {
+		t.Helper()
+		id, err := db.CreateUpstream(ctx, core.Upstream{Name: name, Kind: "newapi", BaseURL: "https://example.com", APIKey: raw, Enabled: enabled, Priority: priority, Protocols: []string{}, Models: []string{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	last := makeStation("last", 90, true)
+	first := makeStation("first", 1, true)
+	disabled := makeStation("disabled", 0, false)
+	hidden := makeStation("outside-scope", 0, true)
+	group, err := db.CreateGroup(ctx, core.Group{Name: "codex", Enabled: true, UpstreamIDs: []int64{first, hidden}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.CreateUsageCredential(ctx, "scope", auth.HashToken(raw), []int64{last, first, disabled}); err != nil {
+		t.Fatal(err)
+	}
+	result, _, err := db.ReadonlyUsage(ctx, auth.HashToken(raw), time.Now(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Stations) != 2 || result.Stations[0].ID != strconv.FormatInt(first, 10) || result.Stations[1].ID != strconv.FormatInt(last, 10) {
+		t.Fatal("disabled/scope/priority mismatch")
+	}
+	if !result.Stations[0].Enabled || result.Stations[0].Priority != 1 || len(result.Stations[0].Groups) != 1 || result.Stations[0].Groups[0].ID != strconv.FormatInt(group, 10) {
+		t.Fatal("group metadata missing")
+	}
+	if len(result.Stations[1].Groups) != 0 {
+		t.Fatal("ungrouped station incorrectly grouped")
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "outside-scope") {
+		t.Fatal("group leaked unauthorized station")
 	}
 }

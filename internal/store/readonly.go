@@ -103,18 +103,31 @@ type ReadonlyBalance struct {
 	UpdatedAt *time.Time `json:"updated_at"`
 }
 type ReadonlyToday struct {
-	Requests int64    `json:"requests"`
-	Input    *int64   `json:"input_tokens"`
-	Output   *int64   `json:"output_tokens"`
-	Total    *int64   `json:"total_tokens"`
-	Cost     *float64 `json:"estimated_cost_usd"`
-	Coverage *float64 `json:"cost_coverage"`
+	KnownInput     int64    `json:"known_input_tokens"`
+	KnownOutput    int64    `json:"known_output_tokens"`
+	KnownTotal     int64    `json:"known_total_tokens"`
+	InputCoverage  *float64 `json:"input_coverage"`
+	OutputCoverage *float64 `json:"output_coverage"`
+	Requests       int64    `json:"requests"`
+	Input          *int64   `json:"input_tokens"`
+	Output         *int64   `json:"output_tokens"`
+	Total          *int64   `json:"total_tokens"`
+	Cost           *float64 `json:"estimated_cost_usd"`
+	Coverage       *float64 `json:"cost_coverage"`
+}
+type ReadonlyGroup struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
 }
 type ReadonlyStation struct {
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Balance ReadonlyBalance `json:"balance"`
-	Today   ReadonlyToday   `json:"today"`
+	Enabled  bool            `json:"enabled"`
+	Priority int             `json:"priority"`
+	Groups   []ReadonlyGroup `json:"groups"`
+	ID       string          `json:"id"`
+	Name     string          `json:"name"`
+	Balance  ReadonlyBalance `json:"balance"`
+	Today    ReadonlyToday   `json:"today"`
 }
 type ReadonlyUsage struct {
 	Version     int               `json:"version"`
@@ -144,12 +157,13 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 	if !enabled {
 		return result, id, ErrReadonlyForbidden
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT u.id,u.name,u.kind,u.balance,
+	rows, err := tx.QueryContext(ctx, `SELECT u.id,u.name,u.kind,u.balance,u.enabled,u.priority,
+ COALESCE((SELECT json_agg(json_build_object('id',g.id::text,'name',g.name,'enabled',g.enabled) ORDER BY g.id) FROM group_upstreams gu JOIN groups g ON g.id=gu.group_id WHERE gu.upstream_id=u.id),'[]'::json),
  COALESCE(sum(d.requests),0),COALESCE(sum(d.input_tokens),0),COALESCE(sum(d.output_tokens),0),
  COALESCE(sum(d.usage_requests),0),COALESCE(sum(d.cost_usd),0),COALESCE(sum(d.cost_known_requests),0),COALESCE(sum(d.output_usage_requests),0)
  FROM usage_credential_stations a JOIN upstreams u ON u.id=a.upstream_id
  LEFT JOIN daily_usage d ON d.upstream_id=u.id AND d.day=$2::date
- WHERE a.credential_id=$1 GROUP BY u.id ORDER BY u.id`, id, now.UTC().Format("2006-01-02"))
+ WHERE a.credential_id=$1 AND u.enabled GROUP BY u.id ORDER BY u.priority,u.id`, id, now.UTC().Format("2006-01-02"))
 	if err != nil {
 		return result, id, err
 	}
@@ -157,9 +171,13 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 		var station ReadonlyStation
 		var sid, input, output, knownUsage, knownCost, knownOutput int64
 		var cost float64
-		var raw []byte
+		var raw, groups []byte
 		var kind string
-		if err = rows.Scan(&sid, &station.Name, &kind, &raw, &station.Today.Requests, &input, &output, &knownUsage, &cost, &knownCost, &knownOutput); err != nil {
+		if err = rows.Scan(&sid, &station.Name, &kind, &raw, &station.Enabled, &station.Priority, &groups, &station.Today.Requests, &input, &output, &knownUsage, &cost, &knownCost, &knownOutput); err != nil {
+			rows.Close()
+			return result, id, err
+		}
+		if err = json.Unmarshal(groups, &station.Groups); err != nil {
 			rows.Close()
 			return result, id, err
 		}
@@ -174,6 +192,19 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 		}
 		station.ID = strconv.FormatInt(sid, 10)
 		station.Balance = ProjectReadonlyBalance(balance, now, staleAfter)
+		station.Today.KnownInput = input
+		station.Today.KnownOutput = output
+		station.Today.KnownTotal = input + output
+		if station.Today.Requests > 0 {
+			inputCoverage := float64(knownUsage) / float64(station.Today.Requests)
+			outputCoverage := float64(knownOutput) / float64(station.Today.Requests)
+			if inputCoverage >= 0 && inputCoverage <= 1 {
+				station.Today.InputCoverage = &inputCoverage
+			}
+			if outputCoverage >= 0 && outputCoverage <= 1 {
+				station.Today.OutputCoverage = &outputCoverage
+			}
+		}
 		if station.Today.Requests == 0 || knownUsage == station.Today.Requests {
 			station.Today.Input = &input
 		}
