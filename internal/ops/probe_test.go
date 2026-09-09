@@ -409,3 +409,35 @@ func TestAccountBalanceOverridesCachedUnlimitedToken(t *testing.T) {
 		t.Fatal("account balance lost to cached token quota")
 	}
 }
+
+func TestUpstreamTodayKeepsReportedOutputAndCache(t *testing.T) {
+	b, err := parseSub2APIUsage([]byte(`{"remaining":12,"unit":"USD","usage":{"today":{"requests":4,"input_tokens":100,"output_tokens":20,"cache_read_tokens":300,"cache_creation_tokens":5,"total_tokens":425,"actual_cost":0.12},"total":{"actual_cost":5}}}`), time.Now())
+	if err != nil || b.Today == nil || b.Source != "sub2api_usage" {
+		t.Fatal("upstream today missing")
+	}
+	if b.Today.Output == nil || *b.Today.Output != 20 || b.Today.Total == nil || *b.Today.Total != 425 || b.Today.Timezone != nil {
+		t.Fatal("changed upstream token accounting or invented timezone")
+	}
+	b, err = parseSub2APIUsage([]byte(`{"remaining":0,"usage":{"today":{"output_tokens":0,"input_tokens":-1}}}`), time.Now())
+	if err != nil || b.Today.Output == nil || *b.Today.Output != 0 || b.Today.Input != nil || b.Today.Cost != nil {
+		t.Fatal("unknown/invalid values confused with zero")
+	}
+}
+
+func TestLegacyBillingUsageRefreshesUsedAmount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/dashboard/billing/subscription":
+			_, _ = w.Write([]byte(`{"hard_limit_usd":100000000}`))
+		case "/v1/dashboard/billing/usage":
+			_, _ = w.Write([]byte(`{"total_usage":1234}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	b := NewProber(server.Client(), time.Second).CheckBalance(context.Background(), core.Upstream{BaseURL: server.URL, APIKey: "fixture"})
+	if b.Source != "billing_subscription" || !b.Unlimited || b.Used == nil || *b.Used != 12.34 {
+		t.Fatal("legacy billing usage not refreshed")
+	}
+}

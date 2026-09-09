@@ -473,3 +473,43 @@ func TestReadonlyEnabledPriorityGroups(t *testing.T) {
 		t.Fatal("group leaked unauthorized station")
 	}
 }
+
+func TestReadonlyUpstreamTodayIsSeparateAndFailureClearsIt(t *testing.T) {
+	db := readonlyDB(t)
+	ctx := context.Background()
+	raw := randomUsageSecret(t)
+	id, err := db.CreateUpstream(ctx, core.Upstream{Name: "direct", Kind: "sub2api", BaseURL: "https://example.com", APIKey: raw, Enabled: true, Protocols: []string{}, Models: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.CreateUsageCredential(ctx, "scope", auth.HashToken(raw), []int64{id}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	output := int64(21)
+	balance := core.Balance{Status: "ok", Source: "sub2api_usage", UpdatedAt: &now, Today: &core.UpstreamToday{Output: &output}}
+	write := func() {
+		t.Helper()
+		body, _ := json.Marshal(balance)
+		if _, err = db.DB().Exec(`UPDATE upstreams SET balance=$2::jsonb WHERE id=$1`, id, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	got, _, err := db.ReadonlyUsage(ctx, auth.HashToken(raw), now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stations[0].UpstreamToday == nil || *got.Stations[0].UpstreamToday.Output != 21 || got.Stations[0].Today.Requests != 0 {
+		t.Fatal("direct data missing or mixed with gateway totals")
+	}
+	balance.Status = "unavailable"
+	write()
+	got, _, err = db.ReadonlyUsage(ctx, auth.HashToken(raw), now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stations[0].UpstreamToday != nil {
+		t.Fatal("failed query exposed stale direct stats as current")
+	}
+}

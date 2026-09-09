@@ -95,6 +95,7 @@ func (s *Store) ListUsageCredentials(ctx context.Context) ([]UsageCredential, er
 }
 
 type ReadonlyBalance struct {
+	Source    string     `json:"source"`
 	Status    string     `json:"status"`
 	Available *float64   `json:"available"`
 	Used      *float64   `json:"used"`
@@ -121,13 +122,14 @@ type ReadonlyGroup struct {
 	Enabled bool   `json:"enabled"`
 }
 type ReadonlyStation struct {
-	Enabled  bool            `json:"enabled"`
-	Priority int             `json:"priority"`
-	Groups   []ReadonlyGroup `json:"groups"`
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	Balance  ReadonlyBalance `json:"balance"`
-	Today    ReadonlyToday   `json:"today"`
+	UpstreamToday *core.UpstreamToday `json:"upstream_today"`
+	Enabled       bool                `json:"enabled"`
+	Priority      int                 `json:"priority"`
+	Groups        []ReadonlyGroup     `json:"groups"`
+	ID            string              `json:"id"`
+	Name          string              `json:"name"`
+	Balance       ReadonlyBalance     `json:"balance"`
+	Today         ReadonlyToday       `json:"today"`
 }
 type ReadonlyUsage struct {
 	Version     int               `json:"version"`
@@ -192,6 +194,9 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 		}
 		station.ID = strconv.FormatInt(sid, 10)
 		station.Balance = ProjectReadonlyBalance(balance, now, staleAfter)
+		if balance.Source == "sub2api_usage" && (station.Balance.Status == "ok" || station.Balance.Status == "stale") {
+			station.UpstreamToday = balance.Today
+		}
 		station.Today.KnownInput = input
 		station.Today.KnownOutput = output
 		station.Today.KnownTotal = input + output
@@ -238,6 +243,10 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 // Never serialize core.Balance directly: its Error may contain upstream secrets.
 func ProjectReadonlyBalance(b core.Balance, now time.Time, staleAfter time.Duration) ReadonlyBalance {
 	out := ReadonlyBalance{Status: "error"}
+	switch b.Source {
+	case "sub2api_usage", "newapi_account", "newapi_token", "billing_subscription":
+		out.Source = b.Source
+	}
 	if b.Status == "unsupported" || (b.Status == "unknown" && b.Error == "balance API unsupported") {
 		out.Status = "unsupported"
 		return out

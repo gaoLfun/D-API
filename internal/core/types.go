@@ -147,17 +147,30 @@ type RequestLog struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+type UpstreamToday struct {
+	Requests   *int64   `json:"requests"`
+	Input      *int64   `json:"input_tokens"`
+	Output     *int64   `json:"output_tokens"`
+	CacheRead  *int64   `json:"cache_read_tokens"`
+	CacheWrite *int64   `json:"cache_write_tokens"`
+	Total      *int64   `json:"total_tokens"`
+	Cost       *float64 `json:"actual_cost"`
+	Timezone   *string  `json:"timezone"`
+}
+
 type Balance struct {
-	CurrencyReported bool       `json:"currency_reported,omitempty"`
-	Status           string     `json:"status"`
-	Available        *float64   `json:"available,omitempty"`
-	Used             *float64   `json:"used,omitempty"`
-	Currency         string     `json:"currency,omitempty"`
-	Plan             string     `json:"plan,omitempty"`
-	Unlimited        bool       `json:"unlimited,omitempty"`
-	Error            string     `json:"error,omitempty"`
-	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
-	LastSuccess      *time.Time `json:"last_success_at,omitempty"`
+	Source           string         `json:"source,omitempty"`
+	Today            *UpstreamToday `json:"today,omitempty"`
+	CurrencyReported bool           `json:"currency_reported,omitempty"`
+	Status           string         `json:"status"`
+	Available        *float64       `json:"available,omitempty"`
+	Used             *float64       `json:"used,omitempty"`
+	Currency         string         `json:"currency,omitempty"`
+	Plan             string         `json:"plan,omitempty"`
+	Unlimited        bool           `json:"unlimited,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	UpdatedAt        *time.Time     `json:"updated_at,omitempty"`
+	LastSuccess      *time.Time     `json:"last_success_at,omitempty"`
 }
 
 func contains(values []string, value string) bool {

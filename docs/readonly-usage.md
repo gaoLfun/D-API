@@ -173,3 +173,11 @@ go build ./cmd/dapi
 - input_coverage/output_coverage 为有完整性记录的请求占比，无请求时 null；迁移前输出完整性计数为 0，所以覆盖率可能保守偏低。
 - 客户端在 total_tokens 为 null 时可以显示 known_total_tokens，必须标注“已记录、不完整”，不得当作当天完整用量。历史未返回的 Token 不补造。
 - 配置 NewAPI 账户登录凭据时，余额探测优先 /api/user/self，再按原逻辑回退；避免已缓存的密钥“不限额”遮住账户余额。账户认证失效时仍可能回退密钥额度，不能把不限额当成账户余额。
+
+## 上游数据展示扩展
+
+station.upstream_today 是最近一次上游成功查询返回的今日统计，缺失为 null。Sub2API /v1/usage 的 usage.today 中 requests/input_tokens/output_tokens/cache_read_tokens/cache_creation_tokens/total_tokens/actual_cost 直接映射；cache_creation_tokens 对外名为 cache_write_tokens。未知字段保持 null，不用 D-API 日聚合补齐。上游未说明时区时 timezone 为 null，不假定 UTC；input 与 cache 是否重叠遵循上游返回，总数不重新计算。实际费用使用 actual_cost，不用原价 cost 替代。负数忽略为未知。
+
+balance.source 标记 sub2api_usage/newapi_account/newapi_token/billing_subscription。旧订阅接口的大额度是不限额标记，不是账户现金余额；其 used 通过 /v1/dashboard/billing/usage 读取 total_usage（美分转美元），仅表示该接口返回的消费口径，不冒称今日费用。NewAPI 账户认证失败仍回退旧接口。
+
+只读接口仍不触发外部查询；定时余额探测同时保存上游今日快照。上游快照失败或不支持时不暴露历史 today，历史成功快照过期时保留数据并通过 balance.status=stale 标记。

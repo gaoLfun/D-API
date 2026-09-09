@@ -321,6 +321,17 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 		}
 	}
 	if subscription != nil {
+		// Legacy billing reports usage in cents; never treat its synthetic limit as a cash balance.
+		body, _, err := p.get(ctx, upstream, "/v1/dashboard/billing/usage", upstream.APIKey, nil)
+		if err == nil {
+			var usage struct {
+				Total *float64 `json:"total_usage"`
+			}
+			if json.Unmarshal(body, &usage) == nil && usage.Total != nil && *usage.Total >= 0 {
+				used := *usage.Total / 100
+				subscription.Used = &used
+			}
+		}
 		return *subscription
 	}
 	if ctx.Err() != nil {
@@ -650,6 +661,7 @@ func parseSubscription(body []byte, now time.Time) (core.Balance, error) {
 		return core.Balance{}, errors.New("subscription balance missing")
 	}
 	balance := successBalance(now)
+	balance.Source = "billing_subscription"
 	balance.Currency, balance.Plan = "USD", payload.Plan
 	if *available >= unlimitedSentinel {
 		balance.Unlimited = true
@@ -679,6 +691,7 @@ func parseTokenUsage(body []byte, now time.Time) (core.Balance, error) {
 		return core.Balance{}, errors.New("token usage balance missing")
 	}
 	balance := successBalance(now)
+	balance.Source = "newapi_token"
 	balance.Currency, balance.Unlimited = "USD", payload.Data.Unlimited
 	used := *payload.Data.Used / newAPIQuotaPerUSD
 	balance.Used = &used
@@ -709,6 +722,7 @@ func parseUserSelf(body []byte, now time.Time) (core.Balance, error) {
 		return core.Balance{}, errors.New("user balance missing")
 	}
 	balance := successBalance(now)
+	balance.Source = "newapi_account"
 	balance.Currency, balance.Plan = "USD", payload.Data.Group
 	available := *payload.Data.Quota / newAPIQuotaPerUSD
 	balance.Available = &available
@@ -729,6 +743,15 @@ func parseSub2APIUsage(body []byte, now time.Time) (core.Balance, error) {
 			Unit      string   `json:"unit"`
 		} `json:"quota"`
 		Usage *struct {
+			Today *struct {
+				Requests   *int64   `json:"requests"`
+				Input      *int64   `json:"input_tokens"`
+				Output     *int64   `json:"output_tokens"`
+				CacheRead  *int64   `json:"cache_read_tokens"`
+				CacheWrite *int64   `json:"cache_creation_tokens"`
+				Total      *int64   `json:"total_tokens"`
+				ActualCost *float64 `json:"actual_cost"`
+			} `json:"today"`
 			Total *struct {
 				Cost       *float64 `json:"cost"`
 				ActualCost *float64 `json:"actual_cost"`
@@ -754,6 +777,11 @@ func parseSub2APIUsage(body []byte, now time.Time) (core.Balance, error) {
 		return core.Balance{}, errors.New("usage balance missing")
 	}
 	balance := successBalance(now)
+	balance.Source = "sub2api_usage"
+	if payload.Usage != nil && payload.Usage.Today != nil {
+		t := payload.Usage.Today
+		balance.Today = &core.UpstreamToday{Requests: nonnegativeInt(t.Requests), Input: nonnegativeInt(t.Input), Output: nonnegativeInt(t.Output), CacheRead: nonnegativeInt(t.CacheRead), CacheWrite: nonnegativeInt(t.CacheWrite), Total: nonnegativeInt(t.Total), Cost: nonnegativeFloat(t.ActualCost)}
+	}
 	balance.Available, balance.Used, balance.Currency = available, used, currency
 	balance.CurrencyReported = currency != ""
 	return balance, nil
@@ -761,4 +789,17 @@ func parseSub2APIUsage(body []byte, now time.Time) (core.Balance, error) {
 
 func successBalance(now time.Time) core.Balance {
 	return core.Balance{Status: "ok", UpdatedAt: &now, LastSuccess: &now, CurrencyReported: true}
+}
+
+func nonnegativeInt(v *int64) *int64 {
+	if v != nil && *v < 0 {
+		return nil
+	}
+	return v
+}
+func nonnegativeFloat(v *float64) *float64 {
+	if v != nil && *v < 0 {
+		return nil
+	}
+	return v
 }
