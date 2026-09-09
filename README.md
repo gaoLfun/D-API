@@ -138,6 +138,8 @@ Key 独立处理；详情抽屉会分别显示余额、请求和成本。拓扑�
 
 ## 文档
 
+- [Paseo 中转站用量插件：安装、更新与恢复](plugins/paseo-relay-usage/README.md)
+
 - [文档索引](docs/README.md)
 - [架构与路由](docs/architecture.md) · [English](docs/architecture.en.md)
 - [部署、备份和恢复](docs/deployment.md) · [English](docs/deployment.en.md)

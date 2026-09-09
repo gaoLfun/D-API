@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import { build } from 'esbuild';
+import { pathToFileURL } from 'node:url';
+await build({ entryPoints: ['usage.server.ts'], bundle: true, platform: 'node', format: 'esm', outfile: 'build/adapter.mjs' });
+const { normalizeUsage, readUsage } = await import(pathToFileURL(process.cwd()+'/build/adapter.mjs'));
+const raw = { version:1, generated_at:'2026-09-09T08:00:00Z', timezone:'UTC', stations:[{id:'1',name:'test',balance:{status:'ok',available:0,used:null,currency:null,unlimited:false,updated_at:null},today:{requests:1,input_tokens:20,output_tokens:null,total_tokens:null,estimated_cost_usd:0,cost_coverage:0.5}, extra:'fixture-private'}]};
+const result=normalizeUsage(raw);
+const direct=normalizeUsage({...raw,stations:[{...raw.stations[0],upstream_today:{requests:2,input_tokens:100,output_tokens:20,cache_read_tokens:300,cache_write_tokens:0,total_tokens:420,actual_cost:0.1,timezone:null}}]});
+assert.equal(direct.stations[0].upstreamToday.output_tokens,20);assert.equal(direct.stations[0].outputTokens,null);assert.equal(direct.stations[0].upstreamToday.total_tokens,420);
+const grouped = normalizeUsage({...raw,stations:[{...raw.stations[0],id:'2',priority:90,enabled:true},{...raw.stations[0],id:'3',priority:0,enabled:false},{...raw.stations[0],id:'1',priority:1,groups:[{id:'1',name:'codex',enabled:true}],today:{...raw.stations[0].today,known_total_tokens:20}}]});
+assert.deepEqual(grouped.stations.map(s=>s.id),['1','2']);assert.equal(grouped.stations[0].groups[0].name,'codex');assert.equal(grouped.stations[0].knownTokens,20);assert.equal(grouped.stations[0].todayTokens,null);
+assert.equal(result.stations[0].remaining,0);assert.equal(result.stations[0].todayTokens,null);assert.equal(result.stations[0].costCoverage,0.5);assert.equal(result.timezone,'UTC');assert.equal(result.stations[0].currency,'');assert.ok(!JSON.stringify(result).includes('fixture-private'));
+assert.throws(()=>normalizeUsage({...raw,version:2}));
+
+process.env.PASEO_RELAY_DAPI_USAGE_CREDENTIAL='test-only';
+let calls=0;
+globalThis.fetch=async(url,options)=>{calls++;assert.equal(new URL(url).pathname,'/api/readonly/usage');assert.equal(options.headers.Authorization,'Bearer test-only');assert.equal(options.cache,'no-store');return Response.json(raw);};
+assert.equal((await readUsage()).status,'connected');assert.equal((await readUsage()).status,'connected');assert.equal(calls,2);
+globalThis.fetch=async()=>new Response('',{status:401});assert.deepEqual((await readUsage()).stations,[]);
+globalThis.fetch=async()=>Response.json({...raw,version:2});assert.equal((await readUsage()).status,'error');
+globalThis.fetch=async()=>new Response('',{status:429,headers:{'Retry-After':'60'}});assert.equal((await readUsage()).status,'error');
+globalThis.fetch=async()=>{throw Error('不应再次请求')};assert.match((await readUsage()).message,/秒后/);
+console.log('通过：v1契约、未知值、UTC、计价覆盖率、Bearer认证、无成功缓存、撤销清空、异常响应和限流退避');

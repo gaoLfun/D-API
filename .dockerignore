@@ -15,3 +15,5 @@ web/test-results
 *.log
 *.sql.gz
 *.dump
+
+plugins/
