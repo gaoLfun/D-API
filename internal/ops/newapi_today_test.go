@@ -15,7 +15,7 @@ import (
 func TestNewAPIAccountTodayPagesAndUnknowns(t *testing.T) {
 	now := time.Date(2026, 9, 9, 1, 30, 0, 0, time.UTC)
 	start := time.Date(2026, 9, 8, 16, 0, 0, 0, time.UTC).Unix()
-	for _, mode := range []string{"pages", "zero", "missing-output", "duplicate", "wrong-window", "forbidden", "changed-total", "slash-only"} {
+	for _, mode := range []string{"pages", "zero", "missing-output", "duplicate", "wrong-window", "forbidden", "changed-total", "slash-only", "reused-id"} {
 		t.Run(mode, func(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -55,10 +55,13 @@ func TestNewAPIAccountTodayPagesAndUnknowns(t *testing.T) {
 				} else {
 					p, _ := strconv.Atoi(q.Get("p"))
 					id := p
-					if mode == "duplicate" {
+					if mode == "duplicate" || mode == "reused-id" {
 						id = 1
 					}
 					row := map[string]any{"id": id, "type": 2, "created_at": start + 1, "prompt_tokens": 100, "completion_tokens": 20}
+					if mode == "reused-id" {
+						row["created_at"] = start + int64(p)
+					}
 					if mode == "missing-output" && p == 2 {
 						delete(row, "completion_tokens")
 					}
@@ -78,7 +81,7 @@ func TestNewAPIAccountTodayPagesAndUnknowns(t *testing.T) {
 				t.Fatal("cost/timezone missing")
 			}
 			switch mode {
-			case "pages", "slash-only":
+			case "pages", "slash-only", "reused-id":
 				wantCalls := 3
 				if mode == "slash-only" {
 					wantCalls = 5

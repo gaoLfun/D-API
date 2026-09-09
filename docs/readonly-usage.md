@@ -186,4 +186,4 @@ balance.source 标记 sub2api_usage/newapi_account/newapi_token/billing_subscrip
 
 账户认证成功后，通过上游 `/api/log/self/stat` 读取当日 quota，按现有 NewAPI 每美元 500000 quota 的口径换算 actual_cost；通过 `/api/log/self` 消费日志汇总 prompt_tokens 和 completion_tokens。查询范围固定为 UTC+08:00 当日零点至本次探测开始时间，upstream_today.timezone 明确返回 UTC+08:00，与网关 today 的 UTC 口径独立。
 
-兼容仅支持尾斜杠的 NewAPI 路由；只尝试配置上游的固定地址，不跟随重定向 Location，不向其他主机转发账户凭据。每页请求 100 条、最多 20 页，总时限 20 秒。分页总数变化、重复记录、越界记录或未读取完整时，输入输出保持 null，仍可展示独立成功获取的费用。上游明确无记录时请求数和 Token 为 0；日志缺少某项 Token 时该项保持 null，不用网关数据补齐。
+兼容仅支持尾斜杠的 NewAPI 路由；只尝试配置上游的固定地址，不跟随重定向 Location，不向其他主机转发账户凭据。每页请求 100 条、最多 20 页，总时限 20 秒。分页总数变化、跨页重复内容、越界记录或未读取完整时，输入输出保持 null，仍可展示独立成功获取的费用。上游明确无记录时请求数和 Token 为 0；日志缺少某项 Token 时该项保持 null，不用网关数据补齐。

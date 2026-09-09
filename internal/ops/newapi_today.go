@@ -42,7 +42,8 @@ func (p *Prober) newAPIAccountToday(ctx context.Context, upstream core.Upstream,
 		Input   *int64 `json:"prompt_tokens"`
 		Output  *int64 `json:"completion_tokens"`
 	}
-	seen := map[int64]bool{}
+	seen := map[string]int{}
+	var count int64
 	var total, input, output int64
 	inputComplete, outputComplete := true, true
 	query.Set("page_size", "100")
@@ -78,11 +79,16 @@ func (p *Prober) newAPIAccountToday(ctx context.Context, upstream core.Upstream,
 		}
 		valid := true
 		for _, row := range response.Data.Items {
-			if row.ID <= 0 || seen[row.ID] || row.Type != 2 || row.Created < start || row.Created > end {
+			// Some providers reuse IDs for distinct consumption records. Compare
+			// record contents across pages, while preserving rows within a page.
+			fingerprint, _ := json.Marshal(row)
+			key := string(fingerprint)
+			if (seen[key] != 0 && seen[key] != page) || row.Type != 2 || row.Created < start || row.Created > end {
 				valid = false
 				break
 			}
-			seen[row.ID] = true
+			seen[key] = page
+			count++
 			if row.Input == nil || *row.Input < 0 {
 				inputComplete = false
 			} else {
@@ -97,7 +103,7 @@ func (p *Prober) newAPIAccountToday(ctx context.Context, upstream core.Upstream,
 		if !valid {
 			break
 		}
-		if int64(len(seen)) == total {
+		if count == total {
 			if inputComplete {
 				out.Input = &input
 			}
@@ -110,7 +116,7 @@ func (p *Prober) newAPIAccountToday(ctx context.Context, upstream core.Upstream,
 			}
 			return out
 		}
-		if len(response.Data.Items) == 0 || int64(len(seen)) > total {
+		if len(response.Data.Items) == 0 || count > total {
 			break
 		}
 	}
