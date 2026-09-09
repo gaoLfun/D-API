@@ -148,15 +148,16 @@ type RequestLog struct {
 }
 
 type Balance struct {
-	Status      string     `json:"status"`
-	Available   *float64   `json:"available,omitempty"`
-	Used        *float64   `json:"used,omitempty"`
-	Currency    string     `json:"currency,omitempty"`
-	Plan        string     `json:"plan,omitempty"`
-	Unlimited   bool       `json:"unlimited,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
-	LastSuccess *time.Time `json:"last_success_at,omitempty"`
+	CurrencyReported bool       `json:"currency_reported,omitempty"`
+	Status           string     `json:"status"`
+	Available        *float64   `json:"available,omitempty"`
+	Used             *float64   `json:"used,omitempty"`
+	Currency         string     `json:"currency,omitempty"`
+	Plan             string     `json:"plan,omitempty"`
+	Unlimited        bool       `json:"unlimited,omitempty"`
+	Error            string     `json:"error,omitempty"`
+	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+	LastSuccess      *time.Time `json:"last_success_at,omitempty"`
 }
 
 func contains(values []string, value string) bool {

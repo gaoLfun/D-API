@@ -747,14 +747,12 @@ func parseSub2APIUsage(body []byte, now time.Time) (core.Balance, error) {
 	if available == nil || *available < 0 || (used != nil && *used < 0) {
 		return core.Balance{}, errors.New("usage balance missing")
 	}
-	if currency == "" {
-		currency = "USD"
-	}
 	balance := successBalance(now)
 	balance.Available, balance.Used, balance.Currency = available, used, currency
+	balance.CurrencyReported = currency != ""
 	return balance, nil
 }
 
 func successBalance(now time.Time) core.Balance {
-	return core.Balance{Status: "ok", UpdatedAt: &now, LastSuccess: &now}
+	return core.Balance{Status: "ok", UpdatedAt: &now, LastSuccess: &now, CurrencyReported: true}
 }

@@ -290,8 +290,9 @@ func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance,
 	if balance.Used == nil {
 		balance.Used = previous.Used
 	}
-	if balance.Currency == "" {
+	if balance.Currency == "" && balance.Status != "ok" {
 		balance.Currency = previous.Currency
+		balance.CurrencyReported = previous.CurrencyReported
 	}
 	if balance.LastSuccess == nil && balance.Status == "ok" {
 		now := time.Now().UTC()

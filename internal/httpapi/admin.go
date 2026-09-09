@@ -34,6 +34,7 @@ type Server struct {
 	operations Operations
 	notifier   ops.Notifier
 	logins     loginLimiter
+	usageRates usageRateLimiter
 }
 
 type Operations interface {
@@ -77,6 +78,7 @@ func BootstrapAdmin(ctx context.Context, database *store.Store, username, passwo
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
+	s.registerReadonly(mux)
 	mux.HandleFunc("POST /api/admin/login", s.login)
 	mux.Handle("POST /api/admin/logout", s.admin(http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/admin/me", s.admin(http.HandlerFunc(s.me)))

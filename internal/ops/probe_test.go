@@ -367,3 +367,19 @@ func TestUnknownBalanceWhenUnsupported(t *testing.T) {
 		t.Fatalf("balance = %#v", balance)
 	}
 }
+
+func TestSub2APIUsageDoesNotInventCurrency(t *testing.T) {
+	for _, unit := range []string{"", "USD", "CNY", "CREDITS"} {
+		body, err := json.Marshal(map[string]any{"remaining": 0, "unit": unit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		balance, err := parseSub2APIUsage(body, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if balance.Currency != unit || balance.CurrencyReported != (unit != "") {
+			t.Fatal("currency provenance incorrect")
+		}
+	}
+}

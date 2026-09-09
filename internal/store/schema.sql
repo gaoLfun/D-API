@@ -376,3 +376,22 @@ UPDATE api_keys SET group_id=(SELECT id FROM groups WHERE name='默认分组')
 WHERE group_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM settings WHERE key='groups_migrated_v1');
 INSERT INTO settings(key,value) VALUES('groups_migrated_v1','true') ON CONFLICT(key) DO NOTHING;
+
+-- Independent, hash-only credentials for the readonly usage API.
+CREATE TABLE IF NOT EXISTS usage_credentials (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    credential_hash BYTEA NOT NULL UNIQUE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS usage_credential_stations (
+    credential_id BIGINT NOT NULL REFERENCES usage_credentials(id) ON DELETE CASCADE,
+    upstream_id BIGINT NOT NULL REFERENCES upstreams(id) ON DELETE CASCADE,
+    PRIMARY KEY (credential_id, upstream_id)
+);
+
+-- Legacy output completeness is unknown; do not infer it from a zero sum.
+ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS output_usage_requests BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE hourly_usage ADD COLUMN IF NOT EXISTS output_usage_requests BIGINT NOT NULL DEFAULT 0;

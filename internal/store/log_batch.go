@@ -17,6 +17,7 @@ type usageAggregate struct {
 	input, output, cacheRead, cacheWrite int64
 	cacheWriteRequests, uncached         int64
 	usageRequests, cacheHits             int64
+	outputUsageRequests                  int64
 	cost                                 float64
 	costKnown                            int64
 }
@@ -209,6 +210,9 @@ func aggregateRequest(entry core.RequestLog) usageAggregate {
 	if entry.Usage.InputTokens != nil {
 		value.usageRequests = 1
 	}
+	if entry.Usage.OutputTokens != nil {
+		value.outputUsageRequests = 1
+	}
 	if value.cacheRead > 0 {
 		value.cacheHits = 1
 	}
@@ -236,6 +240,7 @@ func addUsageAggregate(left, right usageAggregate) usageAggregate {
 	left.cacheWriteRequests += right.cacheWriteRequests
 	left.uncached += right.uncached
 	left.usageRequests += right.usageRequests
+	left.outputUsageRequests += right.outputUsageRequests
 	left.cacheHits += right.cacheHits
 	left.cost += right.cost
 	left.costKnown += right.costKnown
@@ -251,15 +256,15 @@ func upsertUsageAggregates(ctx context.Context, tx *sql.Tx, table, periodColumn 
 	query.WriteString(fmt.Sprintf(`
 		INSERT INTO %s(
 			%s,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
-			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests
+			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests,output_usage_requests
 		) VALUES `, table, periodColumn))
-	args := make([]any, 0, len(keys)*18)
+	args := make([]any, 0, len(keys)*19)
 	for _, key := range keys {
 		if len(args) > 0 {
 			query.WriteByte(',')
 		}
 		query.WriteByte('(')
-		for column := range 18 {
+		for column := range 19 {
 			if column > 0 {
 				query.WriteByte(',')
 			}
@@ -271,7 +276,7 @@ func upsertUsageAggregates(ctx context.Context, tx *sql.Tx, table, periodColumn 
 			key.period, key.apiKeyID, key.groupID, key.upstreamID, key.protocol, key.model,
 			value.requests, value.successes, value.input, value.output, value.cacheRead,
 			value.cacheWrite, value.cacheWriteRequests, value.uncached, value.usageRequests,
-			value.cacheHits, value.cost, value.costKnown,
+			value.cacheHits, value.cost, value.costKnown, value.outputUsageRequests,
 		)
 	}
 	query.WriteString(fmt.Sprintf(` ON CONFLICT(%s,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
@@ -286,8 +291,9 @@ func upsertUsageAggregates(ctx context.Context, tx *sql.Tx, table, periodColumn 
 			usage_requests=%s.usage_requests+EXCLUDED.usage_requests,
 			cache_hit_requests=%s.cache_hit_requests+EXCLUDED.cache_hit_requests,
 			cost_usd=%s.cost_usd+EXCLUDED.cost_usd,
-			cost_known_requests=%s.cost_known_requests+EXCLUDED.cost_known_requests`, periodColumn,
-		table, table, table, table, table, table, table, table, table, table, table, table))
+			cost_known_requests=%s.cost_known_requests+EXCLUDED.cost_known_requests,
+			output_usage_requests=%s.output_usage_requests+EXCLUDED.output_usage_requests`, periodColumn,
+		table, table, table, table, table, table, table, table, table, table, table, table, table))
 	_, err := tx.ExecContext(ctx, query.String(), args...)
 	return err
 }

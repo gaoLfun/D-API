@@ -107,14 +107,14 @@ func recordPreparedRequest(ctx context.Context, executor requestLogExecer, prepa
 		daily AS (
 		INSERT INTO daily_usage(
 				day,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
-				cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests
+				cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests,output_usage_requests
 			)
 			SELECT (created_at AT TIME ZONE 'UTC')::date,api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
 			CASE WHEN status_code BETWEEN 200 AND 399 AND error_code='' THEN 1 ELSE 0 END,
 			COALESCE(input_tokens,0),COALESCE(output_tokens,0),COALESCE(cached_input_tokens,0),
 				COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
 				COALESCE(uncached_input_tokens,0),CASE WHEN input_tokens IS NULL THEN 0 ELSE 1 END,
-				CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END
+				CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END,CASE WHEN output_tokens IS NULL THEN 0 ELSE 1 END
 			FROM inserted
 			WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
 			ON CONFLICT(day,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
@@ -129,7 +129,8 @@ func recordPreparedRequest(ctx context.Context, executor requestLogExecer, prepa
 			usage_requests=daily_usage.usage_requests+EXCLUDED.usage_requests,
 			cache_hit_requests=daily_usage.cache_hit_requests+EXCLUDED.cache_hit_requests,
 			cost_usd=daily_usage.cost_usd+EXCLUDED.cost_usd,
-			cost_known_requests=daily_usage.cost_known_requests+EXCLUDED.cost_known_requests
+			cost_known_requests=daily_usage.cost_known_requests+EXCLUDED.cost_known_requests,
+			output_usage_requests=daily_usage.output_usage_requests+EXCLUDED.output_usage_requests
 		RETURNING 1
 		), lifetime AS (
 			INSERT INTO upstream_lifetime_usage(upstream_id,requests,cost_known_requests,cost_usd,updated_at)
@@ -144,14 +145,14 @@ func recordPreparedRequest(ctx context.Context, executor requestLogExecer, prepa
 		)
 		INSERT INTO hourly_usage(
 			hour,api_key_id,group_id,upstream_id,protocol,model,requests,successes,input_tokens,output_tokens,cached_input_tokens,
-			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests
+			cache_creation_input_tokens,cache_creation_usage_requests,uncached_input_tokens,usage_requests,cache_hit_requests,cost_usd,cost_known_requests,output_usage_requests
 		)
 		SELECT date_trunc('hour',created_at),api_key_id,COALESCE(group_id,0),upstream_id,protocol,model,1,
 			CASE WHEN status_code BETWEEN 200 AND 399 AND error_code='' THEN 1 ELSE 0 END,
 			COALESCE(input_tokens,0),COALESCE(output_tokens,0),COALESCE(cached_input_tokens,0),
 			COALESCE(cache_creation_input_tokens,0),CASE WHEN cache_creation_input_tokens IS NULL THEN 0 ELSE 1 END,
 			COALESCE(uncached_input_tokens,0),CASE WHEN input_tokens IS NULL THEN 0 ELSE 1 END,
-			CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END
+			CASE WHEN cached_input_tokens > 0 THEN 1 ELSE 0 END,COALESCE(cost_usd,0),CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END,CASE WHEN output_tokens IS NULL THEN 0 ELSE 1 END
 		FROM inserted
 		WHERE api_key_id IS NOT NULL AND upstream_id IS NOT NULL
 		ON CONFLICT(hour,api_key_id,group_id,upstream_id,protocol,model) DO UPDATE SET
@@ -166,7 +167,8 @@ func recordPreparedRequest(ctx context.Context, executor requestLogExecer, prepa
 			usage_requests=hourly_usage.usage_requests+EXCLUDED.usage_requests,
 			cache_hit_requests=hourly_usage.cache_hit_requests+EXCLUDED.cache_hit_requests,
 			cost_usd=hourly_usage.cost_usd+EXCLUDED.cost_usd,
-			cost_known_requests=hourly_usage.cost_known_requests+EXCLUDED.cost_known_requests`,
+			cost_known_requests=hourly_usage.cost_known_requests+EXCLUDED.cost_known_requests,
+			output_usage_requests=hourly_usage.output_usage_requests+EXCLUDED.output_usage_requests`,
 		entry.RequestID, nullableID(entry.APIKeyID), entry.GroupID, entry.UpstreamID, entry.Protocol, entry.Model,
 		entry.StatusCode, entry.DurationMS, entry.TTFBMS, entry.TTFTMS, prepared.attempts, entry.Usage.InputTokens, entry.Usage.OutputTokens,
 		entry.Usage.CachedInputTokens, entry.Usage.CacheCreationInputTokens, entry.Usage.UncachedInputTokens,
