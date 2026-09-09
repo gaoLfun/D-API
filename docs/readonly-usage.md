@@ -181,3 +181,9 @@ station.upstream_today 是最近一次上游成功查询返回的今日统计，
 balance.source 标记 sub2api_usage/newapi_account/newapi_token/billing_subscription。旧订阅接口的大额度是不限额标记，不是账户现金余额；其 used 通过 /v1/dashboard/billing/usage 读取 total_usage（美分转美元），仅表示该接口返回的消费口径，不冒称今日费用。NewAPI 账户认证失败仍回退旧接口。
 
 只读接口仍不触发外部查询；定时余额探测同时保存上游今日快照。上游快照失败或不支持时不暴露历史 today，历史成功快照过期时保留数据并通过 balance.status=stale 标记。
+
+### NewAPI / AgentRouter 今日用量
+
+账户认证成功后，通过上游 `/api/log/self/stat` 读取当日 quota，按现有 NewAPI 每美元 500000 quota 的口径换算 actual_cost；通过 `/api/log/self` 消费日志汇总 prompt_tokens 和 completion_tokens。查询范围固定为 UTC+08:00 当日零点至本次探测开始时间，upstream_today.timezone 明确返回 UTC+08:00，与网关 today 的 UTC 口径独立。
+
+兼容仅支持尾斜杠的 NewAPI 路由；只尝试配置上游的固定地址，不跟随重定向 Location，不向其他主机转发账户凭据。每页请求 100 条、最多 20 页，总时限 20 秒。分页总数变化、重复记录、越界记录或未读取完整时，输入输出保持 null，仍可展示独立成功获取的费用。上游明确无记录时请求数和 Token 为 0；日志缺少某项 Token 时该项保持 null，不用网关数据补齐。

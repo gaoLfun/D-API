@@ -194,7 +194,7 @@ func (s *Store) ReadonlyUsage(ctx context.Context, hash []byte, now time.Time, s
 		}
 		station.ID = strconv.FormatInt(sid, 10)
 		station.Balance = ProjectReadonlyBalance(balance, now, staleAfter)
-		if balance.Source == "sub2api_usage" && (station.Balance.Status == "ok" || station.Balance.Status == "stale") {
+		if (balance.Source == "sub2api_usage" || balance.Source == "newapi_account") && (station.Balance.Status == "ok" || station.Balance.Status == "stale") {
 			station.UpstreamToday = balance.Today
 		}
 		station.Today.KnownInput = input

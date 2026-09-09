@@ -394,6 +394,10 @@ func TestAccountBalanceOverridesCachedUnlimitedToken(t *testing.T) {
 				t.Error("account credentials missing")
 			}
 			_, _ = w.Write([]byte(`{"success":true,"data":{"quota":1500000,"used_quota":500000}}`))
+		case "/api/log/self/stat":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"quota":0}}`))
+		case "/api/log/self":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"total":0,"items":[]}}`))
 		case "/api/usage/token/":
 			_, _ = w.Write([]byte(`{"data":{"total_available":0,"total_used":500000,"unlimited_quota":true}}`))
 		default:
@@ -405,8 +409,11 @@ func TestAccountBalanceOverridesCachedUnlimitedToken(t *testing.T) {
 	u := core.Upstream{BaseURL: server.URL, APIKey: "secret", AccessToken: "session", UserID: "42"}
 	p.rememberBalancePath(balancePathKey(u), "/api/usage/token/", time.Now())
 	b := p.CheckBalance(context.Background(), u)
-	if b.Unlimited || b.Available == nil || *b.Available != 3 || len(paths) != 1 || paths[0] != "/api/user/self" {
+	if b.Unlimited || b.Available == nil || *b.Available != 3 || len(paths) != 3 || paths[0] != "/api/user/self" {
 		t.Fatal("account balance lost to cached token quota")
+	}
+	if b.Today == nil || b.Today.Cost == nil || *b.Today.Cost != 0 || b.Today.Input == nil || *b.Today.Input != 0 || b.Today.Output == nil || *b.Today.Output != 0 {
+		t.Fatal("account daily usage missing from balance snapshot")
 	}
 }
 

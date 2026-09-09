@@ -266,6 +266,9 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
 			return core.Balance{}, false
 		}
+		if path == "/api/user/self" && upstream.AccessToken != "" && upstream.UserID != "" {
+			balance.Today = p.newAPIAccountToday(ctx, upstream, credential, headers, now)
+		}
 		if path != "/v1/dashboard/billing/subscription" {
 			p.rememberBalancePath(key, path, now)
 		}
@@ -344,9 +347,20 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 }
 
 func (p *Prober) get(ctx context.Context, upstream core.Upstream, endpoint, credential string, headers map[string]string) ([]byte, int, error) {
+	return p.getWithQuery(ctx, upstream, endpoint, credential, headers, nil)
+}
+func (p *Prober) getWithQuery(ctx context.Context, upstream core.Upstream, endpoint, credential string, headers map[string]string, query url.Values) ([]byte, int, error) {
 	target, err := endpointURL(upstream.BaseURL, endpoint)
 	if err != nil {
 		return nil, 0, err
+	}
+	if query != nil {
+		u, parseErr := url.Parse(target)
+		if parseErr != nil {
+			return nil, 0, errors.New("invalid query target")
+		}
+		u.RawQuery = query.Encode()
+		target = u.String()
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
