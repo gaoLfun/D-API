@@ -511,3 +511,32 @@ test('客户端模拟 Messages 请求发送兼容请求头', async ({ page }) =>
   expect(requestHeaders['anthropic-version']).toBe('2023-06-01')
   expect(requestHeaders.authorization).toBeUndefined()
 })
+
+for (const width of [1440, 390]) {
+  test(`alert history opens failed attempts after successful fallback at ${width}px`, async ({ page }) => {
+    await mockApi(page)
+    await page.setViewportSize({ width, height: 900 })
+    const start = '2026-09-09T04:40:01Z'
+    const end = '2026-09-09T04:45:01Z'
+    await page.route('**/api/admin/alert-history?*', route => route.fulfill({ json: [{ type: 'error_rate', state: 'firing', previous: 'active', notification_number: 2, upstream_id: 1, upstream_name: '阿基诺', at: end, message: '请求尝试：9 次，失败 2 次\n错误率：22.2%，阈值 20%', evidence: { window_start: start, window_end: end, failed_request_ids: ['fallback-request'] } }] }))
+    let query: URLSearchParams | undefined
+    await page.route('**/api/admin/logs?*', route => {
+      query = new URL(route.request().url()).searchParams
+      return route.fulfill({ json: [{ request_id: 'fallback-request', upstream_id: 2, upstream_name: '备用', protocol: 'chat', model: 'test', status_code: 200, duration_ms: 100, created_at: end, attempts: [{ upstream_id: 1, upstream_name: '阿基诺', status_code: 429, error: 'Too Many Requests', duration_ms: 20 }, { upstream_id: 2, upstream_name: '备用', status_code: 200, duration_ms: 80 }] }] })
+    })
+    await page.goto('/#channels')
+    await page.getByRole('tab', { name: '告警历史' }).click()
+    await expect(page.getByText(/持续提醒 · 第 2 次/)).toBeVisible()
+    await page.getByRole('button', { name: '查看窗口内失败尝试' }).click()
+    await expect(page.getByText('fallback-req', { exact: false })).toBeVisible()
+    expect(query?.get('upstream_id')).toBe('1')
+    expect(query?.get('status')).toBe('attempt_error')
+    expect(query?.get('since')).toBe(start)
+    expect(query?.get('until')).toBe(end)
+    await page.getByRole('button', { name: '展开请求 fallback-request 详情' }).click()
+    await expect(page.getByText('状态：429')).toBeVisible()
+    await expect(page.getByText('Too Many Requests')).toBeVisible()
+    await page.getByRole('button', { name: '清除筛选' }).click()
+    await expect.poll(() => query?.has('since')).toBe(false)
+  })
+}

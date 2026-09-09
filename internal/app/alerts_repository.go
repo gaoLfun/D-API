@@ -3,8 +3,12 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"github.com/gaoLfun/dapi/internal/ops"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/alerts"
@@ -129,30 +133,40 @@ func (r AlertRepository) observeBalance(ctx context.Context, rule alerts.Rule) (
 
 func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts.Rule) ([]alerts.Observation, error) {
 	window := windowSeconds(rule)
+	windowEnd := time.Now()
+	windowStart := windowEnd.Add(-time.Duration(window) * time.Second)
 	upstreamID := int64(0)
 	if rule.UpstreamID != nil {
 		upstreamID = *rule.UpstreamID
 	}
 	rows, err := r.Store.DB().QueryContext(ctx, `
 		WITH attempts AS (
-			SELECT COALESCE((a->>'upstream_id')::bigint,0) AS upstream_id,
+			SELECT l.request_id, l.status_code AS final_status, l.error_code AS final_error, COALESCE((a->>'upstream_id')::bigint,0) AS upstream_id,
 				COALESCE((a->>'status_code')::int,0) AS status_code,
 				COALESCE((a->>'duration_ms')::double precision,0) AS duration_ms
 			FROM request_logs l
 			CROSS JOIN LATERAL jsonb_array_elements(l.attempts) a
-			WHERE l.created_at >= now()-make_interval(secs=>$1)
+			WHERE l.created_at >= $1 AND l.created_at < $4
 		), metrics AS (
 			SELECT upstream_id,COUNT(*) AS attempts,
 				100.0*COUNT(*) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500)
 					/NULLIF(COUNT(*),0) AS error_rate,
-				AVG(duration_ms) AS latency
-			FROM attempts GROUP BY upstream_id
+				AVG(duration_ms) AS latency,
+		COUNT(*) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500) AS failures,
+		COUNT(DISTINCT request_id) FILTER (WHERE (status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500) AND final_status BETWEEN 200 AND 399 AND final_error='') AS recovered,
+		to_jsonb((array_agg(DISTINCT request_id) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500))[1:100]) AS failed_request_ids
+		FROM attempts GROUP BY upstream_id
+		), status_counts AS (
+		SELECT upstream_id,jsonb_object_agg(status_code,n) AS counts FROM (
+		SELECT upstream_id,status_code,COUNT(*) AS n FROM attempts
+		WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500
+		GROUP BY upstream_id,status_code) c GROUP BY upstream_id
 		)
-		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),m.latency
-		FROM upstreams u LEFT JOIN metrics m ON m.upstream_id=u.id
+		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),m.latency,COALESCE(m.failures,0),COALESCE(m.recovered,0),COALESCE(c.counts,'{}'::jsonb),COALESCE(m.failed_request_ids,'[]'::jsonb)
+		FROM upstreams u LEFT JOIN metrics m ON m.upstream_id=u.id LEFT JOIN status_counts c ON c.upstream_id=u.id
 		WHERE u.enabled AND ($2=0 OR u.id=$2)
 			AND ($2<>0 OR NOT EXISTS (SELECT 1 FROM alert_rules ar WHERE ar.event=$3 AND ar.upstream_id=u.id AND ar.enabled))
-		ORDER BY u.id`, window, upstreamID, rule.Event)
+		ORDER BY u.id`, windowStart, upstreamID, rule.Event, windowEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +177,16 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 		var name string
 		var errorRate float64
 		var latency sql.NullFloat64
-		if err := rows.Scan(&id, &name, &count, &errorRate, &latency); err != nil {
+		var failures, recovered int64
+		var statusJSON, requestIDsJSON []byte
+		if err := rows.Scan(&id, &name, &count, &errorRate, &latency, &failures, &recovered, &statusJSON, &requestIDsJSON); err != nil {
+			return nil, err
+		}
+		evidence := &ops.MetricEvidence{WindowStart: windowStart, WindowEnd: windowEnd, Threshold: threshold(rule, 20), Attempts: count, Failures: failures, RecoveredRequests: recovered}
+		if err := json.Unmarshal(statusJSON, &evidence.StatusCounts); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(requestIDsJSON, &evidence.FailedRequestIDs); err != nil {
 			return nil, err
 		}
 		value := errorRate
@@ -177,9 +200,26 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 		}
 		active := count >= 5 && errorRate >= threshold(rule, 20)
 		hold := !active && errorRate >= threshold(rule, 20)*0.75
-		message := fmt.Sprintf("上游 %s 在 %d 秒内错误率为 %.1f%%", name, window, errorRate)
+		codes := make([]string, 0, len(evidence.StatusCounts))
+		for code := range evidence.StatusCounts {
+			codes = append(codes, code)
+		}
+		sort.Strings(codes)
+		reasons := make([]string, 0, len(codes))
+		for _, code := range codes {
+			label := "HTTP " + code
+			if code == "0" {
+				label = "无 HTTP 响应"
+			}
+			reasons = append(reasons, fmt.Sprintf("%s × %d", label, evidence.StatusCounts[code]))
+		}
+		if len(reasons) == 0 {
+			reasons = append(reasons, "无")
+		}
+		message := fmt.Sprintf("统计窗口：%s 至 %s (UTC+8)\n请求尝试：%d 次，失败 %d 次\n错误率：%.1f%%，阈值 %.1f%%\n失败原因：%s\n最终成功：%d 个含失败尝试的请求\n统计口径：包含重试与切换前的失败；在通知设置的告警历史中查看对应请求", windowStart.In(time.FixedZone("UTC+8", 8*3600)).Format("2006-01-02 15:04:05"), windowEnd.In(time.FixedZone("UTC+8", 8*3600)).Format("15:04:05"), count, failures, errorRate, evidence.Threshold, strings.Join(reasons, "、"), recovered)
 		recoveryMessage := ""
 		if rule.Event == alerts.EventLatency {
+			evidence = nil
 			value = latency.Float64
 			latencyThreshold := threshold(rule, 30000)
 			active = latency.Float64 >= latencyThreshold
@@ -196,7 +236,7 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 			}
 		}
 		result = append(result, alerts.Observation{
-			Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Hold: hold, Value: value,
+			Evidence: evidence, Key: "upstream:" + strconv.FormatInt(id, 10), Active: active, Hold: hold, Value: value,
 			Message: message, RecoveryMessage: recoveryMessage, UpstreamID: id, UpstreamName: name,
 		})
 	}

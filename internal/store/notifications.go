@@ -14,9 +14,7 @@ type NotificationJob struct {
 }
 
 func (s *Store) EnqueueNotification(ctx context.Context, payload []byte, notBefore time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO notification_outbox(payload,next_attempt_at) VALUES($1::jsonb,$2)`, payload, notBefore)
-	return err
+	return s.EnqueueNotificationsForChannels(ctx, nil, payload, notBefore)
 }
 
 func (s *Store) EnqueueNotificationForChannel(ctx context.Context, channelID int64, payload []byte, notBefore time.Time) error {
@@ -31,6 +29,18 @@ func (s *Store) EnqueueNotificationsForChannels(ctx context.Context, channelIDs 
 		return err
 	}
 	defer tx.Rollback()
+	// Archive the original event and enqueue deliveries in the same transaction.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO alert_events(upstream_id,event,state,message,payload)
+		SELECT u.id,p->>'type',p->>'state',p->>'message',p
+		FROM (SELECT $1::jsonb AS p) e LEFT JOIN upstreams u ON u.id=NULLIF((p->>'upstream_id')::bigint,0)
+		WHERE p->>'type' IN ('error_rate','latency','low_balance','balance_unavailable','client_error_rate','login_failure','new_login_ip')`, payload); err != nil {
+		return err
+	}
+	if len(channelIDs) == 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_outbox(payload,next_attempt_at) VALUES($1::jsonb,$2)`, payload, notBefore); err != nil {
+			return err
+		}
+	}
 	for _, channelID := range channelIDs {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO notification_outbox(channel_id,payload,next_attempt_at) VALUES($1,$2::jsonb,$3)`, channelID, payload, notBefore); err != nil {

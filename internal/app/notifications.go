@@ -155,6 +155,10 @@ func aggregateNotificationEvents(events []ops.Event) ops.Event {
 		return events[0]
 	}
 	result := events[0]
+	result.Evidence = nil
+	result.ActiveSince = nil
+	result.NotificationNumber = 0
+	result.Previous = ""
 	result.UpstreamID = 0
 	result.UpstreamName = ""
 	result.Count = len(events)
@@ -163,6 +167,9 @@ func aggregateNotificationEvents(events []ops.Event) ops.Event {
 		name := event.UpstreamName
 		if name == "" {
 			name = "系统"
+		}
+		if event.NotificationNumber > 0 {
+			name += fmt.Sprintf("（第 %d 次提醒）", event.NotificationNumber)
 		}
 		lines = append(lines, fmt.Sprintf("- %s：%s", name, event.Message))
 		if event.At.After(result.At) {

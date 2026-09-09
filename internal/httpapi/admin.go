@@ -103,6 +103,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/admin/keys/{id}/secret", s.admin(http.HandlerFunc(s.keySecret)))
 	mux.Handle("PUT /api/admin/keys/{id}", s.admin(http.HandlerFunc(s.updateKey)))
 	mux.Handle("DELETE /api/admin/keys/{id}", s.admin(http.HandlerFunc(s.deleteKey)))
+	mux.Handle("GET /api/admin/alert-history", s.admin(http.HandlerFunc(s.alertHistory)))
 	mux.Handle("GET /api/admin/logs", s.admin(http.HandlerFunc(s.logs)))
 	mux.Handle("GET /api/admin/usage", s.admin(http.HandlerFunc(s.usage)))
 	mux.Handle("GET /api/admin/channels", s.admin(http.HandlerFunc(s.listChannels)))
@@ -869,6 +870,22 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 		Limit: parseInt(r.URL.Query().Get("limit"), 50), Offset: parseInt(r.URL.Query().Get("offset"), 0),
 		UpstreamID: parseInt64(r.URL.Query().Get("upstream_id")),
 		GroupID:    parseInt64(r.URL.Query().Get("group_id")),
+	}
+	filter.AttemptScope = r.URL.Query().Get("scope") == "attempts"
+	filter.AttemptFailure = r.URL.Query().Get("status") == "attempt_error"
+	for key, target := range map[string]**time.Time{"since": &filter.Since, "until": &filter.Until} {
+		if value := r.URL.Query().Get(key); value != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_time", "时间格式无效")
+				return
+			}
+			*target = &parsed
+		}
+	}
+	if filter.Since != nil && filter.Until != nil && !filter.Since.Before(*filter.Until) {
+		writeError(w, http.StatusBadRequest, "invalid_time", "开始时间必须早于结束时间")
+		return
 	}
 	filter.StatusMin, filter.StatusMax = statusRange(r.URL.Query().Get("status"))
 	logs, err := s.store.ListRequestLogs(r.Context(), filter)
@@ -1815,4 +1832,13 @@ func (l *loginLimiter) cleanupLocked(now time.Time) {
 		}
 	}
 	l.lastCleanup = now
+}
+
+func (s *Server) alertHistory(w http.ResponseWriter, r *http.Request) {
+	events, err := s.store.ListAlertHistory(r.Context(), parseInt(r.URL.Query().Get("offset"), 0))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
 }

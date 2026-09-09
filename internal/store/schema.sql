@@ -269,6 +269,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
     resolved_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS payload JSONB;
 CREATE INDEX IF NOT EXISTS alert_events_created_idx ON alert_events(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS notification_outbox (

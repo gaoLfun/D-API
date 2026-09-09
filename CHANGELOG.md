@@ -6,6 +6,9 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ### Added
 
+- 错误率告警保存统计快照与失败请求标识，支持从告警历史查看对应窗口的上游失败尝试；明确首次、持续、再次触发与恢复提醒。
+- 优化钉钉 Markdown 排版，企业微信改用 Markdown，并对超长正文进行安全截断。
+
 - Per-model upstream tests following NewAPI and Sub2API channel-test behavior,
   including batch selection, progress, degraded latency, and audit summaries.
 - Recoverable encrypted client-key copies, copy actions, gateway Base URL, and

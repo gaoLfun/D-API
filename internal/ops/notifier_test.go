@@ -86,9 +86,9 @@ func TestWebhookPayloadAdapters(t *testing.T) {
 		provider string
 		want     string
 	}{
-		{"dingtalk", `{"markdown":{"text":"【D-API】通知\n\n**事件：**上游健康状态变更\n\n**级别：**严重\n\n**上游：**primary\n\n**状态：**异常\n\n**之前：**正常\n\n**详情：**上游状态已从正常变更为异常","title":"D-API 通知"},"msgtype":"markdown"}`},
+		{"dingtalk", `{"markdown":{"text":"### D-API · 上游健康状态变更\n\n**级别**：严重\n\n**上游**：primary\n\n**状态**：异常\n\n**之前**：正常\n\n**详情**：上游状态已从正常变更为异常","title":"D-API 通知"},"msgtype":"markdown"}`},
 		{"feishu", `{"content":{"text":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"},"msg_type":"text"}`},
-		{"wecom", `{"msgtype":"text","text":{"content":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}}`},
+		{"wecom", `{"markdown":{"content":"### D-API · 上游健康状态变更\n\n**级别**：严重\n\n**上游**：primary\n\n**状态**：异常\n\n**之前**：正常\n\n**详情**：上游状态已从正常变更为异常"},"msgtype":"markdown"}`},
 		{"slack", `{"text":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}`},
 		{"discord", `{"content":"【D-API】通知\n事件：上游健康状态变更\n级别：严重\n上游：primary\n状态：异常\n之前：正常\n详情：上游状态已从正常变更为异常"}`},
 	}
@@ -208,5 +208,34 @@ func TestCooldownNotifierAllowsRecovery(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("notifications = %d, want 2", count)
+	}
+}
+
+func TestWecomMarkdownLimitAndEscaping(t *testing.T) {
+	body, err := webhookPayload("wecom", "", Event{Type: "error_rate", UpstreamName: "[name](https://invalid.example)", Message: strings.Repeat("中", 5000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Msgtype  string `json:"msgtype"`
+		Markdown struct {
+			Content string `json:"content"`
+		} `json:"markdown"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Msgtype != "markdown" || len(payload.Markdown.Content) > 4096 || !strings.Contains(payload.Markdown.Content, "内容已截断") {
+		t.Fatalf("invalid markdown payload")
+	}
+	if strings.Contains(payload.Markdown.Content, "[name](") {
+		t.Fatal("unescaped upstream name")
+	}
+}
+
+func TestReminderText(t *testing.T) {
+	text := webhookEventText(Event{Type: "error_rate", State: "firing", Previous: "active", NotificationNumber: 2})
+	if !strings.Contains(text, "持续提醒 · 第 2 次") || strings.Contains(text, "之前：") {
+		t.Fatalf("text=%s", text)
 	}
 }

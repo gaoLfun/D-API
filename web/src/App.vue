@@ -247,9 +247,12 @@ Object.assign(keyFilter, readStoredJSON('dapi-key-filter', {}))
 const logs = ref<RequestLog[]>([])
 const usage = ref<Json>({})
 const channels = ref<Channel[]>([])
+type AlertHistoryEntry = { type: string; state: string; previous?: string; upstream_id?: number; upstream_name?: string; message: string; at: string; notification_number?: number; evidence?: { window_start: string; window_end: string; failed_request_ids?: string[] } }
+const alertHistory = ref<AlertHistoryEntry[]>([])
+const alertHistoryOffset = ref(0)
 const alertRules = ref<AlertRule[]>([])
 const maxAttempts = ref(3)
-const logFilter = reactive({ status: '', upstream_id: '', group_id: '', limit: 50, offset: 0 })
+const logFilter = reactive({ status: '', upstream_id: '', group_id: '', scope: '', since: '', until: '', limit: 50, offset: 0 })
 Object.assign(logFilter, readStoredJSON('dapi-log-filter', {}))
 const expandedLog = ref<string | null>(null)
 const usageFilter = reactive({
@@ -266,7 +269,7 @@ const usageFilter = reactive({
 Object.assign(usageFilter, readStoredJSON('dapi-usage-filter', {}))
 const usageMetric = ref<'requests' | 'tokens' | 'latency' | 'cache'>('requests')
 const mobileFiltersOpen = ref(false)
-const notificationSection = ref<'channels' | 'alerts'>('channels')
+const notificationSection = ref<'channels' | 'alerts' | 'history'>('channels')
 
 const upstreamModal = ref(false)
 const editingUpstream = ref<number | null>(null)
@@ -748,7 +751,7 @@ function toggleLog(requestID: string) {
 
 function setLogPreset(preset: 'all' | 'errors') {
   if (preset === 'errors') logFilter.status = 'error'
-  else Object.assign(logFilter, { status: '', upstream_id: '', group_id: '' })
+  else Object.assign(logFilter, { status: '', upstream_id: '', group_id: '', scope: '', since: '', until: '' })
   logFilter.offset = 0
   void loadLogs()
 }
@@ -971,11 +974,12 @@ async function loadCurrent() {
       keys.value = listOf<ClientKey>(keyData)
       groups.value = listOf<Group>(groupData)
     } else if (view.value === 'channels') {
-      const [channelData, ruleData, upstreamData] = await Promise.all([
-        api.get('/api/admin/channels', { signal }), api.get('/api/admin/alert-rules', { signal }), api.get('/api/admin/upstreams', { signal }),
+      const [channelData, ruleData, upstreamData, historyData] = await Promise.all([
+        api.get('/api/admin/channels', { signal }), api.get('/api/admin/alert-rules', { signal }), api.get('/api/admin/upstreams', { signal }), api.get(`/api/admin/alert-history?offset=${alertHistoryOffset.value}`, { signal }),
       ])
       channels.value = listOf<Channel>(channelData)
       alertRules.value = listOf<AlertRule>(ruleData)
+ alertHistory.value = listOf<AlertHistoryEntry>(historyData)
       upstreams.value = listOf<Upstream>(upstreamData)
     } else if (view.value === 'settings') {
       const settingsData = await api.get<Json>('/api/admin/settings', { signal })
@@ -1186,10 +1190,17 @@ function openUpstreamGroup(group: UpstreamGroup) {
   upstreamGroupDrawer.value = group
 }
 
+function inspectAlert(entry: AlertHistoryEntry) {
+ if (!entry.evidence) return
+ Object.assign(logFilter,{status:'attempt_error',scope:'attempts',upstream_id:String(entry.upstream_id || ''),group_id:'',since:entry.evidence.window_start,until:entry.evidence.window_end,offset:0})
+ void go('logs')
+}
+
 async function loadLogs(signal?: AbortSignal) {
   const cycle = signal ? null : beginPageLoad()
   const requestSignal = signal || cycle!.controller.signal
   const query = new URLSearchParams({ limit: String(logFilter.limit), offset: String(logFilter.offset) })
+  for (const key of ['scope','since','until'] as const) { if(logFilter[key]) query.set(key,logFilter[key]) }
   if (logFilter.status) query.set('status', logFilter.status)
   if (logFilter.upstream_id) query.set('upstream_id', logFilter.upstream_id)
   if (logFilter.group_id) query.set('group_id', logFilter.group_id)
@@ -2268,6 +2279,8 @@ onBeforeUnmount(() => {
 
         <section v-else-if="view === 'groups'" class="view-stack">
           <div class="action-row"><p>{{ groups.length }} 个分组，密钥只会在所属分组内路由。</p><button class="primary" @click="openGroup()"><Plus :size="17" />创建分组</button></div>
+          <p v-if="logFilter.since">告警时间窗口：{{ fmtDate(logFilter.since) }} 至 {{ fmtDate(logFilter.until) }}。请求明细可能随日志保留期清理，原始统计保存在告警历史中。</p>
+          <p v-if="logFilter.status === 'attempt_error'">按参与尝试的上游匹配失败，包含最终成功的请求；展开切换链查看状态码。</p>
           <section class="panel table-panel"><div class="table-wrap"><table>
             <thead><tr><th>名称</th><th>状态</th><th>上游</th><th>绑定密钥</th><th class="right">操作</th></tr></thead>
             <tbody>
@@ -2362,8 +2375,8 @@ onBeforeUnmount(() => {
 
         <section v-else-if="view === 'logs'" class="view-stack">
           <form class="filterbar" @submit.prevent="logFilter.offset = 0; loadLogs()">
-            <label><span>状态</span><select v-model="logFilter.status"><option value="">全部</option><option value="success">成功</option><option value="error">失败</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
-            <label><span>上游</span><select v-model="logFilter.upstream_id"><option value="">全部</option><option v-for="item in upstreams" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
+            <label><span>状态</span><select v-model="logFilter.status" @change="logFilter.status === 'attempt_error' && (logFilter.scope = 'attempts')"><option value="">全部</option><option value="success">成功</option><option value="error">请求最终失败</option><option value="attempt_error">上游尝试失败（告警口径）</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
+            <label><span>上游匹配</span><select v-model="logFilter.scope" :disabled="logFilter.status === 'attempt_error'"><option value="">最终上游</option><option value="attempts">参与尝试的上游</option></select></label><label><span>上游</span><select v-model="logFilter.upstream_id"><option value="">全部</option><option v-for="item in upstreams" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
             <label><span>分组</span><select v-model="logFilter.group_id"><option value="">全部</option><option v-for="item in groups" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
             <button class="secondary"><Search :size="16" />筛选</button><div class="quick-filters"><button type="button" class="text-button" :class="{ active: logFilter.status === 'error' }" @click="setLogPreset('errors')">只看失败</button><button type="button" class="text-button" :class="{ active: !logFilter.status && !logFilter.upstream_id && !logFilter.group_id }" @click="setLogPreset('all')">清除筛选</button></div>
           </form>
@@ -2398,7 +2411,7 @@ onBeforeUnmount(() => {
                     <div><span>Token 命中率</span><strong>{{ fmtPercent(logTokenHitRate(item)) }}</strong></div>
                   </div>
                   <div class="attempt-head"><div><strong>切换链</strong><span>{{ item.attempts?.length || 0 }} 次尝试</span></div><div class="log-detail-actions"><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogUpstream(item)"><Server :size="14" />查看上游</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'check')"><Activity :size="14" />检查连接</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'balance')"><CircleDollarSign :size="14" />刷新余额</button></div></div>
-                  <div v-if="item.attempts?.length" class="attempt-timeline" aria-label="请求尝试时间轴"><div v-for="(attempt, index) in item.attempts" :key="index" class="attempt-timeline-row"><span>{{ index + 1 }}</span><div><strong>{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</strong><div class="attempt-track"><i :class="attempt.status_code && attempt.status_code < 400 ? 'good' : 'bad'" :style="{ width: attemptWidth(item, attempt.duration_ms) }"></i></div></div><small>{{ fmtDuration(attempt.duration_ms) }}</small></div></div>
+                  <div v-if="item.attempts?.length" class="attempt-timeline" aria-label="请求尝试时间轴"><div v-for="(attempt, index) in item.attempts" :key="index" class="attempt-timeline-row"><span>{{ index + 1 }}</span><div><strong>{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</strong><small>状态：{{ attempt.status_code || '无 HTTP 响应' }}</small><small v-if="attempt.error" style="overflow-wrap: anywhere">{{ attempt.error }}</small><div class="attempt-track"><i :class="attempt.status_code && attempt.status_code < 400 ? 'good' : 'bad'" :style="{ width: attemptWidth(item, attempt.duration_ms) }"></i></div></div><small>{{ fmtDuration(attempt.duration_ms) }}</small></div></div>
                   <p v-else class="muted">未记录上游尝试。</p>
                 </div></td></tr>
               </template>
@@ -2450,6 +2463,7 @@ onBeforeUnmount(() => {
           <div class="section-tabs" role="tablist" aria-label="通知设置">
             <button role="tab" :aria-selected="notificationSection === 'channels'" :class="{ active: notificationSection === 'channels' }" @click="notificationSection = 'channels'"><Bell :size="15" />通知渠道</button>
             <button role="tab" :aria-selected="notificationSection === 'alerts'" :class="{ active: notificationSection === 'alerts' }" @click="notificationSection = 'alerts'"><AlertCircle :size="15" />告警规则</button>
+            <button role="tab" :aria-selected="notificationSection === 'history'" :class="{ active: notificationSection === 'history' }" @click="notificationSection = 'history'">告警历史</button>
           </div>
           <template v-if="notificationSection === 'channels'">
             <div class="action-row"><p>上游状态与安全事件将发送到已启用渠道。</p><button class="primary" @click="openChannel"><Plus :size="17" />添加渠道</button></div>
@@ -2457,6 +2471,18 @@ onBeforeUnmount(() => {
               <article v-for="item in channels" :key="item.id" class="channel-card"><span class="channel-icon"><Mail v-if="item.kind === 'email'" :size="21" /><Webhook v-else :size="21" /></span><div><strong>{{ item.name }}</strong><small>{{ item.kind === 'email' ? '邮件' : 'Webhook' }} · {{ item.enabled ? '已启用' : '已停用' }}</small></div><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span><div class="channel-actions"><button v-if="item.kind === 'webhook'" class="secondary channel-test" :disabled="channelTestID !== null" :aria-busy="channelTestID === item.id" @click="testChannel(item)"><LoaderCircle v-if="channelTestID === item.id" class="spin" :size="14" /><Webhook v-else :size="14" />{{ channelTestID === item.id ? '测试中' : '测试' }}</button><button class="icon danger" title="删除" @click="removeChannel(item)"><Trash2 :size="16" /></button></div></article>
               <div v-if="!channels.length" class="empty panel">还没有通知渠道。</div>
             </div>
+          </template>
+          <template v-else-if="notificationSection === 'history'">
+            <p>记录告警生成时的统计快照；不代表渠道已经送达。更新前的历史不补录。</p>
+            <article v-for="(entry,index) in alertHistory" :key="index" class="panel" style="padding: 20px">
+              <h3>{{ alertEventText(entry.type) }} · {{ entry.upstream_name || '系统' }}</h3>
+              <p>{{ fmtDate(entry.at) }} · {{ entry.state === 'resolved' ? '已恢复' : (entry.notification_number || 1) > 1 ? `${entry.previous === 'active' ? '持续提醒' : '再次触发'} · 第 ${entry.notification_number} 次` : '首次告警' }}</p>
+              <p style="white-space: pre-wrap">{{ entry.message }}</p>
+              <details v-if="entry.evidence?.failed_request_ids?.length"><summary>失败请求标识（最多 100 条）</summary><p style="overflow-wrap: anywhere">{{ entry.evidence.failed_request_ids.join('、') }}</p></details>
+              <button v-if="entry.evidence" class="secondary" @click="inspectAlert(entry)">查看窗口内失败尝试</button>
+            </article>
+            <p v-if="!alertHistory.length">暂无告警快照。</p>
+            <div class="pagination"><button class="secondary" :disabled="alertHistoryOffset === 0" @click="alertHistoryOffset = Math.max(0,alertHistoryOffset-50); loadCurrent()">上一页</button><button class="secondary" :disabled="alertHistory.length < 50" @click="alertHistoryOffset += 50; loadCurrent()">下一页</button></div>
           </template>
           <template v-else>
             <section class="panel table-panel"><div class="panel-head"><div><h2>告警规则</h2><p>全局默认规则可直接调整；上游规则会覆盖同类默认值</p></div></div>

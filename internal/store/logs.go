@@ -14,12 +14,16 @@ import (
 )
 
 type LogFilter struct {
-	Limit      int
-	Offset     int
-	StatusMin  int
-	StatusMax  int
-	UpstreamID int64
-	GroupID    int64
+	AttemptScope   bool
+	AttemptFailure bool
+	Since          *time.Time
+	Until          *time.Time
+	Limit          int
+	Offset         int
+	StatusMin      int
+	StatusMax      int
+	UpstreamID     int64
+	GroupID        int64
 }
 
 type RequestLogView struct {
@@ -193,9 +197,15 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 			COALESCE(k.name,''),COALESCE(g.name,''),COALESCE(u.name,'')
 		FROM request_logs l
 		LEFT JOIN api_keys k ON k.id=l.api_key_id LEFT JOIN groups g ON g.id=l.group_id LEFT JOIN upstreams u ON u.id=l.upstream_id
-		WHERE ($1=0 OR l.status_code >= $1) AND ($2=0 OR l.status_code <= $2) AND ($3=0 OR l.upstream_id=$3) AND ($4=0 OR l.group_id=$4)
+		WHERE ($1=0 OR l.status_code >= $1) AND ($2=0 OR l.status_code <= $2)
+		AND ($4=0 OR l.group_id=$4)
+		AND ($9::timestamptz IS NULL OR l.created_at >= $9) AND ($10::timestamptz IS NULL OR l.created_at < $10)
+		AND ((NOT $7 AND ($3=0 OR l.upstream_id=$3)) OR ($7 AND EXISTS (
+		SELECT 1 FROM jsonb_array_elements(l.attempts) a
+		WHERE ($3=0 OR COALESCE((a->>'upstream_id')::bigint,0)=$3)
+		AND (NOT $8 OR COALESCE((a->>'status_code')::int,0)=0 OR (a->>'status_code')::int IN (401,403,404,429) OR (a->>'status_code')::int>=500))))
 		ORDER BY l.created_at DESC LIMIT $5 OFFSET $6`,
-		filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.GroupID, filter.Limit, filter.Offset,
+		filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.GroupID, filter.Limit, filter.Offset, filter.AttemptScope || filter.AttemptFailure, filter.AttemptFailure, filter.Since, filter.Until,
 	)
 	if err != nil {
 		return nil, err

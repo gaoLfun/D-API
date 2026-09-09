@@ -84,7 +84,7 @@ func TestEngineDeduplicatesWithinCooldown(t *testing.T) {
 	repository := &testRepository{
 		rules:        []Rule{{ID: 1, Event: EventErrorRate, Enabled: true, Cooldown: time.Hour}},
 		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true}}},
-		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true, LastNotifiedAt: &last}},
+		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true, LastNotifiedAt: &last, NotificationCount: 1}},
 	}
 	var events []ops.Event
 	if err := newTestEngine(repository, now, &events).RunOnce(context.Background()); err != nil {
@@ -101,13 +101,13 @@ func TestEngineRemindsAfterCooldown(t *testing.T) {
 	repository := &testRepository{
 		rules:        []Rule{{ID: 1, Event: EventLatency, Enabled: true, Cooldown: time.Hour}},
 		observations: map[int64][]Observation{1: {{Key: "upstream:7", Active: true}}},
-		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true, LastNotifiedAt: &last}},
+		states:       map[string]State{stateKey(1, "upstream:7"): {Active: true, LastNotifiedAt: &last, NotificationCount: 1}},
 	}
 	var events []ops.Event
 	if err := newTestEngine(repository, now, &events).RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].State != "firing" {
+	if len(events) != 1 || events[0].State != "firing" || events[0].Previous != "active" || events[0].NotificationNumber != 2 {
 		t.Fatalf("events=%#v", events)
 	}
 }

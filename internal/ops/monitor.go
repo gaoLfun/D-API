@@ -11,7 +11,22 @@ import (
 	"github.com/gaoLfun/dapi/internal/core"
 )
 
+type MetricEvidence struct {
+	FailedRequestIDs  []string         `json:"failed_request_ids"`
+	WindowStart       time.Time        `json:"window_start"`
+	WindowEnd         time.Time        `json:"window_end"`
+	Threshold         float64          `json:"threshold"`
+	Attempts          int64            `json:"attempts"`
+	Failures          int64            `json:"failures"`
+	RecoveredRequests int64            `json:"recovered_requests"`
+	StatusCounts      map[string]int64 `json:"status_counts"`
+}
+
 type Event struct {
+	ActiveSince        *time.Time      `json:"active_since,omitempty"`
+	Evidence           *MetricEvidence `json:"evidence,omitempty"`
+	NotificationNumber int             `json:"notification_number,omitempty"`
+
 	Type         string    `json:"type"`
 	State        string    `json:"state"`
 	Previous     string    `json:"previous,omitempty"`

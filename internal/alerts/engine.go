@@ -32,15 +32,16 @@ type Rule struct {
 }
 
 type Observation struct {
-	Key             string  `json:"key"`
-	Active          bool    `json:"active"`
-	Ignore          bool    `json:"ignore,omitempty"`
-	Hold            bool    `json:"hold,omitempty"`
-	Value           float64 `json:"value"`
-	Message         string  `json:"message"`
-	RecoveryMessage string  `json:"recovery_message,omitempty"`
-	UpstreamID      int64   `json:"upstream_id,omitempty"`
-	UpstreamName    string  `json:"upstream_name,omitempty"`
+	Evidence        *ops.MetricEvidence `json:"evidence,omitempty"`
+	Key             string              `json:"key"`
+	Active          bool                `json:"active"`
+	Ignore          bool                `json:"ignore,omitempty"`
+	Hold            bool                `json:"hold,omitempty"`
+	Value           float64             `json:"value"`
+	Message         string              `json:"message"`
+	RecoveryMessage string              `json:"recovery_message,omitempty"`
+	UpstreamID      int64               `json:"upstream_id,omitempty"`
+	UpstreamName    string              `json:"upstream_name,omitempty"`
 }
 
 type State = ops.IncidentState
@@ -127,6 +128,7 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 		return fmt.Errorf("load state: %w", err)
 	}
 	now := e.now()
+	previouslyActive := state.Active
 	policy := ops.IncidentPolicy{
 		FiringConfirmations: 1, RecoveryConfirmations: 1,
 		Cooldown: rule.Cooldown, MaxNotifications: rule.MaxNotifications, Repeat: rule.Cooldown > 0,
@@ -142,15 +144,22 @@ func (e *Engine) handle(ctx context.Context, rule Rule, observation Observation)
 	notification := state.Observe(now, observation.Active, observation.Ignore, observation.Hold, policy)
 	if notification != "" {
 		event := ops.Event{
-			Type:         rule.Event,
-			State:        notification,
-			Previous:     "inactive",
-			UpstreamID:   observation.UpstreamID,
-			UpstreamName: observation.UpstreamName,
-			Message:      observation.Message,
-			At:           now,
+			Type:               rule.Event,
+			Evidence:           observation.Evidence,
+			ActiveSince:        state.Incident.ActiveSince,
+			NotificationNumber: state.NotificationCount + 1,
+			State:              notification,
+			Previous:           "inactive",
+			UpstreamID:         observation.UpstreamID,
+			UpstreamName:       observation.UpstreamName,
+			Message:            observation.Message,
+			At:                 now,
+		}
+		if previouslyActive {
+			event.Previous = "active"
 		}
 		if notification == "resolved" {
+			event.NotificationNumber = 0
 			event.State, event.Previous = "resolved", "active"
 			if observation.RecoveryMessage != "" {
 				event.Message = observation.RecoveryMessage

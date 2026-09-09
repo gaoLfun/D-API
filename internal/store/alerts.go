@@ -120,3 +120,31 @@ func (s *Store) PruneAlertStates(ctx context.Context, ruleID int64, keys []strin
 	)
 	return err
 }
+
+// ListAlertHistory returns immutable notification snapshots, newest first.
+func (s *Store) ListAlertHistory(ctx context.Context, offset int) ([]ops.Event, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > 100000 {
+		offset = 100000
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT payload FROM alert_events WHERE payload IS NOT NULL ORDER BY id DESC LIMIT 50 OFFSET $1`, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]ops.Event, 0)
+	for rows.Next() {
+		var payload []byte
+		var event ops.Event
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return nil, err
+		}
+		result = append(result, event)
+	}
+	return result, rows.Err()
+}

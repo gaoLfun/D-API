@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gaoLfun/dapi/internal/netguard"
 )
@@ -164,9 +165,9 @@ func webhookPayload(provider, rawURL string, event Event) ([]byte, error) {
 	text := webhookEventText(event)
 	switch provider {
 	case "dingtalk":
-		return json.Marshal(map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": "D-API 通知", "text": webhookEventMarkdown(event)}})
+		return json.Marshal(map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": "D-API 通知", "text": limitWebhookText(webhookEventMarkdown(event), 18000)}})
 	case "wecom":
-		return json.Marshal(map[string]any{"msgtype": "text", "text": map[string]string{"content": text}})
+		return json.Marshal(map[string]any{"msgtype": "markdown", "markdown": map[string]string{"content": limitWebhookText(webhookEventMarkdown(event), 4096)}})
 	case "feishu":
 		return json.Marshal(map[string]any{"msg_type": "text", "content": map[string]string{"text": text}})
 	case "slack":
@@ -224,8 +225,21 @@ func webhookEventText(event Event) string {
 	if event.State != "" {
 		lines = append(lines, "状态："+webhookStateLabel(event.State))
 	}
-	if event.Previous != "" {
+	if event.NotificationNumber > 0 {
+		label := "首次告警"
+		if event.NotificationNumber > 1 {
+			label = "再次触发"
+			if event.Previous == "active" {
+				label = "持续提醒"
+			}
+		}
+		lines = append(lines, fmt.Sprintf("提醒：%s · 第 %d 次", label, event.NotificationNumber))
+	}
+	if event.Previous != "" && event.NotificationNumber == 0 {
 		lines = append(lines, "之前："+webhookStateLabel(event.Previous))
+	}
+	if event.ActiveSince != nil && !event.At.Before(*event.ActiveSince) {
+		lines = append(lines, "本轮持续："+event.At.Sub(*event.ActiveSince).Round(time.Second).String())
 	}
 	if event.Message != "" {
 		lines = append(lines, "详情："+webhookEventMessage(event))
@@ -238,15 +252,33 @@ func webhookEventText(event Event) string {
 
 func webhookEventMarkdown(event Event) string {
 	lines := strings.Split(webhookEventText(event), "\n")
-	if len(lines) < 2 {
-		return strings.Join(lines, "\n")
-	}
+	escape := strings.NewReplacer("\\", "\\\\", "*", "\\*", "_", "\\_", "[", "\\[", "]", "\\]", "`", "\\`", "<", "&lt;", ">", "&gt;", "#", "\\#", "!", "\\!")
+	lines[0] = "### D-API · " + escape.Replace(webhookEventLabelForEvent(event))
 	for i := 1; i < len(lines); i++ {
-		if index := strings.Index(lines[i], "："); index >= 0 {
-			lines[i] = "**" + lines[i][:index+len("：")] + "**" + lines[i][index+len("："):]
+		line := lines[i]
+		if index := strings.Index(line, "："); index >= 0 {
+			lines[i] = "**" + escape.Replace(line[:index]) + "**：" + escape.Replace(line[index+len("："):])
+		} else {
+			lines[i] = escape.Replace(line)
 		}
 	}
+	// The title already identifies the event.
+	if len(lines) > 1 {
+		lines = append(lines[:1], lines[2:]...)
+	}
 	return strings.Join(lines, "\n\n")
+}
+
+func limitWebhookText(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	suffix := "\n\n（内容已截断，请在系统告警历史中查看详情）"
+	end := maxBytes - len(suffix)
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end] + suffix
 }
 
 func webhookEventMessage(event Event) string {
@@ -338,7 +370,8 @@ func webhookStateLabel(state string) string {
 		"resolved":          "已恢复",
 		"suspended":         "已暂停路由",
 		"resumed":           "已恢复路由",
-		"active":            "已启用",
+		"active":            "告警中",
+		"inactive":          "未触发",
 		"paused":            "已暂停",
 		"balance_suspended": "已暂停路由",
 		"balance_resumed":   "已恢复路由",

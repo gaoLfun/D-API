@@ -289,3 +289,87 @@ func TestHealthNotificationUpgradeAndEnqueueRetry(t *testing.T) {
 	observe("healthy", "")
 	observe("unhealthy", "")
 }
+
+func TestErrorAlertEvidenceAndAttemptLogs(t *testing.T) {
+	db := alertTestStore(t)
+	ctx := context.Background()
+	id := alertTestUpstream(t, db)
+	other, err := db.CreateUpstream(ctx, core.Upstream{Name: "fallback", Kind: "newapi", BaseURL: "https://example.com", APIKey: "test", Enabled: true, Protocols: []string{"chat"}, Models: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 9; i++ {
+		status := 200
+		final := id
+		if i == 0 {
+			status = 429
+			final = other
+		}
+		if i == 1 {
+			status = 0
+			final = other
+		}
+		attempts := []core.Attempt{{UpstreamID: id, StatusCode: status}}
+		if final == other {
+			attempts = append(attempts, core.Attempt{UpstreamID: other, StatusCode: 200})
+		}
+		payload, _ := json.Marshal(attempts)
+		if _, err := db.DB().Exec(`INSERT INTO request_logs(request_id,protocol,upstream_id,status_code,duration_ms,attempts) VALUES($1,'chat',$2,200,10,$3::jsonb)`, fmt.Sprintf("request-%d", i), final, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observations, err := (AlertRepository{Store: db}).Observe(ctx, alerts.Rule{Event: alerts.EventErrorRate, UpstreamID: &id, Window: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("observations=%+v", observations)
+	}
+	o := observations[0]
+	e := o.Evidence
+	if !o.Active || e == nil || e.Attempts != 9 || e.Failures != 2 || e.RecoveredRequests != 2 || e.StatusCounts["429"] != 1 || e.StatusCounts["0"] != 1 || len(e.FailedRequestIDs) != 2 {
+		t.Fatalf("observation=%+v evidence=%+v", o, e)
+	}
+	legacy, err := db.ListRequestLogs(ctx, store.LogFilter{UpstreamID: id, StatusMin: 400})
+	if err != nil || len(legacy) != 0 {
+		t.Fatalf("final failures=%v err=%v", legacy, err)
+	}
+	logs, err := db.ListRequestLogs(ctx, store.LogFilter{UpstreamID: id, AttemptFailure: true, Since: &e.WindowStart, Until: &e.WindowEnd})
+	if err != nil || len(logs) != 2 {
+		t.Fatalf("attempt failures=%v err=%v", logs, err)
+	}
+	wrong, err := db.ListRequestLogs(ctx, store.LogFilter{UpstreamID: other, AttemptFailure: true})
+	if err != nil || len(wrong) != 0 {
+		t.Fatalf("failure matched wrong upstream: %v err=%v", wrong, err)
+	}
+	event := ops.Event{Type: "error_rate", State: "firing", UpstreamID: id, UpstreamName: "test", Message: o.Message, Evidence: e, At: time.Now(), NotificationNumber: 1}
+	if err := NewOutboxNotifier(db).Notify(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	// Delivery completion and source-log retention must not erase evidence.
+	if _, err := db.DB().Exec(`DELETE FROM notification_outbox`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec(`DELETE FROM request_logs`); err != nil {
+		t.Fatal(err)
+	}
+	history, err := db.ListAlertHistory(ctx, 0)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	if history[0].Evidence.Failures != 2 || len(history[0].Evidence.FailedRequestIDs) != 2 || history[0].Message != event.Message {
+		t.Fatalf("snapshot changed: %+v", history[0])
+	}
+}
+
+func TestNotificationArchiveRollsBackWithEnqueue(t *testing.T) {
+	db := alertTestStore(t)
+	payload, _ := json.Marshal(ops.Event{Type: "error_rate", State: "firing", Message: "synthetic"})
+	if err := db.EnqueueNotificationsForChannels(context.Background(), []int64{-1}, payload, time.Now()); err == nil {
+		t.Fatal("invalid channel accepted")
+	}
+	history, err := db.ListAlertHistory(context.Background(), 0)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("orphan history count=%d err=%v", len(history), err)
+	}
+}

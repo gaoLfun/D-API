@@ -33,3 +33,13 @@ func TestNotificationRetryDelay(t *testing.T) {
 		t.Fatalf("later retry delay = %s", got)
 	}
 }
+
+func TestAggregateDoesNotAttributeFirstUpstreamEvidenceToBatch(t *testing.T) {
+	event := aggregateNotificationEvents([]ops.Event{
+		{Type: "error_rate", State: "firing", Previous: "inactive", UpstreamID: 1, NotificationNumber: 1, Evidence: &ops.MetricEvidence{Attempts: 9, Failures: 2}},
+		{Type: "error_rate", State: "firing", Previous: "active", UpstreamID: 2, NotificationNumber: 3},
+	})
+	if event.Evidence != nil || event.NotificationNumber != 0 || event.Previous != "" || event.UpstreamID != 0 {
+		t.Fatal("batch retained first upstream metadata")
+	}
+}

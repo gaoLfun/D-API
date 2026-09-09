@@ -4,6 +4,7 @@ import "time"
 
 // IncidentHistory survives recovery so brief flapping cannot renew the budget.
 type IncidentHistory struct {
+	ActiveSince    *time.Time `json:"active_since,omitempty"`
 	NotifiedActive *bool      `json:"notified_active,omitempty"`
 	LastFiringAt   *time.Time `json:"last_firing_at,omitempty"`
 	NormalSince    *time.Time `json:"normal_since,omitempty"`
@@ -57,6 +58,10 @@ func (s *IncidentState) Observe(now time.Time, active, ignore, hold bool, p Inci
 			h.FiringStreak++
 		}
 		if h.FiringStreak >= p.FiringConfirmations {
+			if !s.Active {
+				at := now
+				h.ActiveSince = &at
+			}
 			s.Active = true
 		}
 	} else {
