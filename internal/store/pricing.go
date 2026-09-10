@@ -78,7 +78,8 @@ type PricingProfile struct {
 	SourceURL       string              `json:"source_url"`
 	SourceVersion   string              `json:"source_version"`
 	LastRefreshedAt *time.Time          `json:"last_refreshed_at,omitempty"`
-	Prices          []PricingModelPrice `json:"prices"`
+	ModelCount      int                 `json:"model_count"`
+	Prices          []PricingModelPrice `json:"prices,omitempty"`
 }
 
 type PricingBackfillResult struct {
@@ -113,7 +114,35 @@ func (s *Store) SetUSDCNYRate(ctx context.Context, value float64) error {
 }
 
 func (s *Store) ListPricingProfiles(ctx context.Context) ([]PricingProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,provider,source_url,source_version,last_refreshed_at FROM pricing_profiles ORDER BY id`)
+	return s.PricingProfiles(ctx, false)
+}
+
+func (s *Store) PricingProfiles(ctx context.Context, summary bool) ([]PricingProfile, error) {
+	return s.pricingProfiles(ctx, summary, 0)
+}
+
+func (s *Store) PricingProfileByID(ctx context.Context, id int64) (PricingProfile, error) {
+	if id <= 0 {
+		return PricingProfile{}, ErrNotFound
+	}
+	profiles, err := s.pricingProfiles(ctx, false, id)
+	if err != nil {
+		return PricingProfile{}, err
+	}
+	if len(profiles) == 0 {
+		return PricingProfile{}, ErrNotFound
+	}
+	return profiles[0], nil
+}
+
+func (s *Store) pricingProfiles(ctx context.Context, summary bool, id int64) ([]PricingProfile, error) {
+	var args []any
+	profileFilter, priceFilter := "", ""
+	if id > 0 {
+		args = append(args, id)
+		profileFilter, priceFilter = " WHERE p.id=$1", " AND profile_id=$1"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id,p.name,p.provider,p.source_url,p.source_version,p.last_refreshed_at,(SELECT count(DISTINCT model) FROM pricing_model_prices m WHERE m.profile_id=p.id AND valid_from<=now() AND (valid_to IS NULL OR valid_to>now())) FROM pricing_profiles p`+profileFilter+` ORDER BY p.id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +150,7 @@ func (s *Store) ListPricingProfiles(ctx context.Context) ([]PricingProfile, erro
 	profiles := make([]PricingProfile, 0)
 	for rows.Next() {
 		var profile PricingProfile
-		if err := rows.Scan(&profile.ID, &profile.Name, &profile.Provider, &profile.SourceURL, &profile.SourceVersion, &profile.LastRefreshedAt); err != nil {
+		if err := rows.Scan(&profile.ID, &profile.Name, &profile.Provider, &profile.SourceURL, &profile.SourceVersion, &profile.LastRefreshedAt, &profile.ModelCount); err != nil {
 			return nil, err
 		}
 		profile.Prices = []PricingModelPrice{}
@@ -130,11 +159,17 @@ func (s *Store) ListPricingProfiles(ctx context.Context) ([]PricingProfile, erro
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if summary {
+		return profiles, nil
+	}
 	priceRows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT ON (profile_id,model) id,profile_id,model,input_usd_per_million,output_usd_per_million,cache_read_usd_per_million,cache_write_usd_per_million,valid_from,valid_to,source
 		FROM pricing_model_prices
-		WHERE valid_from <= now() AND (valid_to IS NULL OR valid_to > now())
-		ORDER BY profile_id,model,valid_from DESC`)
+		WHERE valid_from <= now() AND (valid_to IS NULL OR valid_to > now())`+priceFilter+`
+		ORDER BY profile_id,model,valid_from DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -396,22 +431,26 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 		return PricingBackfillResult{}, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(739842107)`); err != nil {
+		return PricingBackfillResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE pricing_backfill(
 		id BIGINT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, api_key_id BIGINT NOT NULL,
 		group_id BIGINT, upstream_id BIGINT NOT NULL, protocol TEXT NOT NULL, model TEXT NOT NULL,
-		cost_usd NUMERIC(20,8) NOT NULL
+		cost_usd NUMERIC(20,8) NOT NULL, known BIGINT NOT NULL
 	) ON COMMIT DROP`); err != nil {
 		return PricingBackfillResult{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		WITH candidates AS (
-			SELECT l.id, l.created_at, l.api_key_id, l.group_id, l.upstream_id, l.protocol, l.model,
+			SELECT l.id, l.created_at, l.api_key_id, l.group_id, l.upstream_id, l.protocol, l.model, l.cost_usd AS old_cost,
 				(
-					COALESCE(l.uncached_input_tokens, GREATEST(COALESCE(l.input_tokens,0)-COALESCE(l.cached_input_tokens,0),0)) * p.input_usd_per_million
+					(CASE WHEN l.protocol='messages' THEN GREATEST(COALESCE(l.input_tokens,0),0) ELSE COALESCE(l.uncached_input_tokens, GREATEST(COALESCE(l.input_tokens,0)-COALESCE(l.cached_input_tokens,0),0)) END) * p.input_usd_per_million
 					+ COALESCE(l.cached_input_tokens,0) * p.cache_read_usd_per_million
 					+ COALESCE(l.cache_creation_input_tokens,0) * p.cache_write_usd_per_million
 					+ COALESCE(l.output_tokens,0) * p.output_usd_per_million
-				) / 1000000.0 AS cost_usd
+				) / 1000000.0 AS cost_usd,
+				COALESCE(l.cache_creation_input_tokens,0) * p.input_usd_per_million / 1000000.0 AS duplicated_cost
 			FROM request_logs l
 			JOIN upstreams u ON u.id=l.upstream_id
 			JOIN LATERAL (
@@ -422,16 +461,19 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 				  AND m.valid_from <= l.created_at AND (m.valid_to IS NULL OR m.valid_to > l.created_at)
 				ORDER BY CASE WHEN m.model=l.model THEN 0 ELSE 1 END,m.valid_from DESC LIMIT 1
 			) p ON TRUE
-			WHERE l.cost_usd IS NULL
+			WHERE (l.cost_usd IS NULL OR (l.protocol='messages' AND l.pricing_version<2))
 			  AND l.created_at >= $1::date AT TIME ZONE 'UTC'
 			  AND l.created_at < ($2::date + interval '1 day') AT TIME ZONE 'UTC'
 			  AND l.upstream_id IS NOT NULL AND l.api_key_id IS NOT NULL
 			  AND (l.input_tokens IS NOT NULL OR l.output_tokens IS NOT NULL OR l.cached_input_tokens IS NOT NULL OR l.cache_creation_input_tokens IS NOT NULL OR l.uncached_input_tokens IS NOT NULL)
 		), updated AS (
-			UPDATE request_logs l SET cost_usd=c.cost_usd FROM candidates c WHERE l.id=c.id AND l.cost_usd IS NULL
-			RETURNING l.id,l.created_at,l.api_key_id,l.group_id,l.upstream_id,l.protocol,l.model,l.cost_usd
+			UPDATE request_logs l SET cost_usd=c.cost_usd,pricing_version=2 FROM candidates c WHERE l.id=c.id
+            -- Old logs lack profile provenance. Correct a known charge only
+            -- when the historical rate reproduces it using the old formula.
+            AND (c.old_cost IS NULL OR (c.duplicated_cost>0 AND abs(c.old_cost-c.cost_usd-c.duplicated_cost)<=0.000000005))
+			RETURNING l.id,l.created_at,l.api_key_id,l.group_id,l.upstream_id,l.protocol,l.model,c.cost_usd-COALESCE(c.old_cost,0) AS cost_usd, CASE WHEN c.old_cost IS NULL THEN 1 ELSE 0 END AS known
 		)
-		INSERT INTO pricing_backfill SELECT id,created_at,api_key_id,group_id,upstream_id,protocol,model,cost_usd FROM updated`, from, to); err != nil {
+		INSERT INTO pricing_backfill SELECT id,created_at,api_key_id,group_id,upstream_id,protocol,model,cost_usd,known FROM updated`, from, to); err != nil {
 		return PricingBackfillResult{}, err
 	}
 	var result PricingBackfillResult
@@ -442,7 +484,7 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 	if err := tx.QueryRowContext(ctx, `
 		WITH aggregate AS (
 			SELECT (created_at AT TIME ZONE 'UTC')::date AS day,api_key_id,COALESCE(group_id,0) AS group_id,upstream_id,protocol,model,
-				sum(cost_usd) AS cost_usd,count(*) AS known
+				sum(cost_usd) AS cost_usd,sum(known) AS known
 			FROM pricing_backfill GROUP BY 1,2,3,4,5,6
 		), updated AS (
 			UPDATE daily_usage d SET cost_usd=d.cost_usd+a.cost_usd,cost_known_requests=d.cost_known_requests+a.known
@@ -454,7 +496,7 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 	if err := tx.QueryRowContext(ctx, `
 		WITH aggregate AS (
 			SELECT date_trunc('hour',created_at) AS hour,api_key_id,COALESCE(group_id,0) AS group_id,upstream_id,protocol,model,
-				sum(cost_usd) AS cost_usd,count(*) AS known
+				sum(cost_usd) AS cost_usd,sum(known) AS known
 			FROM pricing_backfill GROUP BY 1,2,3,4,5,6
 		), updated AS (
 			UPDATE hourly_usage h SET cost_usd=h.cost_usd+a.cost_usd,cost_known_requests=h.cost_known_requests+a.known
@@ -465,7 +507,7 @@ func (s *Store) BackfillPricingCosts(ctx context.Context, from, to time.Time) (P
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO upstream_lifetime_usage(upstream_id,requests,cost_known_requests,cost_usd,updated_at)
-		SELECT upstream_id,0,count(*),sum(cost_usd),now() FROM pricing_backfill GROUP BY upstream_id
+		SELECT upstream_id,0,sum(known),sum(cost_usd),now() FROM pricing_backfill GROUP BY upstream_id
 		ON CONFLICT(upstream_id) DO UPDATE SET
 			cost_known_requests=upstream_lifetime_usage.cost_known_requests+EXCLUDED.cost_known_requests,
 			cost_usd=upstream_lifetime_usage.cost_usd+EXCLUDED.cost_usd,
@@ -644,6 +686,10 @@ func calculateRequestCost(price PricingModelPrice, usage core.Usage) float64 {
 		if value < 0 {
 			value = 0
 		}
+		uncached = &value
+	}
+	if usage.BillableInputTokens != nil {
+		value := max(*usage.BillableInputTokens, 0)
 		uncached = &value
 	}
 	var total float64

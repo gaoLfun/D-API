@@ -143,23 +143,24 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 		WITH attempts AS (
 			SELECT l.request_id, l.status_code AS final_status, l.error_code AS final_error, COALESCE((a->>'upstream_id')::bigint,0) AS upstream_id,
 				COALESCE((a->>'status_code')::int,0) AS status_code,
-				COALESCE((a->>'duration_ms')::double precision,0) AS duration_ms
+				COALESCE((a->>'duration_ms')::double precision,0) AS duration_ms,
+				`+store.AttemptFailureSQL("a", "l.error_code")+` AS failed
 			FROM request_logs l
 			CROSS JOIN LATERAL jsonb_array_elements(l.attempts) a
 			WHERE l.created_at >= $1 AND l.created_at < $4
 		), metrics AS (
 			SELECT upstream_id,COUNT(*) AS attempts,
-				100.0*COUNT(*) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500)
+				100.0*COUNT(*) FILTER (WHERE failed)
 					/NULLIF(COUNT(*),0) AS error_rate,
 				AVG(duration_ms) AS latency,
-		COUNT(*) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500) AS failures,
-		COUNT(DISTINCT request_id) FILTER (WHERE (status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500) AND final_status BETWEEN 200 AND 399 AND final_error='') AS recovered,
-		to_jsonb((array_agg(DISTINCT request_id) FILTER (WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500))[1:100]) AS failed_request_ids
+		COUNT(*) FILTER (WHERE failed) AS failures,
+		COUNT(DISTINCT request_id) FILTER (WHERE (failed) AND final_status BETWEEN 200 AND 399 AND final_error='') AS recovered,
+		to_jsonb((array_agg(DISTINCT request_id) FILTER (WHERE failed))[1:100]) AS failed_request_ids
 		FROM attempts GROUP BY upstream_id
 		), status_counts AS (
 		SELECT upstream_id,jsonb_object_agg(status_code,n) AS counts FROM (
 		SELECT upstream_id,status_code,COUNT(*) AS n FROM attempts
-		WHERE status_code=0 OR status_code IN (401,403,404,429) OR status_code>=500
+		WHERE failed
 		GROUP BY upstream_id,status_code) c GROUP BY upstream_id
 		)
 		SELECT u.id,u.name,COALESCE(m.attempts,0),COALESCE(m.error_rate,0),m.latency,COALESCE(m.failures,0),COALESCE(m.recovered,0),COALESCE(c.counts,'{}'::jsonb),COALESCE(m.failed_request_ids,'[]'::jsonb)
@@ -246,7 +247,7 @@ func (r AlertRepository) observeUpstreamMetrics(ctx context.Context, rule alerts
 func (r AlertRepository) observeClientErrors(ctx context.Context, rule alerts.Rule) ([]alerts.Observation, error) {
 	window := windowSeconds(rule)
 	rows, err := r.Store.DB().QueryContext(ctx, `
-		SELECT k.id,k.name,COUNT(l.id),COALESCE(100.0*COUNT(l.id) FILTER (WHERE l.status_code>=400)/NULLIF(COUNT(l.id),0),0)
+		SELECT k.id,k.name,COUNT(l.id),COALESCE(100.0*COUNT(l.id) FILTER (WHERE l.status_code>=400 OR l.error_code<>'')/NULLIF(COUNT(l.id),0),0)
 		FROM api_keys k LEFT JOIN request_logs l ON l.api_key_id=k.id AND l.created_at>=now()-make_interval(secs=>$1)
 		WHERE k.enabled GROUP BY k.id,k.name ORDER BY k.id`, window)
 	if err != nil {

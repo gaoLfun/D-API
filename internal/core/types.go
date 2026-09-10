@@ -1,10 +1,13 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+var ErrUpstreamConfigChanged = errors.New("upstream configuration changed during operation")
 
 const (
 	ProtocolResponses = "responses"
@@ -31,6 +34,7 @@ func BalanceTransitionMessage(name string, transition BalanceTransition, reason 
 }
 
 type Upstream struct {
+	ConfigVersion      int64             `json:"-"`
 	ID                 int64             `json:"id"`
 	Name               string            `json:"name"`
 	Kind               string            `json:"kind"`
@@ -111,6 +115,7 @@ func (k APIKey) Allows(protocol, model string) bool {
 }
 
 type Attempt struct {
+	FailureClass string `json:"failure_class,omitempty"`
 	UpstreamID   int64  `json:"upstream_id"`
 	UpstreamName string `json:"upstream_name"`
 	StatusCode   int    `json:"status_code,omitempty"`
@@ -121,6 +126,8 @@ type Attempt struct {
 }
 
 type Usage struct {
+	// BillableInputTokens excludes separately billed cache writes. Not a statistics field.
+	BillableInputTokens      *int64 `json:"-"`
 	InputTokens              *int64 `json:"input_tokens,omitempty"`
 	OutputTokens             *int64 `json:"output_tokens,omitempty"`
 	CachedInputTokens        *int64 `json:"cached_input_tokens,omitempty"`

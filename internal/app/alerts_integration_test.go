@@ -237,7 +237,7 @@ func TestHealthNotificationsPersistCooldownAndLeaveRoutingResponsive(t *testing.
 			probe.Status, probe.StatusCode = "healthy", 200
 		}
 		repo := OpsRepository{Store: db}
-		status, notification, err := repo.SaveHealth(ctx, id, probe)
+		status, notification, err := repo.SaveHealth(ctx, core.Upstream{ID: id}, probe)
 		if err != nil || status != wantStatus || notification != wantNotification {
 			t.Fatalf("status=%s notification=%s err=%v", status, notification, err)
 		}

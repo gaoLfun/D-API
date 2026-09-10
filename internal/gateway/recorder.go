@@ -13,26 +13,36 @@ import (
 )
 
 const (
-	requestLogQueueSize    = 2048
-	requestLogBatchSize    = 64
-	requestLogFlushEvery   = 100 * time.Millisecond
-	requestLogWriteTimeout = 2 * time.Second
+	requestLogQueueSize           = 2048
+	requestLogBatchSize           = 64
+	requestLogFlushEvery          = 100 * time.Millisecond
+	requestLogWriteTimeout        = 2 * time.Second
+	requestLogFallbackConcurrency = 4
+	requestLogFallbackWaiters     = 64
+	requestLogFallbackWait        = 100 * time.Millisecond
 )
 
 var defaultRequestLogRetryDelays = []time.Duration{100 * time.Millisecond, 500 * time.Millisecond}
 
 type requestRecorder struct {
-	repo        Repository
-	queue       chan core.RequestLog
-	done        chan struct{}
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mu          sync.RWMutex
-	closed      bool
-	retryDelays []time.Duration
-	errMu       sync.Mutex
-	flushErr    error
-	dropped     atomic.Uint64
+	fallbackSlots      chan struct{}
+	fallbackWaitSlots  chan struct{}
+	fallbackWaiting    atomic.Int64
+	fallbackCount      atomic.Uint64
+	fallbackRejected   atomic.Uint64
+	fallbackWaitNS     atomic.Int64
+	fallbackDurationNS atomic.Int64
+	repo               Repository
+	queue              chan core.RequestLog
+	done               chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
+	mu                 sync.RWMutex
+	closed             bool
+	retryDelays        []time.Duration
+	errMu              sync.Mutex
+	flushErr           error
+	dropped            atomic.Uint64
 }
 
 func newRequestRecorder(repo Repository) *requestRecorder {
@@ -42,7 +52,9 @@ func newRequestRecorder(repo Repository) *requestRecorder {
 func newRequestRecorderWithRetryDelays(repo Repository, retryDelays []time.Duration) *requestRecorder {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &requestRecorder{
-		repo: repo, queue: make(chan core.RequestLog, requestLogQueueSize), done: make(chan struct{}),
+		fallbackSlots:     make(chan struct{}, requestLogFallbackConcurrency),
+		fallbackWaitSlots: make(chan struct{}, requestLogFallbackWaiters),
+		repo:              repo, queue: make(chan core.RequestLog, requestLogQueueSize), done: make(chan struct{}),
 		ctx: ctx, cancel: cancel, retryDelays: append([]time.Duration(nil), retryDelays...),
 	}
 	go r.run()
@@ -50,7 +62,7 @@ func newRequestRecorderWithRetryDelays(repo Repository, retryDelays []time.Durat
 }
 
 // Submit returns false when the queue is full or closing. The caller then
-// writes synchronously, providing bounded backpressure without losing logs.
+// uses the bounded synchronous fallback; exhausted capacity is counted as loss.
 func (r *requestRecorder) Submit(entry core.RequestLog) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -214,3 +226,41 @@ func (r *requestRecorder) flush(entries []core.RequestLog) error {
 }
 
 func (r *requestRecorder) Dropped() uint64 { return r.dropped.Load() }
+
+func (r *requestRecorder) fallback(entry core.RequestLog) error {
+	started := time.Now()
+	r.fallbackCount.Add(1)
+	defer func() { r.fallbackDurationNS.Add(time.Since(started).Nanoseconds()) }()
+	select {
+	case r.fallbackWaitSlots <- struct{}{}:
+	default:
+		return r.rejectFallback()
+	}
+	r.fallbackWaiting.Add(1)
+	timer := time.NewTimer(requestLogFallbackWait)
+	defer timer.Stop()
+	acquired := false
+	select {
+	case r.fallbackSlots <- struct{}{}:
+		acquired = true
+	case <-timer.C:
+	case <-r.ctx.Done():
+	}
+	r.fallbackWaitNS.Add(time.Since(started).Nanoseconds())
+	r.fallbackWaiting.Add(-1)
+	<-r.fallbackWaitSlots
+	if !acquired {
+		return r.rejectFallback()
+	}
+	defer func() { <-r.fallbackSlots }()
+	return r.flush([]core.RequestLog{entry})
+}
+
+func (r *requestRecorder) rejectFallback() error {
+	total := r.dropped.Add(1)
+	rejected := r.fallbackRejected.Add(1)
+	if rejected == 1 || rejected%100 == 0 {
+		slog.Error("request log fallback capacity exhausted", "fallback_rejected", rejected, "dropped_total", total)
+	}
+	return errors.New("request log fallback capacity exhausted or closing")
+}

@@ -180,8 +180,12 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     PRIMARY KEY(day, api_key_id, group_id, upstream_id, protocol, model)
 );
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_pkey;
-ALTER TABLE daily_usage ADD PRIMARY KEY(day, api_key_id, group_id, upstream_id, protocol, model);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='daily_usage'::regclass AND contype='p' AND pg_get_constraintdef(oid)='PRIMARY KEY (day, api_key_id, group_id, upstream_id, protocol, model)') THEN
+        ALTER TABLE daily_usage DROP CONSTRAINT IF EXISTS daily_usage_pkey;
+        ALTER TABLE daily_usage ADD PRIMARY KEY(day, api_key_id, group_id, upstream_id, protocol, model);
+    END IF;
+END $$;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS cache_creation_usage_requests BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE daily_usage ADD COLUMN IF NOT EXISTS uncached_input_tokens BIGINT NOT NULL DEFAULT 0;

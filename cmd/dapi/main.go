@@ -61,13 +61,16 @@ func run() error {
 	operations := app.Operations{Store: db, Prober: prober}
 	delivery := app.ChannelNotifier{Store: db}
 	notifier := app.NewOutboxNotifier(db)
-	httpapi.New(db, cfg, operations, notifier).Register(mux)
 	gatewayHandler := gateway.NewSecureHandler(app.GatewayRepository{Store: db}, gateway.Limits{
-		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
-		MaxConcurrentPerKey:   cfg.MaxConcurrentPerKey,
-		MaxRequestsPerMinute:  cfg.MaxRequestsPerMinute,
-		MaxRequestDuration:    cfg.MaxRequestDuration,
+		MaxConcurrentRequests:    cfg.MaxConcurrentRequests,
+		MaxConcurrentPerKey:      cfg.MaxConcurrentPerKey,
+		MaxRequestsPerMinute:     cfg.MaxRequestsPerMinute,
+		MaxRequestDuration:       cfg.MaxRequestDuration,
+		DownstreamWriteTimeout:   cfg.DownstreamWriteTimeout,
+		MaxBufferedRequestBytes:  cfg.MaxBufferedRequestBytes,
+		MaxBufferedResponseBytes: cfg.MaxBufferedResponseBytes,
 	})
+	httpapi.New(db, cfg, operations, notifier).WithRuntimeMetrics(gatewayHandler.Metrics).Register(mux)
 	mux.Handle("/v1/", gatewayHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
@@ -96,7 +99,7 @@ func run() error {
 			slog.Error("alert engine stopped", "error", err)
 		}
 	}()
-	go cleanup(ctx, db, cfg.LogRetention)
+	go cleanup(ctx, db, cfg)
 	go refreshPricing(ctx, db)
 
 	drain := newRequestDrain()
@@ -161,29 +164,22 @@ func resetPassword(ctx context.Context, database *store.Store, username, passwor
 	return nil
 }
 
-func cleanup(ctx context.Context, database *store.Store, retention time.Duration) {
-	ticker := time.NewTicker(24 * time.Hour)
+func cleanup(ctx context.Context, database *store.Store, cfg config.Config) {
+	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
-		before := time.Now().Add(-retention)
-		if err := database.CleanupLogs(ctx, before); err != nil && ctx.Err() == nil {
-			slog.Error("request log cleanup failed", "error", err)
+		report, err := database.CleanupRetention(ctx, time.Now().Add(-cfg.LogRetention), time.Now().Add(-cfg.DailyUsageRetention), time.Now().Add(-cfg.HourlyUsageRetention))
+		if err != nil && ctx.Err() == nil {
+			slog.Error("retention cleanup failed", "error", err)
 		}
-		if err := database.CleanupAuditLogs(ctx, before); err != nil && ctx.Err() == nil {
-			slog.Error("audit log cleanup failed", "error", err)
+		if !report.Skipped && ctx.Err() == nil {
+			slog.Info("retention cleanup finished", "report", report)
 		}
-		if err := database.CleanupAlertEvents(ctx, before); err != nil && ctx.Err() == nil {
-			slog.Error("alert event cleanup failed", "error", err)
-		}
-		if err := database.CleanupDailyUsage(ctx, before); err != nil && ctx.Err() == nil {
-			slog.Error("daily usage cleanup failed", "error", err)
-		}
-		if err := database.CleanupHourlyUsage(ctx, time.Now().Add(-90*24*time.Hour)); err != nil && ctx.Err() == nil {
-			slog.Error("hourly usage cleanup failed", "error", err)
-		}
-		if err := database.DeleteExpiredSessions(ctx); err != nil && ctx.Err() == nil {
+		sessionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := database.DeleteExpiredSessions(sessionCtx); err != nil && ctx.Err() == nil {
 			slog.Error("expired session cleanup failed", "error", err)
 		}
+		cancel()
 		select {
 		case <-ctx.Done():
 			return

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,6 +9,28 @@ import (
 )
 
 var ErrNotFound = errors.New("not found")
+var ErrPasswordChanged = errors.New("password changed during login")
+
+// Serialize session creation with password changes, including logins that
+// verified the old hash before the password change committed.
+func (s *Store) CreateSessionForPassword(ctx context.Context, hash []byte, admin Admin, ip, userAgent string, expiresAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current []byte
+	if err := tx.QueryRowContext(ctx, `SELECT password_hash FROM admins WHERE id=$1 FOR SHARE`, admin.ID).Scan(&current); err != nil {
+		return err
+	}
+	if !bytes.Equal(current, admin.PasswordHash) {
+		return ErrPasswordChanged
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions(token_hash,admin_id,ip,user_agent,expires_at) VALUES($1,$2,$3,$4,$5)`, hash, admin.ID, ip, userAgent, expiresAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 type Admin struct {
 	ID              int64

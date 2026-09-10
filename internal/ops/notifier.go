@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gaoLfun/dapi/internal/netguard"
+	"github.com/gaoLfun/dapi/internal/safeerr"
 )
 
 type Notifier interface {
@@ -46,7 +47,7 @@ func (notifiers MultiNotifier) Notify(ctx context.Context, event Event) error {
 	}
 	if delivered > 0 {
 		if len(errs) > 0 {
-			slog.Warn("notification partially delivered", "event", event.Type, "errors", errors.Join(errs...))
+			slog.Warn("notification partially delivered", "event", event.Type, "errors", safeerr.Text(errors.Join(errs...)))
 		}
 		return nil
 	}
@@ -118,7 +119,16 @@ func NewWebhookNotifier(config WebhookConfig, client *http.Client) *WebhookNotif
 	return &WebhookNotifier{config: config, client: client}
 }
 
-func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
+func (n *WebhookNotifier) Notify(ctx context.Context, event Event) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			secrets := []string{n.config.URL}
+			for _, value := range n.config.Headers {
+				secrets = append(secrets, value)
+			}
+			resultErr = errors.New(safeerr.Text(resultErr, secrets...))
+		}
+	}()
 	body, err := webhookPayload(n.config.Provider, n.config.URL, event)
 	if err != nil {
 		return err
@@ -127,7 +137,7 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, n.config.URL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build webhook request: %w", err)
+		return fmt.Errorf("build webhook request: %s", safeerr.Text(err, n.config.URL))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for key, value := range n.config.Headers {
@@ -138,12 +148,12 @@ func (n *WebhookNotifier) Notify(ctx context.Context, event Event) error {
 	}
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send webhook: %w", err)
+		return fmt.Errorf("send webhook: %s", safeerr.Text(err, n.config.URL))
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (64<<10)+1))
 	if err != nil {
-		return fmt.Errorf("read webhook response: %w", err)
+		return fmt.Errorf("read webhook response: %s", safeerr.Text(err, n.config.URL))
 	}
 	if len(responseBody) > 64<<10 {
 		return errors.New("webhook response too large")
@@ -451,7 +461,12 @@ func NewSMTPNotifier(config SMTPConfig) *SMTPNotifier {
 	return &SMTPNotifier{config: config}
 }
 
-func (n *SMTPNotifier) Notify(ctx context.Context, event Event) error {
+func (n *SMTPNotifier) Notify(ctx context.Context, event Event) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.New(safeerr.Text(resultErr, n.config.Password))
+		}
+	}()
 	requestCtx, cancel := context.WithTimeout(ctx, n.config.Timeout)
 	defer cancel()
 	host, _, err := net.SplitHostPort(n.config.Address)

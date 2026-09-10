@@ -27,13 +27,13 @@ type boundedMonitorRepository struct{ upstreams []core.Upstream }
 func (r boundedMonitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {
 	return r.upstreams, nil
 }
-func (boundedMonitorRepository) SaveHealth(context.Context, int64, Health) (string, string, error) {
+func (boundedMonitorRepository) SaveHealth(context.Context, core.Upstream, Health) (string, string, error) {
 	return "healthy", "", nil
 }
 func (boundedMonitorRepository) AcknowledgeHealthNotification(context.Context, int64, string) error {
 	return nil
 }
-func (boundedMonitorRepository) SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error) {
+func (boundedMonitorRepository) SaveBalance(context.Context, core.Upstream, core.Balance, bool) (core.BalanceTransition, error) {
 	return core.BalanceUnchanged, nil
 }
 func (boundedMonitorRepository) SaveEvent(context.Context, Event) error { return nil }
@@ -77,7 +77,8 @@ func TestMonitorParallelUsesBoundedWorkers(t *testing.T) {
 func (r *monitorRepository) ListUpstreams(context.Context) ([]core.Upstream, error) {
 	return r.upstreams, nil
 }
-func (r *monitorRepository) SaveHealth(_ context.Context, id int64, health Health) (string, string, error) {
+func (r *monitorRepository) SaveHealth(_ context.Context, upstream core.Upstream, health Health) (string, string, error) {
+	id := upstream.ID
 	r.health = append(r.health, health)
 	status := r.status
 	if status == "" {
@@ -95,7 +96,7 @@ func (r *monitorRepository) AcknowledgeHealthNotification(_ context.Context, _ i
 	r.notification = ""
 	return nil
 }
-func (r *monitorRepository) SaveBalance(_ context.Context, _ int64, _ core.Balance, immediate bool) (core.BalanceTransition, error) {
+func (r *monitorRepository) SaveBalance(_ context.Context, _ core.Upstream, _ core.Balance, immediate bool) (core.BalanceTransition, error) {
 	r.balanceImmediate = immediate
 	return r.balanceTransition, nil
 }

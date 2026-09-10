@@ -90,3 +90,11 @@ func TestDecodeLiteLLMPrices(t *testing.T) {
 		t.Fatalf("Gemini price = %#v", got)
 	}
 }
+
+func TestMessagesCacheWriteNotBilledAsOrdinaryInput(t *testing.T) {
+	usage := core.Usage{InputTokens: tokenCount(10), UncachedInputTokens: tokenCount(40), BillableInputTokens: tokenCount(10), CachedInputTokens: tokenCount(20), CacheCreationInputTokens: tokenCount(30), OutputTokens: tokenCount(5)}
+	cost := calculateRequestCost(PricingModelPrice{InputUSDPerMillion: 2, OutputUSDPerMillion: 8, CacheReadUSDPerMillion: 0.5, CacheWriteUSDPerMillion: 3}, usage)
+	if math.Abs(cost-0.00016) > 1e-10 {
+		t.Fatalf("cost=%f", cost)
+	}
+}

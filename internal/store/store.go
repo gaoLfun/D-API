@@ -15,7 +15,13 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed reliability_migration.sql
+var reliabilityMigration string
+
 type Store struct {
+	cleanupMu        sync.RWMutex
+	cleanupReport    CleanupReport
+	usageReports     usageReportCache
 	db               *sql.DB
 	box              *cryptox.SecretBox
 	pricingMu        sync.RWMutex
@@ -67,8 +73,24 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(739842106)`); err != nil {
 		return fmt.Errorf("lock migration: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate database: %w", err)
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		return fmt.Errorf("create migrations: %w", err)
+	}
+	migrations := []string{schema, `ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS pricing_version INTEGER NOT NULL DEFAULT 1; ALTER TABLE request_logs ALTER COLUMN pricing_version SET DEFAULT 2;`, reliabilityMigration, `ALTER TABLE upstreams ADD COLUMN IF NOT EXISTS config_version BIGINT NOT NULL DEFAULT 1;`}
+	for index, migration := range migrations {
+		var applied bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, index+1).Scan(&applied); err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, migration); err != nil {
+			return fmt.Errorf("migration %d: %w", index+1, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, index+1); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration: %w", err)

@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -14,19 +14,26 @@ import (
 )
 
 type LogFilter struct {
-	AttemptScope   bool
-	AttemptFailure bool
-	Since          *time.Time
-	Until          *time.Time
-	Limit          int
-	Offset         int
-	StatusMin      int
-	StatusMax      int
-	UpstreamID     int64
-	GroupID        int64
+	APIKeyID        int64
+	Model           string
+	UpstreamBaseURL string
+	Protocol        string
+	Cursor          *PageCursor
+	Outcome         string
+	AttemptScope    bool
+	AttemptFailure  bool
+	Since           *time.Time
+	Until           *time.Time
+	Limit           int
+	Offset          int
+	StatusMin       int
+	StatusMax       int
+	UpstreamID      int64
+	GroupID         int64
 }
 
 type RequestLogView struct {
+	ID int64 `json:"-"`
 	core.RequestLog
 	APIKeyName   string `json:"api_key_name,omitempty"`
 	GroupName    string `json:"group_name,omitempty"`
@@ -83,6 +90,9 @@ func (s *Store) prepareRequest(ctx context.Context, entry core.RequestLog) (prep
 	}
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
+	}
+	if entry.Protocol == core.ProtocolMessages {
+		entry.Usage.BillableInputTokens = entry.Usage.InputTokens
 	}
 	if entry.UpstreamID != nil {
 		entry.CostUSD, err = s.RequestCost(ctx, *entry.UpstreamID, entry.Model, entry.Usage, entry.CreatedAt)
@@ -185,27 +195,49 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 	if filter.Limit <= 0 || filter.Limit > 200 {
 		filter.Limit = 50
 	}
+	return s.listRequestLogs(ctx, filter)
+}
+
+func (s *Store) listRequestLogs(ctx context.Context, filter LogFilter) ([]RequestLogView, error) {
 	if filter.Offset < 0 {
 		filter.Offset = 0
 	}
 	if filter.Offset > 100000 {
 		filter.Offset = 100000
 	}
+	args := []any{filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.GroupID, filter.Limit, filter.Offset, filter.AttemptScope || filter.AttemptFailure, filter.AttemptFailure, filter.Since, filter.Until, filter.Outcome}
+	cursorClause := ""
+	for _, field := range []struct {
+		condition string
+		value     any
+		enabled   bool
+	}{
+		{usageBaseURLSQL("u.base_url"), normalizeUsageBaseURL(filter.UpstreamBaseURL), filter.UpstreamBaseURL != ""}, {"l.api_key_id", filter.APIKeyID, filter.APIKeyID > 0}, {"l.model", filter.Model, filter.Model != ""}, {"l.protocol", filter.Protocol, filter.Protocol != ""},
+	} {
+		if field.enabled {
+			args = append(args, field.value)
+			cursorClause += fmt.Sprintf(" AND %s=$%d ", field.condition, len(args))
+		}
+	}
+	if filter.Cursor != nil {
+		cursorClause += fmt.Sprintf(" AND (l.created_at,l.id) < ($%d::timestamptz,$%d::bigint) ", len(args)+1, len(args)+2)
+		args = append(args, filter.Cursor.At, filter.Cursor.ID)
+	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT l.request_id,COALESCE(l.api_key_id,0),l.group_id,l.upstream_id,l.protocol,l.model,l.status_code,l.duration_ms,l.ttfb_ms,l.ttft_ms,
+  SELECT l.id,l.request_id,COALESCE(l.api_key_id,0),l.group_id,l.upstream_id,l.protocol,l.model,l.status_code,l.duration_ms,l.ttfb_ms,l.ttft_ms,
 			l.attempts,l.input_tokens,l.output_tokens,l.cached_input_tokens,l.cache_creation_input_tokens,l.uncached_input_tokens,l.cost_usd,l.error_code,l.client_ip,l.created_at,
 			COALESCE(k.name,''),COALESCE(g.name,''),COALESCE(u.name,'')
 		FROM request_logs l
 		LEFT JOIN api_keys k ON k.id=l.api_key_id LEFT JOIN groups g ON g.id=l.group_id LEFT JOIN upstreams u ON u.id=l.upstream_id
 		WHERE ($1=0 OR l.status_code >= $1) AND ($2=0 OR l.status_code <= $2)
+		AND ($11='' OR ($11='success' AND l.status_code BETWEEN 200 AND 399 AND l.error_code='') OR ($11='error' AND (l.status_code>=400 OR l.error_code<>'')))
 		AND ($4=0 OR l.group_id=$4)
 		AND ($9::timestamptz IS NULL OR l.created_at >= $9) AND ($10::timestamptz IS NULL OR l.created_at < $10)
 		AND ((NOT $7 AND ($3=0 OR l.upstream_id=$3)) OR ($7 AND EXISTS (
 		SELECT 1 FROM jsonb_array_elements(l.attempts) a
 		WHERE ($3=0 OR COALESCE((a->>'upstream_id')::bigint,0)=$3)
-		AND (NOT $8 OR COALESCE((a->>'status_code')::int,0)=0 OR (a->>'status_code')::int IN (401,403,404,429) OR (a->>'status_code')::int>=500))))
-		ORDER BY l.created_at DESC LIMIT $5 OFFSET $6`,
-		filter.StatusMin, filter.StatusMax, filter.UpstreamID, filter.GroupID, filter.Limit, filter.Offset, filter.AttemptScope || filter.AttemptFailure, filter.AttemptFailure, filter.Since, filter.Until,
+		AND (NOT $8 OR `+AttemptFailureSQL("a", "l.error_code")+`))))
+		`+cursorClause+` ORDER BY l.created_at DESC,l.id DESC LIMIT $5 OFFSET $6`, args...,
 	)
 	if err != nil {
 		return nil, err
@@ -216,7 +248,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, filter LogFilter) ([]Reques
 		var entry RequestLogView
 		var attempts []byte
 		if err := rows.Scan(
-			&entry.RequestID, &entry.APIKeyID, &entry.GroupID, &entry.UpstreamID, &entry.Protocol, &entry.Model,
+			&entry.ID, &entry.RequestID, &entry.APIKeyID, &entry.GroupID, &entry.UpstreamID, &entry.Protocol, &entry.Model,
 			&entry.StatusCode, &entry.DurationMS, &entry.TTFBMS, &entry.TTFTMS, &attempts, &entry.Usage.InputTokens,
 			&entry.Usage.OutputTokens, &entry.Usage.CachedInputTokens, &entry.Usage.CacheCreationInputTokens, &entry.Usage.UncachedInputTokens, &entry.CostUSD, &entry.ErrorCode,
 			&entry.ClientIP, &entry.CreatedAt, &entry.APIKeyName, &entry.GroupName, &entry.UpstreamName,
@@ -366,17 +398,30 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 	from, to := usageDateRange(filter)
 	dimension := normalizeDimension(filter.Dimension)
 	granularity := normalizeGranularity(filter.Granularity)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.day,d.api_key_id,COALESCE(k.name,''),d.group_id,COALESCE(g.name,''),d.upstream_id,COALESCE(u.name,''),COALESCE(u.base_url,''),d.protocol,d.model,
-			d.requests,d.successes,d.input_tokens,d.output_tokens,d.cached_input_tokens,
-			 d.cache_creation_input_tokens,d.cache_creation_usage_requests,d.uncached_input_tokens,d.usage_requests,d.cache_hit_requests
-			,d.cost_usd,d.cost_known_requests
-		FROM daily_usage d
-		LEFT JOIN api_keys k ON k.id=d.api_key_id LEFT JOIN groups g ON g.id=d.group_id LEFT JOIN upstreams u ON u.id=d.upstream_id
-		WHERE d.day >= $1::date AND d.day <= $2::date
-		  AND ($3=0 OR d.upstream_id=$3) AND ($4=0 OR d.api_key_id=$4) AND ($5=0 OR d.group_id=$5)
-		  AND ($6='' OR d.protocol=$6) AND ($7='' OR d.model=$7)
-		ORDER BY d.day`, from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model)
+	columns := []string{"0::bigint", "''", "0::bigint", "''", "0::bigint", "''", "''", "''", "''"}
+	switch dimension {
+	case "api_key":
+		columns[0], columns[1] = "d.api_key_id", "COALESCE(k.name,'')"
+	case "group":
+		columns[2], columns[3] = "d.group_id", "COALESCE(g.name,'')"
+	case "upstream":
+		columns[4], columns[5], columns[6] = "d.upstream_id", "COALESCE(u.name,'')", "COALESCE(u.base_url,'')"
+	case "protocol":
+		columns[7] = "d.protocol"
+	case "model":
+		columns[8] = "d.model"
+	}
+	bucket := "date_trunc('" + granularity + "',d.day::timestamp)::date"
+	query := `SELECT ` + bucket + `,` + strings.Join(columns, ",") + `,
+ SUM(d.requests),SUM(d.successes),SUM(d.input_tokens),SUM(d.output_tokens),SUM(d.cached_input_tokens),
+ SUM(d.cache_creation_input_tokens),SUM(d.cache_creation_usage_requests),SUM(d.uncached_input_tokens),SUM(d.usage_requests),SUM(d.cache_hit_requests),SUM(d.cost_usd),SUM(d.cost_known_requests)
+ FROM daily_usage d
+ LEFT JOIN api_keys k ON k.id=d.api_key_id LEFT JOIN groups g ON g.id=d.group_id LEFT JOIN upstreams u ON u.id=d.upstream_id
+ WHERE d.day >= $1::date AND d.day <= $2::date
+ AND ($3=0 OR d.upstream_id=$3) AND ($4=0 OR d.api_key_id=$4) AND ($5=0 OR d.group_id=$5)
+ AND ($6='' OR d.protocol=$6) AND ($7='' OR d.model=$7)
+ GROUP BY 1,2,3,4,5,6,7,8,9,10 ORDER BY 1`
+	rows, err := s.db.QueryContext(ctx, query, from, to, filter.UpstreamID, filter.APIKeyID, filter.GroupID, filter.Protocol, filter.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +505,7 @@ func (s *Store) UsageWithFilter(ctx context.Context, filter UsageFilter) ([]Usag
 	}
 
 	// Duration statistics come from raw logs. They naturally remain unknown when old logs were pruned.
-	// ponytail: keep values in memory for exact Top-N/other P95; move percentile aggregation into SQL if traffic grows materially.
+	// Percentiles are aggregated in SQL; the combined Other percentile remains unknown.
 	durationStats, err := s.usageDurations(ctx, filter, from, to, dimension, granularity)
 	if err != nil {
 		return nil, err
@@ -640,27 +685,23 @@ func usageDimensionSQL(dimension string) string {
 	}
 }
 
+// Keep Go aggregation and SQL filtering on exactly the same normalization.
+// Bracketed IPv6 hosts must stay bracketed when removing a default port.
+var usageHTTPSPort = regexp.MustCompile(`^https://(\[[^]]+\]|[^/:]+):443(/|$)`)
+var usageHTTPPort = regexp.MustCompile(`^http://(\[[^]]+\]|[^/:]+):80(/|$)`)
+
 func usageBaseURLSQL(column string) string {
-	return fmt.Sprintf("lower(regexp_replace(regexp_replace(regexp_replace(trim(trailing '/' FROM %s), '[?#].*$', ''), '(?i)^https://([^/:]+):443(/|$)', 'https://\\1\\2'), '(?i)^http://([^/:]+):80(/|$)', 'http://\\1\\2'))", column)
+	return fmt.Sprintf(`regexp_replace(regexp_replace(rtrim(regexp_replace(lower(btrim(%s)), '[?#].*$', ''), '/'), '^https://(\[[^]]+\]|[^/:]+):443(/|$)', 'https://\1\2'), '^http://(\[[^]]+\]|[^/:]+):80(/|$)', 'http://\1\2')`, column)
 }
 
 func normalizeUsageBaseURL(value string) string {
-	raw := strings.TrimSpace(value)
-	if raw == "" {
-		return ""
+	raw := strings.ToLower(strings.TrimSpace(value))
+	if index := strings.IndexAny(raw, "?#"); index >= 0 {
+		raw = raw[:index]
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return strings.ToLower(strings.TrimRight(raw, "/"))
-	}
-	if (parsed.Scheme == "https" && parsed.Port() == "443") || (parsed.Scheme == "http" && parsed.Port() == "80") {
-		parsed.Host = parsed.Hostname()
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	parsed.Host = strings.ToLower(parsed.Host)
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	parsed.RawQuery, parsed.Fragment = "", ""
-	return strings.ToLower(strings.TrimRight(parsed.String(), "/"))
+	raw = strings.TrimRight(raw, "/")
+	raw = usageHTTPSPort.ReplaceAllString(raw, "https://${1}${2}")
+	return usageHTTPPort.ReplaceAllString(raw, "http://${1}${2}")
 }
 
 func valueFloat(value *float64) float64 {
@@ -790,76 +831,18 @@ func (s *Store) CleanupAlertEvents(ctx context.Context, before time.Time) error 
 }
 
 func (s *Store) CleanupDailyUsage(ctx context.Context, before time.Time) error {
-	const batchSize = 1000
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		result, err := s.db.ExecContext(ctx, `
-			DELETE FROM daily_usage
-			WHERE ctid IN (
-				SELECT ctid FROM daily_usage
-				WHERE day < ($1 AT TIME ZONE 'UTC')::date
-				ORDER BY day
-				LIMIT $2
-			)`, before, batchSize)
-		if err != nil {
-			return err
-		}
-		deleted, err := result.RowsAffected()
-		if err != nil || deleted < batchSize {
-			return err
-		}
-	}
+	_, err := s.cleanupBatches(ctx, "daily_usage", before)
+	return err
 }
 
 func (s *Store) CleanupHourlyUsage(ctx context.Context, before time.Time) error {
-	const batchSize = 1000
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		result, err := s.db.ExecContext(ctx, `
-			DELETE FROM hourly_usage
-			WHERE ctid IN (
-				SELECT ctid FROM hourly_usage
-				WHERE hour < $1
-				ORDER BY hour
-				LIMIT $2
-			)`, before.UTC(), batchSize)
-		if err != nil {
-			return err
-		}
-		deleted, err := result.RowsAffected()
-		if err != nil || deleted < batchSize {
-			return err
-		}
-	}
+	_, err := s.cleanupBatches(ctx, "hourly_usage", before)
+	return err
 }
 
 func (s *Store) cleanupByID(ctx context.Context, table string, before time.Time) error {
-	const batchSize = 1000
-	// table is selected only by the fixed methods above; it is never caller input.
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		result, err := s.db.ExecContext(ctx, `
-			DELETE FROM `+table+`
-			WHERE id IN (
-				SELECT id FROM `+table+`
-				WHERE created_at < $1
-				ORDER BY created_at,id
-				LIMIT $2
-			)`, before, batchSize)
-		if err != nil {
-			return err
-		}
-		deleted, err := result.RowsAffected()
-		if err != nil || deleted < batchSize {
-			return err
-		}
-	}
+	_, err := s.cleanupBatches(ctx, table, before)
+	return err
 }
 
 func nullableID(id int64) any {

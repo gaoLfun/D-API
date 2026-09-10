@@ -13,6 +13,15 @@ import (
 	"github.com/lib/pq"
 )
 
+var ErrUpstreamConfigChanged = core.ErrUpstreamConfigChanged
+
+func expectedConfigVersion(versions []int64) int64 {
+	if len(versions) > 0 {
+		return versions[0]
+	}
+	return 0
+}
+
 type UpstreamRecord struct {
 	core.Upstream
 	Balance   core.Balance `json:"balance"`
@@ -27,7 +36,7 @@ const upstreamColumns = `
 	first_byte_timeout_ms, idle_timeout_ms, failure_threshold, cooldown_seconds,
 	health_status, consecutive_failures, consecutive_successes, recovery_started_at, health_notified_status,
 	circuit_open_until, last_check_at, last_error,
-	balance, created_at, updated_at, pricing_profile_id`
+	balance, created_at, updated_at, pricing_profile_id, config_version`
 
 func (s *Store) ListUpstreams(ctx context.Context) ([]core.Upstream, error) {
 	records, err := s.ListUpstreamRecords(ctx)
@@ -180,7 +189,7 @@ func (s *Store) UpdateUpstream(ctx context.Context, upstream core.Upstream) (cor
 			zero_balance_checks=CASE WHEN $9 AND NOT $10 THEN zero_balance_checks ELSE 0 END,
 			priority=$11,protocols=$12,models=$13,models_locked=$14,
 			model_aliases=$15,connect_timeout_ms=$16,first_byte_timeout_ms=$17,
-			idle_timeout_ms=$18,failure_threshold=$19,cooldown_seconds=$20,pricing_profile_id=$21,updated_at=now()
+			idle_timeout_ms=$18,failure_threshold=$19,cooldown_seconds=$20,pricing_profile_id=$21,updated_at=now(),config_version=config_version+1
 		WHERE id=$22`,
 		upstream.Name, upstream.Kind, upstream.BaseURL, upstream.UserAgent, apiKey, accessToken, userID,
 		upstream.Enabled, upstream.BalanceProtection, balanceConfigChanged, upstream.Priority, pq.Array(upstream.Protocols), pq.Array(upstream.Models), upstream.ModelsLocked, aliases,
@@ -246,24 +255,31 @@ func (s *Store) DeleteUpstream(ctx context.Context, id int64) error {
 }
 
 func (s *Store) SaveModels(ctx context.Context, id int64, models []string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, models_locked=true, updated_at=now() WHERE id=$2`, pq.Array(models), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, models_locked=true, updated_at=now(), config_version=config_version+1 WHERE id=$2`, pq.Array(models), id)
 	if err == nil {
 		s.invalidateRouteCache()
 	}
 	return err
 }
 
-func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, updated_at=now() WHERE id=$2 AND models_locked=false AND models IS DISTINCT FROM $1`, pq.Array(models), id)
+func (s *Store) SaveDiscoveredModels(ctx context.Context, id int64, models []string, versions ...int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET models=$1, updated_at=now() WHERE id=$2 AND ($3=0 OR config_version=$3) AND models_locked=false AND models IS DISTINCT FROM $1`, pq.Array(models), id, expectedConfigVersion(versions))
 	if err == nil {
 		if count, _ := result.RowsAffected(); count > 0 {
 			s.invalidateRouteCache()
 		}
 	}
+	if err == nil && expectedConfigVersion(versions) > 0 {
+		var current bool
+		err = s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM upstreams WHERE id=$1 AND config_version=$2)`, id, expectedConfigVersion(versions)).Scan(&current)
+		if err == nil && !current {
+			return ErrUpstreamConfigChanged
+		}
+	}
 	return err
 }
 
-func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
+func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool, versions ...int64) (core.BalanceTransition, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return core.BalanceUnchanged, err
@@ -272,14 +288,18 @@ func (s *Store) SaveBalance(ctx context.Context, id int64, balance core.Balance,
 	var name string
 	var protection, suspended bool
 	var zeroChecks int
+	var version int64
 	var previousBalance []byte
 	if err := tx.QueryRowContext(ctx, `
-		SELECT name,balance_protection_enabled,balance_suspended,zero_balance_checks,balance
+		SELECT name,balance_protection_enabled,balance_suspended,zero_balance_checks,balance,config_version
 		FROM upstreams WHERE id=$1 FOR UPDATE`, id,
-	).Scan(&name, &protection, &suspended, &zeroChecks, &previousBalance); errors.Is(err, sql.ErrNoRows) {
+	).Scan(&name, &protection, &suspended, &zeroChecks, &previousBalance, &version); errors.Is(err, sql.ErrNoRows) {
 		return core.BalanceUnchanged, ErrNotFound
 	} else if err != nil {
 		return core.BalanceUnchanged, err
+	}
+	if expected := expectedConfigVersion(versions); expected > 0 && expected != version {
+		return core.BalanceUnchanged, ErrUpstreamConfigChanged
 	}
 	var previous core.Balance
 	if len(previousBalance) > 0 {
@@ -383,18 +403,18 @@ func writeBalanceAlertEvent(ctx context.Context, tx *sql.Tx, id int64, name stri
 	return err
 }
 
-func (s *Store) SaveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool) (string, error) {
-	status, _, err := s.saveHealth(ctx, id, healthy, message, authFailure, false)
+func (s *Store) SaveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool, versions ...int64) (string, error) {
+	status, _, err := s.saveHealth(ctx, id, healthy, message, authFailure, false, expectedConfigVersion(versions))
 	return status, err
 }
 
 // SaveProbeHealth advances recovery confirmation. Ordinary gateway successes
 // deliberately use SaveHealth so traffic bursts cannot prematurely close an incident.
-func (s *Store) SaveProbeHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool) (string, string, error) {
-	return s.saveHealth(ctx, id, healthy, message, authFailure, true)
+func (s *Store) SaveProbeHealth(ctx context.Context, id int64, healthy bool, message string, authFailure bool, versions ...int64) (string, string, error) {
+	return s.saveHealth(ctx, id, healthy, message, authFailure, true, expectedConfigVersion(versions))
 }
 
-func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure, confirmRecovery bool) (string, string, error) {
+func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message string, authFailure, confirmRecovery bool, version int64) (string, string, error) {
 	var status string
 	var notified string
 	if healthy {
@@ -402,7 +422,7 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 		err := s.db.QueryRowContext(ctx, `
 			WITH previous AS MATERIALIZED (
 				SELECT id,health_status AS old_status,consecutive_failures AS old_failures,
-					circuit_open_until AS old_circuit FROM upstreams WHERE id=$1 FOR UPDATE
+					circuit_open_until AS old_circuit FROM upstreams WHERE id=$1 AND ($3=0 OR config_version=$3) FOR UPDATE
 			)
 			UPDATE upstreams SET
 				health_status=CASE
@@ -439,8 +459,11 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 			RETURNING health_status,health_notified_status,
 				health_status IS DISTINCT FROM previous.old_status OR
 				consecutive_failures IS DISTINCT FROM previous.old_failures OR
-				circuit_open_until IS DISTINCT FROM previous.old_circuit`, id, confirmRecovery).Scan(&status, &notified, &changed)
+				circuit_open_until IS DISTINCT FROM previous.old_circuit`, id, confirmRecovery, version).Scan(&status, &notified, &changed)
 		if errors.Is(err, sql.ErrNoRows) {
+			if version > 0 {
+				return "", "", ErrUpstreamConfigChanged
+			}
 			return "", "", ErrNotFound
 		}
 		if err == nil && changed {
@@ -456,8 +479,11 @@ func (s *Store) saveHealth(ctx context.Context, id int64, healthy bool, message 
 			circuit_open_until=CASE WHEN health_status='unhealthy' OR $3 OR consecutive_failures + 1 >= failure_threshold
 				THEN now() + make_interval(secs => cooldown_seconds) ELSE circuit_open_until END,
 			last_check_at=now(), last_error=$2, updated_at=now()
-		WHERE id=$1 RETURNING health_status,health_notified_status`, id, message, authFailure).Scan(&status, &notified)
+		WHERE id=$1 AND ($4=0 OR config_version=$4) RETURNING health_status,health_notified_status`, id, message, authFailure, version).Scan(&status, &notified)
 	if errors.Is(err, sql.ErrNoRows) {
+		if version > 0 {
+			return "", "", ErrUpstreamConfigChanged
+		}
 		return "", "", ErrNotFound
 	}
 	if err == nil {
@@ -524,7 +550,7 @@ func (s *Store) scanUpstream(row scanner) (UpstreamRecord, error) {
 		&connectMS, &firstByteMS, &idleMS, &record.FailureThreshold, &cooldownSeconds,
 		&record.HealthStatus, &record.ConsecutiveFailure, &record.ConsecutiveSuccess, &record.RecoveryStartedAt, &record.HealthNotified,
 		&record.CircuitOpenUntil, &record.LastCheckAt,
-		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt, &record.PricingProfileID,
+		&record.LastError, &balance, &record.CreatedAt, &record.UpdatedAt, &record.PricingProfileID, &record.ConfigVersion,
 	)
 	if err != nil {
 		return UpstreamRecord{}, err

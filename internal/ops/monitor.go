@@ -40,9 +40,9 @@ type Event struct {
 
 type Repository interface {
 	ListUpstreams(context.Context) ([]core.Upstream, error)
-	SaveHealth(context.Context, int64, Health) (string, string, error)
+	SaveHealth(context.Context, core.Upstream, Health) (string, string, error)
 	AcknowledgeHealthNotification(context.Context, int64, string) error
-	SaveBalance(context.Context, int64, core.Balance, bool) (core.BalanceTransition, error)
+	SaveBalance(context.Context, core.Upstream, core.Balance, bool) (core.BalanceTransition, error)
 	SaveEvent(context.Context, Event) error
 }
 
@@ -124,7 +124,10 @@ func (m *Monitor) RunHealth(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		status, notification, err := m.Repository.SaveHealth(ctx, upstream.ID, health)
+		status, notification, err := m.Repository.SaveHealth(ctx, upstream, health)
+		if errors.Is(err, core.ErrUpstreamConfigChanged) {
+			return pendingErr
+		}
 		if err != nil {
 			return errors.Join(pendingErr, err)
 		}
@@ -252,7 +255,10 @@ func (m *Monitor) RunBalances(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		transition, err := m.Repository.SaveBalance(ctx, upstream.ID, balance, false)
+		transition, err := m.Repository.SaveBalance(ctx, upstream, balance, false)
+		if errors.Is(err, core.ErrUpstreamConfigChanged) {
+			return pendingErr
+		}
 		if err != nil {
 			return errors.Join(pendingErr, err)
 		}

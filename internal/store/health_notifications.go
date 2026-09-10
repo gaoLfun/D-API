@@ -10,12 +10,22 @@ import (
 )
 
 // Serialize the durable incident state independently of routing health updates.
-func (s *Store) updateHealthNotification(ctx context.Context, id int64, update func(*ops.IncidentState) string, acknowledged string) (string, error) {
+func (s *Store) updateHealthNotification(ctx context.Context, id int64, update func(*ops.IncidentState) string, acknowledged string, versions ...int64) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+	// All notification writers lock the upstream before the incident row.
+	// A common lock order avoids upgrade deadlocks between observation and acknowledgement.
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT config_version FROM upstreams WHERE id=$1 FOR UPDATE`, id).Scan(&current); err != nil {
+		return "", err
+	}
+	if expected := expectedConfigVersion(versions); expected > 0 && current != expected {
+		return "", ErrUpstreamConfigChanged
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO health_notification_states(upstream_id,state)
 		SELECT id,jsonb_build_object(
@@ -50,7 +60,7 @@ func (s *Store) updateHealthNotification(ctx context.Context, id int64, update f
 	return notification, tx.Commit()
 }
 
-func (s *Store) ObserveHealthNotification(ctx context.Context, id int64, status string, interval time.Duration) (string, error) {
+func (s *Store) ObserveHealthNotification(ctx context.Context, id int64, status string, interval time.Duration, versions ...int64) (string, error) {
 	return s.updateHealthNotification(ctx, id, func(state *ops.IncidentState) string {
 		now := time.Now()
 		policy := ops.IncidentPolicy{
@@ -69,7 +79,7 @@ func (s *Store) ObserveHealthNotification(ctx context.Context, id int64, status 
 			return "unhealthy"
 		}
 		return "healthy"
-	}, "")
+	}, "", versions...)
 }
 
 func (s *Store) AcceptHealthNotification(ctx context.Context, id int64, status string) error {

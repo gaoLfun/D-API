@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,15 +11,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/core"
-	"github.com/gaoLfun/dapi/internal/netguard"
+	"github.com/gaoLfun/dapi/internal/safeerr"
 )
 
 const maxBodyBytes = 32 << 20
@@ -48,8 +45,8 @@ type Repository interface {
 	AvailableModels(context.Context, core.APIKey) ([]string, error)
 	MaxAttempts(context.Context) (int, error)
 	RecordRequest(context.Context, core.RequestLog) error
-	MarkUpstreamSuccess(context.Context, int64) error
-	MarkUpstreamFailure(context.Context, int64, int, string) error
+	MarkUpstreamSuccess(context.Context, core.Upstream) error
+	MarkUpstreamFailure(context.Context, core.Upstream, int, string) error
 }
 
 type batchRepository interface {
@@ -57,109 +54,37 @@ type batchRepository interface {
 }
 
 type Handler struct {
-	repo       Repository
-	mux        *http.ServeMux
-	mu         sync.Mutex
-	transports map[transportKey]*http.Client
-	limits     Limits
-	gate       requestGate
-	rate       requestRateLimiter
-	secure     bool
-	recorder   *requestRecorder
-	healthMu   sync.Mutex
-	health     map[int64]*upstreamHealthState
+	repo           Repository
+	mux            *http.ServeMux
+	mu             sync.Mutex
+	transports     map[transportKey]*transportEntry
+	limits         Limits
+	gate           requestGate
+	authSlots      chan struct{}
+	bodyBudget     byteBudget
+	responseBudget byteBudget
+	rate           requestRateLimiter
+	secure         bool
+	recorder       *requestRecorder
+	healthMu       sync.Mutex
+	health         map[int64]*upstreamHealthState
 }
 
 type upstreamHealthState struct {
-	mu             sync.Mutex
+	lock           chan struct{}
 	references     int
 	pendingFailure bool
 }
 
 // Limits bounds resource use by authenticated clients. Zero values use safe defaults.
 type Limits struct {
-	MaxConcurrentRequests int
-	MaxConcurrentPerKey   int
-	MaxRequestsPerMinute  int
-	MaxRequestDuration    time.Duration
-}
-
-type requestGate struct {
-	mu     sync.Mutex
-	active int
-	byKey  map[int64]int
-}
-
-func (g *requestGate) acquire(key int64, limits Limits) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.byKey == nil {
-		g.byKey = make(map[int64]int)
-	}
-	if g.active >= limits.MaxConcurrentRequests || g.byKey[key] >= limits.MaxConcurrentPerKey {
-		return false
-	}
-	g.active++
-	g.byKey[key]++
-	return true
-}
-
-func (g *requestGate) release(key int64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.active > 0 {
-		g.active--
-	}
-	if count := g.byKey[key] - 1; count > 0 {
-		g.byKey[key] = count
-	} else {
-		delete(g.byKey, key)
-	}
-}
-
-type requestRate struct {
-	window time.Time
-	count  int
-}
-
-type requestRateLimiter struct {
-	mu          sync.Mutex
-	entries     map[int64]requestRate
-	lastCleanup time.Time
-}
-
-func (l *requestRateLimiter) allow(key int64, max int, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.entries == nil {
-		l.entries = make(map[int64]requestRate)
-	}
-	window := now.UTC().Truncate(time.Minute)
-	// Remove stale keys occasionally so an attacker cannot grow this map by
-	// creating many API keys. The scan is bounded to once per minute.
-	if l.lastCleanup.IsZero() || now.Sub(l.lastCleanup) >= time.Minute {
-		for id, candidate := range l.entries {
-			if candidate.window.Before(window) {
-				delete(l.entries, id)
-			}
-		}
-		l.lastCleanup = now
-	}
-	entry := l.entries[key]
-	if !entry.window.Equal(window) {
-		entry = requestRate{window: window}
-	}
-	if entry.count >= max {
-		l.entries[key] = entry
-		return false
-	}
-	entry.count++
-	l.entries[key] = entry
-	return true
-}
-
-type transportKey struct {
-	connect, firstByte, idle time.Duration
+	MaxConcurrentRequests    int
+	MaxConcurrentPerKey      int
+	MaxRequestsPerMinute     int
+	MaxRequestDuration       time.Duration
+	DownstreamWriteTimeout   time.Duration
+	MaxBufferedRequestBytes  int64
+	MaxBufferedResponseBytes int64
 }
 
 func NewHandler(repo Repository, configured ...Limits) *Handler {
@@ -175,7 +100,19 @@ func NewSecureHandler(repo Repository, configured ...Limits) *Handler {
 
 func newHandler(repo Repository, secure bool, configured ...Limits) *Handler {
 	limits := Limits{MaxConcurrentRequests: defaultMaxConcurrentRequests, MaxConcurrentPerKey: defaultMaxConcurrentPerKey, MaxRequestsPerMinute: defaultMaxRequestsPerMinute, MaxRequestDuration: defaultMaxRequestDuration}
+	limits.DownstreamWriteTimeout = 30 * time.Second
+	limits.MaxBufferedRequestBytes = 512 << 20
+	limits.MaxBufferedResponseBytes = 512 << 20
 	if len(configured) > 0 {
+		if configured[0].MaxBufferedResponseBytes > 0 {
+			limits.MaxBufferedResponseBytes = configured[0].MaxBufferedResponseBytes
+		}
+		if configured[0].DownstreamWriteTimeout > 0 {
+			limits.DownstreamWriteTimeout = configured[0].DownstreamWriteTimeout
+		}
+		if configured[0].MaxBufferedRequestBytes > 0 {
+			limits.MaxBufferedRequestBytes = configured[0].MaxBufferedRequestBytes
+		}
 		if configured[0].MaxConcurrentRequests > 0 {
 			limits.MaxConcurrentRequests = configured[0].MaxConcurrentRequests
 		}
@@ -202,9 +139,10 @@ func newHandler(repo Repository, secure bool, configured ...Limits) *Handler {
 		limits.MaxRequestDuration = 24 * time.Hour
 	}
 	h := &Handler{
-		repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*http.Client),
+		repo: repo, mux: http.NewServeMux(), transports: make(map[transportKey]*transportEntry),
 		limits: limits, secure: secure, health: make(map[int64]*upstreamHealthState),
 	}
+	h.authSlots = make(chan struct{}, limits.MaxConcurrentRequests)
 	if secure {
 		h.recorder = newRequestRecorder(repo)
 	}
@@ -218,6 +156,7 @@ func newHandler(repo Repository, secure bool, configured ...Limits) *Handler {
 // Close flushes queued request logs. Call it after the HTTP server has stopped
 // accepting requests and before closing the repository.
 func (h *Handler) Close(ctx context.Context) error {
+	h.closeTransports()
 	if h.recorder == nil {
 		return nil
 	}
@@ -232,7 +171,9 @@ func (h *Handler) DroppedRequestLogs() uint64 {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	ctx, cancel := context.WithTimeout(r.Context(), h.limits.MaxRequestDuration)
+	defer cancel()
+	h.mux.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (h *Handler) proxy(protocol string) http.HandlerFunc {
@@ -275,14 +216,58 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 		requestCtx, cancel := context.WithTimeout(r.Context(), h.limits.MaxRequestDuration)
 		defer cancel()
 		r = r.WithContext(requestCtx)
+		controller := http.NewResponseController(w)
+		if deadline, ok := requestCtx.Deadline(); ok {
+			// Preserve the server's 30-second body-read limit as well as total duration.
+			if readLimit := time.Now().Add(30 * time.Second); readLimit.Before(deadline) {
+				deadline = readLimit
+			}
+			_ = controller.SetReadDeadline(deadline)
+		}
 
+		requestEnded := func() bool {
+			if requestCtx.Err() == nil {
+				return false
+			}
+			logEntry.StatusCode, logEntry.ErrorCode = 499, "client_closed"
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				logEntry.StatusCode, logEntry.ErrorCode = http.StatusGatewayTimeout, "request_timeout"
+				writeError(w, protocol, logEntry.StatusCode, logEntry.ErrorCode, "gateway request timed out")
+			}
+			return true
+		}
+
+		bodySize := r.ContentLength
+		if bodySize <= 0 || bodySize > maxBodyBytes {
+			bodySize = maxBodyBytes
+		}
+
+		// Reserve for the body, decoding and up to five model rewrites.
+		reservation := max(bodySize, 1) * 8
+		if !h.bodyBudget.acquire(reservation, h.limits.MaxBufferedRequestBytes) {
+			// HTTP/1 otherwise drains an unread body before sending the response.
+			// Do not wait for a rejected client's body or leave a drain unbounded.
+			if r.ProtoMajor == 1 {
+				w.Header().Set("Connection", "close")
+				_ = controller.SetReadDeadline(time.Now())
+			}
+			logEntry.StatusCode, logEntry.ErrorCode = 429, "body_budget_exceeded"
+			w.Header().Set("Retry-After", "1")
+			writeError(w, protocol, 429, logEntry.ErrorCode, "request body memory budget exhausted")
+			return
+		}
+		defer h.bodyBudget.release(reservation)
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
 			logEntry.StatusCode = http.StatusBadRequest
 			logEntry.ErrorCode = "invalid_request"
-			writeError(w, protocol, http.StatusBadRequest, "invalid_request", "invalid request body")
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) || isTimeout(err) {
+				logEntry.StatusCode, logEntry.ErrorCode = 504, "request_timeout"
+			}
+			writeError(w, protocol, logEntry.StatusCode, logEntry.ErrorCode, "invalid or timed out request body")
 			return
 		}
+		_ = controller.SetReadDeadline(time.Time{})
 		payload, err := parseRequestPayload(body)
 		if err != nil || strings.TrimSpace(payload.Model) == "" || strings.ContainsRune(payload.Model, '\x00') {
 			logEntry.StatusCode = http.StatusBadRequest
@@ -302,6 +287,9 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 
 		maxAttempts, err := h.repo.MaxAttempts(r.Context())
 		if err != nil {
+			if requestEnded() {
+				return
+			}
 			logEntry.StatusCode = http.StatusInternalServerError
 			logEntry.ErrorCode = "internal_error"
 			writeError(w, protocol, http.StatusInternalServerError, "internal_error", "gateway configuration unavailable")
@@ -314,6 +302,9 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 		}
 		candidates, err := h.repo.Candidates(r.Context(), key.GroupID, protocol, payload.Model)
 		if err != nil {
+			if requestEnded() {
+				return
+			}
 			logEntry.StatusCode = http.StatusInternalServerError
 			logEntry.ErrorCode = "internal_error"
 			writeError(w, protocol, http.StatusInternalServerError, "internal_error", "upstream routes unavailable")
@@ -335,6 +326,9 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 		allRateLimited, allTimedOut := len(eligible) > 0, len(eligible) > 0
 		bodies := requestBodies{body: body, model: originalModel}
 		for _, upstream := range eligible {
+			if requestEnded() {
+				return
+			}
 			attemptStarted := time.Now()
 			attempt := core.Attempt{UpstreamID: upstream.ID, UpstreamName: upstream.Name}
 			outBody, err := bodies.forModel(upstream.UpstreamModel(payload.Model))
@@ -353,9 +347,9 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							allRateLimited = allRateLimited && response.StatusCode == http.StatusTooManyRequests
 							allTimedOut = allTimedOut && response.StatusCode == http.StatusGatewayTimeout
 							if countsAsUpstreamFailure(response.StatusCode) {
-								h.markFailure(upstream.ID, response.StatusCode, attempt.Error)
+								h.markFailure(r.Context(), upstream.ID, response.StatusCode, attempt.Error, upstream.ConfigVersion)
 							}
-							drainAndClose(response.Body)
+							drainAndClose(r.Context(), response.Body)
 							continue
 						}
 						if payload.Stream {
@@ -363,7 +357,8 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							attempt.DurationMS = time.Since(attemptStarted).Milliseconds()
 							attempt.TTFBMS, attempt.TTFTMS = ttfbMS, ttftMS
 							if streamErr != nil {
-								attempt.Error = streamErr.Error()
+								attempt.Error = safeerr.Text(streamErr, upstream.APIKey)
+								attempt.FailureClass = failureClass(r.Context(), streamErr)
 							}
 							logEntry.Attempts = append(logEntry.Attempts, attempt)
 							if committed {
@@ -373,31 +368,41 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 								logEntry.TTFBMS, logEntry.TTFTMS = ttfbMS, ttftMS
 								if streamErr != nil && r.Context().Err() == nil && !errors.Is(streamErr, errClientClosed) {
 									logEntry.ErrorCode = "stream_interrupted"
-									h.markFailure(upstream.ID, response.StatusCode, streamErr.Error())
+									h.markFailure(r.Context(), upstream.ID, response.StatusCode, safeerr.Text(streamErr, upstream.APIKey), upstream.ConfigVersion)
 								} else if streamErr != nil {
 									logEntry.ErrorCode = "client_closed"
+									if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+										logEntry.ErrorCode = "request_timeout"
+									}
 								} else if streamErr == nil {
-									h.markSuccess(upstream)
+									h.markSuccess(r.Context(), upstream)
 								}
 								return
 							}
-							if r.Context().Err() != nil || errors.Is(streamErr, context.Canceled) {
+							if r.Context().Err() != nil || errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, errClientClosed) {
 								if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
 									logEntry.StatusCode = http.StatusGatewayTimeout
 									logEntry.ErrorCode = "request_timeout"
+									writeError(w, protocol, http.StatusGatewayTimeout, logEntry.ErrorCode, "gateway request timed out")
 								} else {
 									logEntry.StatusCode = 499
 									logEntry.ErrorCode = "client_closed"
 								}
 								return
 							}
-							h.markFailure(upstream.ID, 0, streamErr.Error())
+							h.markFailure(r.Context(), upstream.ID, 0, attempt.Error, upstream.ConfigVersion)
 							allRateLimited = false
 							allTimedOut = allTimedOut && isTimeout(streamErr)
 							continue
 						}
 
-						responseBody, ttfbMS, readErr := readResponseWithMetrics(r.Context(), response.Body, upstream.FirstByteTimeout, upstream.IdleTimeout, attemptStarted)
+						buffer := &responseBuffer{budget: &h.responseBudget, limit: h.limits.MaxBufferedResponseBytes}
+						responseBody, ttfbMS, readErr := readResponseWithMetrics(r.Context(), response.Body, upstream.FirstByteTimeout, upstream.IdleTimeout, attemptStarted, buffer)
+						if readErr == nil {
+							defer buffer.release()
+						} else {
+							buffer.release()
+						}
 						response.Body.Close()
 						if readErr == nil {
 							attempt.DurationMS = time.Since(attemptStarted).Milliseconds()
@@ -407,11 +412,25 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 							logEntry.StatusCode = response.StatusCode
 							logEntry.TTFBMS = ttfbMS
 							logEntry.Usage = parseUsageWithProtocol(responseBody, protocol)
-							h.markSuccess(upstream)
+							h.markSuccess(r.Context(), upstream)
+							if requestEnded() {
+								return
+							}
 							copyResponseHeaders(w.Header(), response.Header)
 							setGatewayHeaders(w.Header(), requestID, upstream.Name, len(logEntry.Attempts))
-							w.WriteHeader(response.StatusCode)
-							_, _ = w.Write(responseBody)
+							defer controller.SetWriteDeadline(time.Time{})
+							if err := setDownstreamDeadline(r.Context(), w, h.limits.DownstreamWriteTimeout); err == nil {
+								w.WriteHeader(response.StatusCode)
+								_, err = w.Write(responseBody)
+								if err == nil {
+									err = controller.Flush()
+								}
+								if err != nil {
+									logEntry.ErrorCode = "client_closed"
+								}
+							} else {
+								logEntry.ErrorCode = "client_closed"
+							}
 							return
 						}
 						attempt.TTFBMS = ttfbMS
@@ -421,18 +440,32 @@ func (h *Handler) proxy(protocol string) http.HandlerFunc {
 			}
 
 			attempt.DurationMS = time.Since(attemptStarted).Milliseconds()
-			attempt.Error = errorText(err)
+			attempt.Error = safeerr.Text(err, upstream.APIKey)
+			attempt.FailureClass = failureClass(r.Context(), err)
 			logEntry.Attempts = append(logEntry.Attempts, attempt)
 			allRateLimited = false
 			allTimedOut = allTimedOut && isTimeout(err)
 			if r.Context().Err() != nil {
 				logEntry.StatusCode = 499
 				logEntry.ErrorCode = "client_closed"
+				if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+					logEntry.StatusCode, logEntry.ErrorCode = http.StatusGatewayTimeout, "request_timeout"
+					writeError(w, protocol, http.StatusGatewayTimeout, logEntry.ErrorCode, "gateway request timed out")
+				}
 				return
 			}
-			h.markFailure(upstream.ID, 0, attempt.Error)
+			if errors.Is(err, errResponseBudget) {
+				logEntry.StatusCode, logEntry.ErrorCode = http.StatusServiceUnavailable, "response_budget_exceeded"
+				w.Header().Set("Retry-After", "1")
+				writeError(w, protocol, logEntry.StatusCode, logEntry.ErrorCode, "response memory budget exhausted")
+				return
+			}
+			h.markFailure(r.Context(), upstream.ID, 0, attempt.Error, upstream.ConfigVersion)
 		}
 
+		if requestEnded() {
+			return
+		}
 		status, code, message := http.StatusBadGateway, "bad_gateway", "all upstreams failed"
 		if allRateLimited {
 			status, code, message = http.StatusTooManyRequests, "rate_limit_exceeded", "all upstreams are rate limited"
@@ -471,6 +504,12 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	r = r.WithContext(requestCtx)
 	models, err := h.repo.AvailableModels(r.Context(), key)
+	if r.Context().Err() != nil {
+		if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+			writeError(w, core.ProtocolChat, http.StatusGatewayTimeout, "request_timeout", "gateway request timed out")
+		}
+		return
+	}
 	if err != nil {
 		writeError(w, core.ProtocolChat, http.StatusInternalServerError, "internal_error", "model list unavailable")
 		return
@@ -497,6 +536,24 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request, protocol string) (core.APIKey, bool) {
+	reject := func(status int, code, message string) {
+		// Authentication rejects before consuming the body. Do not let HTTP/1
+		// drain an unsent body before delivering the rejection or releasing the slot.
+		if r.ProtoMajor == 1 && r.Body != nil && r.Body != http.NoBody {
+			w.Header().Set("Connection", "close")
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+		writeError(w, protocol, status, code, message)
+	}
+
+	select {
+	case h.authSlots <- struct{}{}:
+		defer func() { <-h.authSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		reject(http.StatusTooManyRequests, "authentication_busy", "too many authentication requests")
+		return core.APIKey{}, false
+	}
 	token := ""
 	if protocol == core.ProtocolMessages {
 		token = strings.TrimSpace(r.Header.Get("X-Api-Key"))
@@ -508,647 +565,30 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request, protocol 
 		}
 	}
 	if token == "" {
-		writeError(w, protocol, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		reject(http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return core.APIKey{}, false
 	}
 	key, err := h.repo.Authenticate(r.Context(), token)
+	if r.Context().Err() != nil {
+		if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+			reject(http.StatusGatewayTimeout, "request_timeout", "gateway request timed out")
+		}
+		return core.APIKey{}, false
+	}
 	if err != nil {
 		if errors.Is(err, ErrInvalidAPIKey) {
-			writeError(w, protocol, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+			reject(http.StatusUnauthorized, "invalid_api_key", "invalid API key")
 		} else {
-			writeError(w, protocol, http.StatusInternalServerError, "internal_error", "authentication unavailable")
+			reject(http.StatusInternalServerError, "internal_error", "authentication unavailable")
 		}
 		return core.APIKey{}, false
 	}
 	if !key.Enabled {
-		writeError(w, protocol, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+		reject(http.StatusUnauthorized, "invalid_api_key", "invalid API key")
 		return core.APIKey{}, false
 	}
 	return key, true
 }
-
-func (h *Handler) client(upstream core.Upstream) *http.Client {
-	key := transportKey{upstream.ConnectTimeout, upstream.FirstByteTimeout, upstream.IdleTimeout}
-	if key.connect <= 0 {
-		key.connect = 5 * time.Second
-	}
-	if key.firstByte <= 0 {
-		key.firstByte = 180 * time.Second
-	}
-	if key.idle <= 0 {
-		key.idle = 90 * time.Second
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if client := h.transports[key]; client != nil {
-		return client
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if h.secure {
-		transport.Proxy = nil
-		transport.DialContext = (&netguard.Dialer{Timeout: key.connect}).DialContext
-	} else {
-		transport.DialContext = (&net.Dialer{Timeout: key.connect, KeepAlive: 30 * time.Second}).DialContext
-	}
-	transport.ResponseHeaderTimeout = key.firstByte
-	transport.IdleConnTimeout = key.idle
-	transport.MaxIdleConns = 200
-	transport.MaxIdleConnsPerHost = 100
-	transport.MaxConnsPerHost = 128
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	h.transports[key] = client
-	return client
-}
-
-func upstreamRequest(in *http.Request, upstream core.Upstream, body []byte, protocol string) (*http.Request, error) {
-	target, err := url.Parse(strings.TrimSpace(upstream.BaseURL))
-	if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
-		return nil, errors.New("invalid upstream URL")
-	}
-	path := in.URL.Path
-	if strings.HasSuffix(strings.TrimRight(target.Path, "/"), "/v1") && strings.HasPrefix(path, "/v1/") {
-		path = strings.TrimPrefix(path, "/v1")
-	}
-	target.Path = strings.TrimRight(target.Path, "/") + "/" + strings.TrimLeft(path, "/")
-	target.RawPath = ""
-	target.RawQuery = in.URL.RawQuery
-	out, err := http.NewRequestWithContext(in.Context(), in.Method, target.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	out.Header = filteredRequestHeaders(in.Header)
-	stripHopHeaders(out.Header)
-	out.Header.Del("Content-Length")
-	out.Header.Del("X-Api-Key")
-	out.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-	if upstream.UserAgent != "" {
-		out.Header.Set("User-Agent", upstream.UserAgent)
-	}
-	if protocol == core.ProtocolMessages {
-		out.Header.Set("X-Api-Key", upstream.APIKey)
-	}
-	return out, nil
-}
-
-type requestBodies struct {
-	body      []byte
-	model     string
-	rewritten map[string][]byte
-}
-
-type requestPayload struct {
-	Model  string
-	Stream bool
-}
-
-// Inspect top-level keys before forwarding the original bytes. Different JSON
-// implementations must not choose different model or stream values.
-func parseRequestPayload(body []byte) (requestPayload, error) {
-	var result requestPayload
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') {
-		return result, errors.New("request must be an object")
-	}
-	seenModel, seenStream := false, false
-	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return result, err
-		}
-		key, ok := token.(string)
-		if !ok {
-			return result, errors.New("invalid field")
-		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return result, err
-		}
-		switch {
-		case strings.EqualFold(key, "model"):
-			if key != "model" || seenModel {
-				return result, errors.New("ambiguous model field")
-			}
-			seenModel = true
-			if err := json.Unmarshal(value, &result.Model); err != nil {
-				return result, err
-			}
-		case strings.EqualFold(key, "stream"):
-			if key != "stream" || seenStream {
-				return result, errors.New("ambiguous stream field")
-			}
-			seenStream = true
-			if err := json.Unmarshal(value, &result.Stream); err != nil {
-				return result, err
-			}
-		}
-	}
-	if _, err := decoder.Token(); err != nil {
-		return result, err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return result, errors.New("trailing request data")
-	}
-	return result, nil
-}
-
-func (b *requestBodies) forModel(model string) ([]byte, error) {
-	if model == b.model {
-		return b.body, nil
-	}
-	if body, ok := b.rewritten[model]; ok {
-		return body, nil
-	}
-	body, err := replaceModel(b.body, model)
-	if err != nil {
-		return nil, err
-	}
-	if b.rewritten == nil {
-		b.rewritten = make(map[string][]byte)
-	}
-	b.rewritten[model] = body
-	return body, nil
-}
-
-func replaceModel(body []byte, model string) ([]byte, error) {
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-	encoded, err := json.Marshal(model)
-	if err != nil {
-		return nil, err
-	}
-	payload["model"] = encoded
-	return json.Marshal(payload)
-}
-
-func (h *Handler) relayStream(ctx context.Context, w http.ResponseWriter, response *http.Response, requestID, upstreamName string, attempts int, firstByteTimeout, idleTimeout time.Duration) (bool, core.Usage, error) {
-	committed, usage, _, _, err := h.relayStreamWithMetrics(ctx, w, response, requestID, upstreamName, attempts, firstByteTimeout, idleTimeout, "", time.Now())
-	return committed, usage, err
-}
-
-func (h *Handler) relayStreamWithMetrics(ctx context.Context, w http.ResponseWriter, response *http.Response, requestID, upstreamName string, attempts int, firstByteTimeout, idleTimeout time.Duration, protocol string, attemptStarted time.Time) (bool, core.Usage, *int64, *int64, error) {
-	defer response.Body.Close()
-	if firstByteTimeout <= 0 {
-		firstByteTimeout = 180 * time.Second
-	}
-	if idleTimeout <= 0 {
-		idleTimeout = 5 * time.Minute
-	}
-	type readResult struct {
-		n   int
-		err error
-	}
-	buffer := make([]byte, 32<<10)
-	results, acknowledge, done := make(chan readResult), make(chan struct{}), make(chan struct{})
-	defer close(done)
-	go func() {
-		for {
-			n, err := response.Body.Read(buffer)
-			select {
-			case results <- readResult{n: n, err: err}:
-			case <-done:
-				return
-			}
-			if n > 0 {
-				select {
-				case <-acknowledge:
-				case <-done:
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	committed := false
-	parser := sseUsageParser{protocol: protocol}
-	var ttfbMS, ttftMS *int64
-	timeout := firstByteTimeout
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for {
-		timer.Reset(timeout)
-		select {
-		case result := <-results:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			if result.n > 0 {
-				if ttfbMS == nil {
-					value := time.Since(attemptStarted).Milliseconds()
-					ttfbMS = &value
-				}
-				if !committed {
-					copyResponseHeaders(w.Header(), response.Header)
-					setGatewayHeaders(w.Header(), requestID, upstreamName, attempts)
-					w.Header().Del("Content-Length")
-					w.WriteHeader(response.StatusCode)
-					committed = true
-				}
-				parser.Feed(buffer[:result.n])
-				if ttftMS == nil && parser.HasText() {
-					value := time.Since(attemptStarted).Milliseconds()
-					ttftMS = &value
-				}
-				if _, err := w.Write(buffer[:result.n]); err != nil {
-					acknowledge <- struct{}{}
-					return true, parser.Usage(), ttfbMS, ttftMS, fmt.Errorf("%w: %v", errClientClosed, err)
-				}
-				acknowledge <- struct{}{}
-				if err := http.NewResponseController(w).Flush(); err != nil {
-					return true, parser.Usage(), ttfbMS, ttftMS, fmt.Errorf("%w: %v", errClientClosed, err)
-				}
-				timeout = idleTimeout
-			}
-			if result.err != nil {
-				if errors.Is(result.err, io.EOF) {
-					if !committed {
-						copyResponseHeaders(w.Header(), response.Header)
-						setGatewayHeaders(w.Header(), requestID, upstreamName, attempts)
-						w.WriteHeader(response.StatusCode)
-						committed = true
-					}
-					return committed, parser.Usage(), ttfbMS, ttftMS, nil
-				}
-				return committed, parser.Usage(), ttfbMS, ttftMS, result.err
-			}
-		case <-timer.C:
-			_ = response.Body.Close()
-			if committed {
-				return true, parser.Usage(), ttfbMS, ttftMS, upstreamTimeout("upstream stream idle timeout")
-			}
-			return false, parser.Usage(), ttfbMS, ttftMS, upstreamTimeout("upstream first byte timeout")
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			_ = response.Body.Close()
-			return committed, parser.Usage(), ttfbMS, ttftMS, ctx.Err()
-		}
-	}
-}
-
-func readResponse(ctx context.Context, body io.ReadCloser, firstByteTimeout, idleTimeout time.Duration) ([]byte, error) {
-	content, _, err := readResponseWithMetrics(ctx, body, firstByteTimeout, idleTimeout, time.Now())
-	return content, err
-}
-
-func readResponseWithMetrics(ctx context.Context, body io.ReadCloser, firstByteTimeout, idleTimeout time.Duration, started time.Time) ([]byte, *int64, error) {
-	if firstByteTimeout <= 0 {
-		firstByteTimeout = 180 * time.Second
-	}
-	if idleTimeout <= 0 {
-		idleTimeout = 5 * time.Minute
-	}
-	type readResult struct {
-		content []byte
-		err     error
-	}
-	results, done, acknowledge := make(chan readResult), make(chan struct{}), make(chan struct{})
-	defer close(done)
-	go func() {
-		buffer := make([]byte, 32<<10)
-		for {
-			n, err := body.Read(buffer)
-			content := buffer[:n]
-			select {
-			case results <- readResult{content: content, err: err}:
-			case <-done:
-				return
-			}
-			select {
-			case <-acknowledge:
-			case <-done:
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	content := make([]byte, 0)
-	var ttfbMS *int64
-	timeout := firstByteTimeout
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for {
-		timer.Reset(timeout)
-		select {
-		case result := <-results:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			if len(result.content) > 0 {
-				if ttfbMS == nil {
-					value := time.Since(started).Milliseconds()
-					ttfbMS = &value
-				}
-				if len(content)+len(result.content) > maxBodyBytes {
-					_ = body.Close()
-					return nil, ttfbMS, errors.New("upstream response exceeds 32 MiB")
-				}
-				content = append(content, result.content...)
-				timeout = idleTimeout
-			}
-			acknowledge <- struct{}{}
-			if result.err != nil {
-				if errors.Is(result.err, io.EOF) {
-					return content, ttfbMS, nil
-				}
-				return nil, ttfbMS, result.err
-			}
-		case <-timer.C:
-			_ = body.Close()
-			if len(content) == 0 {
-				return nil, ttfbMS, upstreamTimeout("upstream first byte timeout")
-			}
-			return nil, ttfbMS, upstreamTimeout("upstream response idle timeout")
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			_ = body.Close()
-			return nil, ttfbMS, ctx.Err()
-		}
-	}
-}
-
-func parseUsage(body []byte) core.Usage {
-	return parseUsageWithProtocol(body, "")
-}
-
-func parseUsageWithProtocol(body []byte, protocol string) core.Usage {
-	var payload struct {
-		Usage    json.RawMessage `json:"usage"`
-		Response struct {
-			Usage json.RawMessage `json:"usage"`
-		} `json:"response"`
-		Message struct {
-			Usage json.RawMessage `json:"usage"`
-		} `json:"message"`
-	}
-	if json.Unmarshal(body, &payload) != nil {
-		return core.Usage{}
-	}
-	if len(payload.Usage) == 0 {
-		payload.Usage = payload.Response.Usage
-	}
-	if len(payload.Usage) == 0 {
-		payload.Usage = payload.Message.Usage
-	}
-	if len(payload.Usage) == 0 {
-		return core.Usage{}
-	}
-	return parseUsageObjectForProtocol(payload.Usage, protocol)
-}
-
-type usageFields struct {
-	Input          *int64 `json:"input_tokens"`
-	Output         *int64 `json:"output_tokens"`
-	Prompt         *int64 `json:"prompt_tokens"`
-	Completion     *int64 `json:"completion_tokens"`
-	Cached         *int64 `json:"cached_input_tokens"`
-	CacheRead      *int64 `json:"cache_read_input_tokens"`
-	CacheCreation  *int64 `json:"cache_creation_input_tokens"`
-	PromptCacheHit *int64 `json:"prompt_cache_hit_tokens"`
-	InputDetails   struct {
-		Cached *int64 `json:"cached_tokens"`
-	} `json:"input_tokens_details"`
-	PromptDetails struct {
-		Cached *int64 `json:"cached_tokens"`
-	} `json:"prompt_tokens_details"`
-}
-
-func parseUsageObject(body []byte) core.Usage {
-	return parseUsageObjectForProtocol(body, "")
-}
-
-func parseUsageObjectForProtocol(body []byte, protocol string) core.Usage {
-	var fields usageFields
-	if json.Unmarshal(body, &fields) != nil {
-		return core.Usage{}
-	}
-	usage := core.Usage{InputTokens: fields.Input, OutputTokens: fields.Output, CachedInputTokens: fields.Cached, CacheCreationInputTokens: fields.CacheCreation}
-	if usage.InputTokens == nil {
-		usage.InputTokens = fields.Prompt
-	}
-	if usage.OutputTokens == nil {
-		usage.OutputTokens = fields.Completion
-	}
-	if usage.CachedInputTokens == nil {
-		usage.CachedInputTokens = fields.CacheRead
-	}
-	if usage.CachedInputTokens == nil {
-		usage.CachedInputTokens = fields.InputDetails.Cached
-	}
-	if usage.CachedInputTokens == nil {
-		usage.CachedInputTokens = fields.PromptDetails.Cached
-	}
-	if usage.CachedInputTokens == nil && protocol != core.ProtocolMessages {
-		usage.CachedInputTokens = fields.PromptCacheHit
-	}
-	return normalizeUsageForProtocol(usage, protocol)
-}
-
-func normalizeUsage(usage core.Usage) core.Usage {
-	return normalizeUsageForProtocol(usage, "")
-}
-
-func normalizeUsageForProtocol(usage core.Usage, protocol string) core.Usage {
-	if usage.InputTokens != nil {
-		uncached := *usage.InputTokens
-		if protocol == core.ProtocolMessages {
-			if usage.CacheCreationInputTokens != nil {
-				uncached += *usage.CacheCreationInputTokens
-			}
-		} else if usage.CachedInputTokens != nil {
-			uncached -= *usage.CachedInputTokens
-		}
-		if uncached < 0 {
-			uncached = 0
-		}
-		usage.UncachedInputTokens = &uncached
-	}
-	return usage
-}
-
-type sseUsageParser struct {
-	pending  []byte
-	discard  bool
-	usage    core.Usage
-	protocol string
-	textSeen bool
-}
-
-func (p *sseUsageParser) Feed(content []byte) {
-	for len(content) > 0 {
-		newline := bytes.IndexByte(content, '\n')
-		if newline < 0 {
-			p.append(content)
-			return
-		}
-		p.append(content[:newline])
-		if !p.discard {
-			p.parseLine(p.pending)
-		}
-		p.pending = p.pending[:0]
-		p.discard = false
-		content = content[newline+1:]
-	}
-}
-
-func (p *sseUsageParser) append(content []byte) {
-	if p.discard {
-		return
-	}
-	if len(p.pending)+len(content) > 1<<20 {
-		p.pending = p.pending[:0]
-		p.discard = true
-		return
-	}
-	p.pending = append(p.pending, content...)
-}
-
-func (p *sseUsageParser) parseLine(line []byte) {
-	line = bytes.TrimSpace(line)
-	if !bytes.HasPrefix(line, []byte("data:")) {
-		return
-	}
-	data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
-		return
-	}
-	var event struct {
-		Type     string          `json:"type"`
-		Delta    json.RawMessage `json:"delta"`
-		Usage    json.RawMessage `json:"usage"`
-		Response struct {
-			Usage json.RawMessage `json:"usage"`
-		} `json:"response"`
-		Message struct {
-			Usage json.RawMessage `json:"usage"`
-		} `json:"message"`
-		Choices []struct {
-			Text  string `json:"text"`
-			Delta struct {
-				Content json.RawMessage `json:"content"`
-			} `json:"delta"`
-		} `json:"choices"`
-	}
-	if json.Unmarshal(data, &event) != nil {
-		return
-	}
-	for _, raw := range []json.RawMessage{event.Usage, event.Response.Usage, event.Message.Usage} {
-		if len(raw) > 0 {
-			p.merge(parseUsageObjectForProtocol(raw, p.protocol))
-		}
-	}
-	if eventHasText(event.Type, event.Delta, event.Choices, p.protocol) {
-		p.textSeen = true
-	}
-}
-
-func eventHasText(eventType string, delta json.RawMessage, choices []struct {
-	Text  string `json:"text"`
-	Delta struct {
-		Content json.RawMessage `json:"content"`
-	} `json:"delta"`
-}, protocol string) bool {
-	switch protocol {
-	case core.ProtocolResponses:
-		return eventType == "response.output_text.delta" && rawString(delta) != ""
-	case core.ProtocolMessages:
-		if eventType != "content_block_delta" {
-			return false
-		}
-		var value struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		return json.Unmarshal(delta, &value) == nil && value.Type == "text_delta" && value.Text != ""
-	case core.ProtocolChat:
-		for _, choice := range choices {
-			if rawHasText(choice.Delta.Content) || choice.Text != "" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func rawString(raw json.RawMessage) string {
-	var value string
-	if json.Unmarshal(raw, &value) != nil {
-		return ""
-	}
-	return value
-}
-
-func rawHasText(raw json.RawMessage) bool {
-	if rawString(raw) != "" {
-		return true
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return false
-	}
-	for _, part := range parts {
-		if (part.Type == "text" || part.Type == "output_text" || part.Type == "") && part.Text != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *sseUsageParser) merge(usage core.Usage) {
-	if usage.InputTokens != nil {
-		p.usage.InputTokens = usage.InputTokens
-	}
-	if usage.OutputTokens != nil {
-		p.usage.OutputTokens = usage.OutputTokens
-	}
-	if usage.CachedInputTokens != nil {
-		p.usage.CachedInputTokens = usage.CachedInputTokens
-	}
-	if usage.CacheCreationInputTokens != nil {
-		p.usage.CacheCreationInputTokens = usage.CacheCreationInputTokens
-	}
-	if usage.UncachedInputTokens != nil {
-		p.usage.UncachedInputTokens = usage.UncachedInputTokens
-	}
-}
-
-func (p *sseUsageParser) Usage() core.Usage {
-	if !p.discard && len(p.pending) > 0 {
-		p.parseLine(p.pending)
-	}
-	p.pending = nil
-	return normalizeUsageForProtocol(p.usage, p.protocol)
-}
-
-func (p *sseUsageParser) HasText() bool { return p.textSeen }
 
 func retryStatus(status int) bool {
 	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusTooManyRequests || status >= 500
@@ -1178,83 +618,6 @@ func writeError(w http.ResponseWriter, protocol string, status int, code, messag
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": message, "type": code, "code": code}})
 }
 
-func setGatewayHeaders(header http.Header, requestID, upstream string, attempts int) {
-	header.Set("X-DAPI-Request-ID", requestID)
-	header.Set("X-DAPI-Upstream", upstream)
-	header.Set("X-DAPI-Attempts", strconv.Itoa(attempts))
-}
-
-func copyResponseHeaders(destination, source http.Header) {
-	for key := range destination {
-		if preservedGatewayHeader(key) {
-			continue
-		}
-		destination.Del(key)
-	}
-	for key, values := range source {
-		if blockedResponseHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			destination.Add(key, value)
-		}
-	}
-	stripHopHeaders(destination)
-}
-
-func preservedGatewayHeader(name string) bool {
-	switch http.CanonicalHeaderKey(name) {
-	case "X-Dapi-Request-Id", "X-Dapi-Upstream", "X-Dapi-Attempts",
-		"Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options",
-		"Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy":
-		return true
-	default:
-		return false
-	}
-}
-
-func blockedResponseHeader(name string) bool {
-	canonical := http.CanonicalHeaderKey(name)
-	if strings.HasPrefix(canonical, "Access-Control-") {
-		return true
-	}
-	switch canonical {
-	case "Set-Cookie", "Set-Cookie2", "Location", "Content-Security-Policy",
-		"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy", "Permissions-Policy", "Cross-Origin-Opener-Policy", "Strict-Transport-Security":
-		return true
-	default:
-		return false
-	}
-}
-
-func stripHopHeaders(header http.Header) {
-	for _, name := range strings.Split(header.Get("Connection"), ",") {
-		header.Del(strings.TrimSpace(name))
-	}
-	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		header.Del(name)
-	}
-}
-
-func drainAndClose(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
-	_ = body.Close()
-}
-
-func filteredRequestHeaders(source http.Header) http.Header {
-	destination := make(http.Header)
-	for _, name := range []string{
-		"Accept", "Accept-Encoding", "Cache-Control", "Content-Type", "Pragma", "User-Agent",
-		"X-Request-ID", "OpenAI-Organization", "OpenAI-Project", "OpenAI-Beta",
-		"Anthropic-Version", "Anthropic-Beta",
-	} {
-		for _, value := range source.Values(name) {
-			destination.Add(name, value)
-		}
-	}
-	return destination
-}
-
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
@@ -1264,7 +627,7 @@ func errorText(err error) string {
 	if err == nil {
 		return "upstream request failed"
 	}
-	return err.Error()
+	return safeerr.Text(err)
 }
 
 func clientIP(r *http.Request) string {
@@ -1288,7 +651,7 @@ func int64ptr(value int64) *int64 { return &value }
 func (h *Handler) record(entry core.RequestLog) {
 	if h.recorder != nil {
 		if !h.recorder.Submit(entry) {
-			h.recorder.rememberFlushError(h.recorder.flush([]core.RequestLog{entry}))
+			h.recorder.rememberFlushError(h.recorder.fallback(entry))
 		}
 		return
 	}
@@ -1299,15 +662,21 @@ func (h *Handler) record(entry core.RequestLog) {
 	}
 }
 
-func (h *Handler) markSuccess(upstream core.Upstream) {
-	state := h.lockUpstreamHealth(upstream.ID)
+func (h *Handler) markSuccess(parent context.Context, upstream core.Upstream) {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	state := h.lockUpstreamHealth(ctx, upstream.ID)
+	if state == nil {
+		return
+	}
 	defer h.unlockUpstreamHealth(upstream.ID, state)
 	if !needsSuccessWrite(upstream) && !state.pendingFailure {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := h.repo.MarkUpstreamSuccess(ctx, upstream.ID); err != nil {
+	if err := h.repo.MarkUpstreamSuccess(ctx, upstream); err != nil {
+		if errors.Is(err, core.ErrUpstreamConfigChanged) {
+			return
+		}
 		slog.Error("upstream success state write failed", "upstream_id", upstream.ID, "error", err)
 		return
 	}
@@ -1319,37 +688,62 @@ func needsSuccessWrite(upstream core.Upstream) bool {
 		upstream.HealthStatus == "healthy" && upstream.ConsecutiveFailure > 0
 }
 
-func (h *Handler) markFailure(upstreamID int64, status int, reason string) {
-	state := h.lockUpstreamHealth(upstreamID)
-	defer h.unlockUpstreamHealth(upstreamID, state)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func (h *Handler) markFailure(parent context.Context, upstreamID int64, status int, reason string, versions ...int64) {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
-	if err := h.repo.MarkUpstreamFailure(ctx, upstreamID, status, reason); err != nil {
+	state := h.lockUpstreamHealth(ctx, upstreamID)
+	if state == nil {
+		return
+	}
+	defer h.unlockUpstreamHealth(upstreamID, state)
+	upstream := core.Upstream{ID: upstreamID}
+	if len(versions) > 0 {
+		upstream.ConfigVersion = versions[0]
+	}
+	if err := h.repo.MarkUpstreamFailure(ctx, upstream, status, reason); err != nil {
+		if errors.Is(err, core.ErrUpstreamConfigChanged) {
+			return
+		}
 		slog.Error("upstream failure state write failed", "upstream_id", upstreamID, "status", status, "error", err)
 		return
 	}
 	state.pendingFailure = true
 }
 
-func (h *Handler) lockUpstreamHealth(upstreamID int64) *upstreamHealthState {
+func (h *Handler) lockUpstreamHealth(ctx context.Context, upstreamID int64) *upstreamHealthState {
+	// A per-upstream semaphore preserves failure/success ordering while allowing
+	// queued requests to leave when their total or health-write deadline expires.
 	h.healthMu.Lock()
 	state := h.health[upstreamID]
 	if state == nil {
-		state = &upstreamHealthState{}
+		state = &upstreamHealthState{lock: make(chan struct{}, 1)}
 		h.health[upstreamID] = state
 	}
 	state.references++
 	h.healthMu.Unlock()
-	state.mu.Lock()
-	return state
+	select {
+	case state.lock <- struct{}{}:
+		if ctx.Err() != nil {
+			h.unlockUpstreamHealth(upstreamID, state)
+			return nil
+		}
+		return state
+	case <-ctx.Done():
+		h.releaseUpstreamHealth(upstreamID, state)
+		return nil
+	}
 }
 
 func (h *Handler) unlockUpstreamHealth(upstreamID int64, state *upstreamHealthState) {
+	h.releaseUpstreamHealth(upstreamID, state)
+	<-state.lock
+}
+
+func (h *Handler) releaseUpstreamHealth(upstreamID int64, state *upstreamHealthState) {
 	h.healthMu.Lock()
 	state.references--
 	if state.references == 0 && !state.pendingFailure && h.health[upstreamID] == state {
 		delete(h.health, upstreamID)
 	}
 	h.healthMu.Unlock()
-	state.mu.Unlock()
 }

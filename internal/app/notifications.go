@@ -3,18 +3,20 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/gaoLfun/dapi/internal/ops"
+	"github.com/gaoLfun/dapi/internal/safeerr"
 	"github.com/gaoLfun/dapi/internal/store"
 )
 
 const (
 	notificationGroupWait   = 10 * time.Second
-	notificationBatchSize   = 50
+	notificationBatchSize   = 5
 	notificationMaxAttempts = 5
 )
 
@@ -53,13 +55,13 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 	if database == nil || delivery == nil {
 		return
 	}
-	run := func() {
+	run := func() bool {
 		jobs, err := database.ClaimNotificationJobs(ctx, notificationBatchSize)
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Error("notification outbox claim failed", "error", err)
 			}
-			return
+			return false
 		}
 		groups := make(map[notificationGroup][]store.NotificationJob)
 		order := make([]notificationGroup, 0, len(jobs))
@@ -67,7 +69,7 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 			var event ops.Event
 			if err := json.Unmarshal(job.Payload, &event); err != nil {
 				slog.Error("notification outbox payload invalid", "job_id", job.ID, "error", err)
-				if completeErr := database.CompleteNotification(ctx, job.ID); completeErr != nil {
+				if completeErr := database.CompleteNotification(ctx, job); completeErr != nil {
 					slog.Error("notification outbox invalid job cleanup failed", "job_id", job.ID, "error", completeErr)
 				}
 				continue
@@ -79,7 +81,17 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 			groups[key] = append(groups[key], job)
 		}
 		for _, key := range order {
-			jobs := groups[key]
+			deliveryCtx, cancelDelivery := context.WithTimeout(ctx, 20*time.Second)
+			jobs := make([]store.NotificationJob, 0, len(groups[key]))
+			for _, job := range groups[key] {
+				if err := database.RenewNotification(deliveryCtx, job); err != nil {
+					if !errors.Is(err, store.ErrNotificationLeaseLost) && ctx.Err() == nil {
+						slog.Error("notification lease renewal failed", "job_id", job.ID, "error", err)
+					}
+					continue
+				}
+				jobs = append(jobs, job)
+			}
 			events := make([]ops.Event, 0, len(jobs))
 			for _, job := range jobs {
 				var event ops.Event
@@ -88,8 +100,9 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 				}
 			}
 			if len(events) == 0 {
+				cancelDelivery()
 				for _, job := range jobs {
-					_ = database.CompleteNotification(ctx, job.ID)
+					_ = database.CompleteNotification(ctx, job)
 				}
 				continue
 			}
@@ -98,20 +111,24 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 			if channelDelivery, ok := delivery.(interface {
 				NotifyChannel(context.Context, int64, ops.Event) error
 			}); ok && key.ChannelID > 0 {
-				deliveryErr = channelDelivery.NotifyChannel(ctx, key.ChannelID, event)
+				deliveryErr = channelDelivery.NotifyChannel(deliveryCtx, key.ChannelID, event)
 			} else {
-				deliveryErr = delivery.Notify(ctx, event)
+				deliveryErr = delivery.Notify(deliveryCtx, event)
+			}
+			cancelDelivery()
+			if ctx.Err() != nil {
+				return false
 			}
 			if deliveryErr != nil {
 				for _, job := range jobs {
 					var updateErr error
 					if job.Attempts >= notificationMaxAttempts {
-						updateErr = database.DeadNotification(ctx, job.ID, deliveryErr.Error())
+						updateErr = database.DeadNotification(ctx, job, safeerr.Text(deliveryErr))
 						if updateErr == nil {
-							slog.Error("notification moved to dead-letter", "job_id", job.ID, "channel_id", job.ChannelID, "attempts", job.Attempts, "error", deliveryErr)
+							slog.Error("notification moved to dead-letter", "job_id", job.ID, "channel_id", job.ChannelID, "attempts", job.Attempts, "error", safeerr.Text(deliveryErr))
 						}
 					} else {
-						updateErr = database.FailNotification(ctx, job.ID, deliveryErr.Error(), time.Now().Add(notificationRetryDelay(job.Attempts)))
+						updateErr = database.FailNotification(ctx, job, safeerr.Text(deliveryErr), time.Now().Add(notificationRetryDelay(job.Attempts)))
 					}
 					if updateErr != nil {
 						slog.Error("notification outbox failure update failed", "job_id", job.ID, "error", updateErr)
@@ -120,22 +137,25 @@ func RunNotificationWorker(ctx context.Context, database *store.Store, delivery 
 				continue
 			}
 			for _, job := range jobs {
-				if err := database.CompleteNotification(ctx, job.ID); err != nil {
+				if err := database.CompleteNotification(ctx, job); err != nil {
 					slog.Error("notification outbox completion failed", "job_id", job.ID, "error", err)
 				}
 			}
 		}
+		return len(jobs) == notificationBatchSize
 	}
 
-	run()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for {
+	for ctx.Err() == nil {
+		// Drain full batches immediately; only sleep when the due queue is empty.
+		if run() {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			run()
 		}
 	}
 }

@@ -38,11 +38,11 @@ type blockingHealthRepository struct {
 	releaseFailure chan struct{}
 }
 
-func (r *blockingHealthRepository) MarkUpstreamFailure(ctx context.Context, id int64, status int, reason string) error {
+func (r *blockingHealthRepository) MarkUpstreamFailure(ctx context.Context, upstream core.Upstream, status int, reason string) error {
 	close(r.failureStarted)
 	select {
 	case <-r.releaseFailure:
-		return r.fakeRepository.MarkUpstreamFailure(ctx, id, status, reason)
+		return r.fakeRepository.MarkUpstreamFailure(ctx, upstream, status, reason)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -104,14 +104,16 @@ func (f *fakeRepository) RecordRequests(_ context.Context, entries []core.Reques
 	return nil
 }
 
-func (f *fakeRepository) MarkUpstreamSuccess(_ context.Context, id int64) error {
+func (f *fakeRepository) MarkUpstreamSuccess(_ context.Context, upstream core.Upstream) error {
+	id := upstream.ID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.successes = append(f.successes, id)
 	return nil
 }
 
-func (f *fakeRepository) MarkUpstreamFailure(_ context.Context, id int64, _ int, _ string) error {
+func (f *fakeRepository) MarkUpstreamFailure(_ context.Context, upstream core.Upstream, _ int, _ string) error {
+	id := upstream.ID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failures = append(f.failures, id)
@@ -162,13 +164,13 @@ func TestSuccessWritesAfterConcurrentFailureFromHealthySnapshot(t *testing.T) {
 	upstream := core.Upstream{ID: 7, HealthStatus: "healthy"}
 	failureDone := make(chan struct{})
 	go func() {
-		handler.markFailure(upstream.ID, http.StatusBadGateway, "failed")
+		handler.markFailure(context.Background(), upstream.ID, http.StatusBadGateway, "failed")
 		close(failureDone)
 	}()
 	<-repo.failureStarted
 	successDone := make(chan struct{})
 	go func() {
-		handler.markSuccess(upstream)
+		handler.markSuccess(context.Background(), upstream)
 		close(successDone)
 	}()
 	select {
@@ -179,7 +181,7 @@ func TestSuccessWritesAfterConcurrentFailureFromHealthySnapshot(t *testing.T) {
 	close(repo.releaseFailure)
 	<-failureDone
 	<-successDone
-	handler.markSuccess(upstream)
+	handler.markSuccess(context.Background(), upstream)
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
 	if len(repo.failures) != 1 || len(repo.successes) != 1 {

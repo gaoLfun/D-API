@@ -19,6 +19,7 @@ import (
 
 	"github.com/gaoLfun/dapi/internal/core"
 	"github.com/gaoLfun/dapi/internal/netguard"
+	"github.com/gaoLfun/dapi/internal/safeerr"
 )
 
 const (
@@ -92,7 +93,7 @@ func (p *Prober) CheckHealth(ctx context.Context, upstream core.Upstream) Health
 	started := time.Now()
 	result := Health{Status: "unhealthy", CheckedAt: started}
 	if err := acquireProbe(ctx, p.healthSlots); err != nil {
-		result.Error = err.Error()
+		result.Error = safeerr.Text(err, upstream.APIKey, upstream.AccessToken)
 		return result
 	}
 	defer releaseProbe(p.healthSlots)
@@ -100,12 +101,12 @@ func (p *Prober) CheckHealth(ctx context.Context, upstream core.Upstream) Health
 	result.Latency = time.Since(started)
 	result.StatusCode = status
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = safeerr.Text(err, upstream.APIKey, upstream.AccessToken)
 		return result
 	}
 	models, err := parseModels(body)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = safeerr.Text(err, upstream.APIKey, upstream.AccessToken)
 		return result
 	}
 	result.Status = "healthy"
@@ -174,7 +175,7 @@ func (p *Prober) testModelProtocol(ctx context.Context, upstream core.Upstream, 
 		err = parseModelContent(protocol, body, expected)
 	}
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = safeerr.Text(err, upstream.APIKey, upstream.AccessToken)
 		return result
 	}
 	result.Status = "success"
@@ -239,7 +240,7 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 		return core.Balance{Status: "unknown", Error: "missing upstream URL or API key", UpdatedAt: &now}
 	}
 	if err := acquireProbe(ctx, p.balanceSlots); err != nil {
-		return core.Balance{Status: "unavailable", Error: err.Error(), UpdatedAt: &now}
+		return core.Balance{Status: "unavailable", Error: safeerr.Text(err, upstream.APIKey, upstream.AccessToken), UpdatedAt: &now}
 	}
 	defer releaseProbe(p.balanceSlots)
 	key := balancePathKey(upstream)
@@ -258,12 +259,12 @@ func (p *Prober) CheckBalance(ctx context.Context, upstream core.Upstream) core.
 			return core.Balance{}, false
 		}
 		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
+			failures = append(failures, fmt.Sprintf("%s: %s", path, safeerr.Text(err, upstream.APIKey, upstream.AccessToken, credential)))
 			return core.Balance{}, false
 		}
 		balance, err := parse(body, now)
 		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
+			failures = append(failures, fmt.Sprintf("%s: %s", path, safeerr.Text(err, upstream.APIKey, upstream.AccessToken, credential)))
 			return core.Balance{}, false
 		}
 		if path == "/api/user/self" && upstream.AccessToken != "" && upstream.UserID != "" {
@@ -701,7 +702,7 @@ func parseTokenUsage(body []byte, now time.Time) (core.Balance, error) {
 	if (payload.Success != nil && !*payload.Success) || (payload.Code != nil && *payload.Code != 0) {
 		return core.Balance{}, errors.New("token usage rejected")
 	}
-	if payload.Data.Used == nil || *payload.Data.Used < 0 || (!payload.Data.Unlimited && (payload.Data.Available == nil || *payload.Data.Available < 0)) {
+	if payload.Data.Used == nil || *payload.Data.Used < 0 || (!payload.Data.Unlimited && (payload.Data.Available == nil)) {
 		return core.Balance{}, errors.New("token usage balance missing")
 	}
 	balance := successBalance(now)
@@ -732,7 +733,7 @@ func parseUserSelf(body []byte, now time.Time) (core.Balance, error) {
 	if (payload.Success != nil && !*payload.Success) || (payload.Code != nil && *payload.Code != 0) {
 		return core.Balance{}, errors.New("user balance rejected")
 	}
-	if payload.Data.Quota == nil || *payload.Data.Quota < 0 || (payload.Data.Used != nil && *payload.Data.Used < 0) {
+	if payload.Data.Quota == nil || (payload.Data.Used != nil && *payload.Data.Used < 0) {
 		return core.Balance{}, errors.New("user balance missing")
 	}
 	balance := successBalance(now)
@@ -787,7 +788,7 @@ func parseSub2APIUsage(body []byte, now time.Time) (core.Balance, error) {
 			used = payload.Usage.Total.Cost
 		}
 	}
-	if available == nil || *available < 0 || (used != nil && *used < 0) {
+	if available == nil || (used != nil && *used < 0) {
 		return core.Balance{}, errors.New("usage balance missing")
 	}
 	balance := successBalance(now)

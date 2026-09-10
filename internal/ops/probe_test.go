@@ -448,3 +448,24 @@ func TestLegacyBillingUsageRefreshesUsedAmount(t *testing.T) {
 		t.Fatal("legacy billing usage not refreshed")
 	}
 }
+
+func TestOverdraftBalancesRemainAvailableForProtection(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		parse      func([]byte, time.Time) (core.Balance, error)
+	}{
+		{"account", `{"success":true,"data":{"quota":-500000,"used_quota":1000000}}`, parseUserSelf},
+		{"token", `{"success":true,"data":{"total_available":-500000,"total_used":1000000}}`, parseTokenUsage},
+		{"sub2api", `{"remaining":-1,"unit":"USD"}`, parseSub2APIUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			balance, err := tc.parse([]byte(tc.body), time.Now())
+			if err != nil || balance.Status != "ok" || balance.Available == nil || *balance.Available != -1 {
+				t.Fatalf("balance=%+v err=%v", balance, err)
+			}
+		})
+	}
+	if _, err := parseTokenUsage([]byte(`{"success":true,"data":{"total_available":1,"total_used":-1}}`), time.Now()); err == nil {
+		t.Fatal("negative used quota accepted")
+	}
+}

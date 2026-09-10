@@ -47,13 +47,13 @@ func (r GatewayRepository) RecordRequests(ctx context.Context, entries []core.Re
 	return r.Store.RecordRequests(ctx, entries)
 }
 
-func (r GatewayRepository) MarkUpstreamSuccess(ctx context.Context, id int64) error {
-	_, err := r.Store.SaveHealth(ctx, id, true, "", false)
+func (r GatewayRepository) MarkUpstreamSuccess(ctx context.Context, upstream core.Upstream) error {
+	_, err := r.Store.SaveHealth(ctx, upstream.ID, true, "", false, upstream.ConfigVersion)
 	return err
 }
 
-func (r GatewayRepository) MarkUpstreamFailure(ctx context.Context, id int64, status int, reason string) error {
-	_, err := r.Store.SaveHealth(ctx, id, false, reason, status == http.StatusUnauthorized || status == http.StatusForbidden)
+func (r GatewayRepository) MarkUpstreamFailure(ctx context.Context, upstream core.Upstream, status int, reason string) error {
+	_, err := r.Store.SaveHealth(ctx, upstream.ID, false, reason, status == http.StatusUnauthorized || status == http.StatusForbidden, upstream.ConfigVersion)
 	return err
 }
 
@@ -66,14 +66,15 @@ func (r OpsRepository) ListUpstreams(ctx context.Context) ([]core.Upstream, erro
 	return r.Store.ListUpstreams(ctx)
 }
 
-func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Health) (string, string, error) {
+func (r OpsRepository) SaveHealth(ctx context.Context, upstream core.Upstream, health ops.Health) (string, string, error) {
+	id := upstream.ID
 	healthy := health.Status == "healthy"
-	status, _, err := r.Store.SaveProbeHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden)
+	status, _, err := r.Store.SaveProbeHealth(ctx, id, healthy, health.Error, health.StatusCode == http.StatusUnauthorized || health.StatusCode == http.StatusForbidden, upstream.ConfigVersion)
 	if err != nil {
 		return "", "", err
 	}
 	if healthy && health.Models != nil {
-		if err := r.Store.SaveDiscoveredModels(ctx, id, health.Models); err != nil {
+		if err := r.Store.SaveDiscoveredModels(ctx, id, health.Models, upstream.ConfigVersion); err != nil {
 			return "", "", err
 		}
 	}
@@ -81,7 +82,7 @@ func (r OpsRepository) SaveHealth(ctx context.Context, id int64, health ops.Heal
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	notification, err := r.Store.ObserveHealthNotification(ctx, id, status, interval)
+	notification, err := r.Store.ObserveHealthNotification(ctx, id, status, interval, upstream.ConfigVersion)
 	return status, notification, err
 }
 
@@ -89,8 +90,8 @@ func (r OpsRepository) AcknowledgeHealthNotification(ctx context.Context, id int
 	return r.Store.AcceptHealthNotification(ctx, id, status)
 }
 
-func (r OpsRepository) SaveBalance(ctx context.Context, id int64, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
-	return r.Store.SaveBalance(ctx, id, balance, immediate)
+func (r OpsRepository) SaveBalance(ctx context.Context, upstream core.Upstream, balance core.Balance, immediate bool) (core.BalanceTransition, error) {
+	return r.Store.SaveBalance(ctx, upstream.ID, balance, immediate, upstream.ConfigVersion)
 }
 
 func (r OpsRepository) SaveEvent(ctx context.Context, event ops.Event) error {
@@ -115,7 +116,7 @@ func (o Operations) Check(ctx context.Context, id int64) (ops.Health, error) {
 	if ctx.Err() != nil {
 		return ops.Health{}, ctx.Err()
 	}
-	if _, _, err := (OpsRepository{Store: o.Store}).SaveHealth(ctx, id, health); err != nil {
+	if _, _, err := (OpsRepository{Store: o.Store}).SaveHealth(ctx, upstream.Upstream, health); err != nil {
 		return ops.Health{}, err
 	}
 	return health, nil
@@ -138,7 +139,7 @@ func (o Operations) Balance(ctx context.Context, id int64) (core.Upstream, core.
 	if ctx.Err() != nil {
 		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, ctx.Err()
 	}
-	transition, err := o.Store.SaveBalance(ctx, id, balance, true)
+	transition, err := o.Store.SaveBalance(ctx, id, balance, true, upstream.ConfigVersion)
 	if err != nil {
 		return core.Upstream{}, core.Balance{}, core.BalanceUnchanged, err
 	}
