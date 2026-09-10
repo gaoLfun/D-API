@@ -9,6 +9,8 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 
 - 管理员先调用 `POST /api/admin/login`，服务通过 `HttpOnly` 的
   `dapi_session` Cookie 维持会话。
+  登录与改密并发时，已验证的旧密码不能创建仍有效的会话；若改密先完成，
+  登录返回 `401 invalid_credentials`，需要使用新密码重新登录。
 - 后续请求必须携带该 Cookie。浏览器跨站修改请求还必须有与当前 Host
   一致的 `Origin`；建议脚本始终发送 `Origin`。
 - 登录成功后不要把 Cookie 写入日志或命令历史。登出使用
@@ -48,6 +50,7 @@ D-API 的管理 API 供后台 SPA 和受信任的自动化脚本使用。它不�
 | `GET/POST/PUT/DELETE` | `/api/admin/alert-rules[/{id}]` | 告警规则 |
 | `GET/PUT` | `/api/admin/settings` | 路由最大尝试次数 |
 | `GET` | `/api/admin/pricing` | 价格档案和 USD/CNY 汇率 |
+| `GET` | `/api/admin/pricing/profiles/{id}` | 单个价格档案及当前生效的模型价格；管理员认证，不存在返回 404 |
 | `POST/PUT/DELETE` | `/api/admin/pricing/profiles[/{id}]` | 管理价格档案 |
 | `POST` | `/api/admin/pricing/refresh` | 同步 LiteLLM 价格 |
 | `POST` | `/api/admin/pricing/backfill` | 按历史有效价格回算未知请求成本 |
@@ -99,6 +102,11 @@ HTTP(S) URL 和指向回环、私网、链路本地、组播、CGNAT 或云元�
 
 成功创建返回 `201 {"id":123}`。列表只返回 `has_api_key`、
 `has_access_token`、`has_user_id` 等存在性标记，不返回明文凭据。
+
+健康检查、余额刷新和模型发现按发起时的配置版本保存结果。探测期间修改上游配置，
+迟到结果不会覆盖新配置的健康、余额保护或模型列表；手工操作返回
+`409 upstream_config_changed`，刷新列表后可重新操作。后台周期探测及在途代理的
+健康回写同样丢弃旧版本结果。版本号仅供服务内部使用。
 
 上游列表还会返回今日及生命周期的 `today_requests`、`today_tokens`、
 `today_cost_usd`、`today_cost_coverage`、`lifetime_requests`、
@@ -200,9 +208,26 @@ secret_unavailable`，必须重新创建。删除密钥会立即使其失效。
 ## 日志和用量
 
 `GET /api/admin/logs` 支持 `limit`（默认 50，最大 200）、`offset`、
-`status=success|error|5xx|429`、`upstream_id` 和 `group_id`。响应包含请求 ID、模型、
+`status=success|error|5xx|429|attempt_error`、`upstream_id` 和 `group_id`。响应包含请求 ID、模型、
 协议、状态、总耗时、TTFB、流式 TTFT、尝试链和可用 Token 字段；请求体和
 响应体不会存储。
+
+图表、用量与拓扑下钻还支持以下条件，可组合使用，均先筛选再分页：
+
+| 参数 | 含义 |
+| --- | --- |
+| `api_key_id` | 客户端密钥正整数 ID；非法值返回 `400/invalid_filter` |
+| `model` / `protocol` | 去除首尾空白后精确匹配；最大长度分别为 512 / 64 字节 |
+| `upstream_base_url` | 按用量报表的 Base URL 集群口径匹配最终上游，覆盖同集群的多个 Key；最大 2048 字节 |
+| `since` / `until` | 带时区的 RFC3339 时间，开始包含、结束不包含；无效时间或倒置范围返回 `400/invalid_time` |
+| `scope=attempts` | 上游 ID 匹配扩展到尝试链；与 `status=attempt_error` 配合追溯失败尝试 |
+
+集群筛选与用量统计统一按顺序去首尾空白、转小写、去查询/片段、去末尾斜杠，
+再移除 HTTP 的 80 或 HTTPS 的 443 默认端口；IPv6 保留方括号，非默认端口保留。
+该口径沿用整个 URL 转小写的规则，
+按当前上游配置关联，不是历史 URL 快照。超长筛选值返回 `400/invalid_filter`。
+小时下钻保留时间偏移，日/周/月使用 UTC，并将周/月窗口裁剪到实际报表范围；
+“其他”等无法精确定位的聚合不提供单维度下钻。新筛选同时适用于游标和旧数组接口。
 
 `GET /api/admin/usage` 支持：
 
@@ -316,3 +341,34 @@ UTC+8；未提供中文翻译的自定义详情会原样保留。
 ## 长期只读用量接口
 
 供 Paseo 插件查询的独立哈希凭据、`GET /api/readonly/usage`、管理员凭据管理接口及部署回滚步骤见 [只读用量接口](readonly-usage.md)。查询仅读取现有快照和 UTC 日聚合，不刷新余额或调用模型。
+
+## 运行状态、死信和价格摘要
+
+- `GET /api/admin/metrics`：管理员会话认证；返回 `gateway`（活跃请求、正文预留/上限、日志队列/累计丢弃）、`database`（连接使用、累计等待次数/毫秒）、`notifications`（pending/dead）。计数为进程累计值，重启归零；通知数量来自数据库。
+- `GET /api/admin/notifications/dead?offset=0`：每页最多 50 条，包含 ID、渠道、尝试次数、脱敏错误、停止时间和 `retryable`。不返回消息正文或渠道配置。
+- `POST /api/admin/notifications/{id}/retry`：将仍存在且启用渠道的死信原子地重新排队并记审计。成功返回 `{"queued":true}`；已重试、渠道停用/删除返回 409。重新排队会实际再次发送通知，外部渠道仍具有至少一次投递语义。
+- `GET /api/admin/pricing?summary=true`：只返回价格档案元数据和 `model_count`；默认接口保留完整 `prices`，编辑档案时按需获取。
+
+`logs?status=error` 包含 HTTP 200 但 `error_code` 非空的流式失败；`status=success` 仅包含 2xx/3xx 且无错误。`status=attempt_error` 与上游告警共用失败判定，排除明确的客户端断开和网关总超时。
+
+历史回算除补齐未知成本外，会修正 `pricing_version<2` 的 Messages 请求费用。对已知成本，仅当当前绑定档案的历史价格能复现旧公式金额（允许数据库舍入误差）时修正；无法核验的金额保留原值。修正把成本差额同步到保留的日/小时/生命周期汇总；重复调用不重复加减。仅处理仍保留原始日志的指定日期窗口（最多 365 天）；不会在启动时自动改历史账目。
+
+运维指标 `gateway` 新增：`buffered_response_bytes`、`buffered_response_limit`（非流式响应缓冲容量）；`log_fallback_active`、`log_fallback_waiting`（当前日志同步写入/等待数）；`log_fallback_count`、`log_fallback_rejected`（累计回退/容量拒绝）；`log_fallback_wait_ms`、`log_fallback_duration_ms`（累计排队/含排队总耗时）。容量拒绝已包含在 `dropped_request_logs` 中，不能重复相加。
+
+价格编辑通过 `GET /api/admin/pricing/profiles/{id}` 获取单个档案对象，不再下载全部档案价格。加载中禁止保存；切换、关闭、卸载会取消旧详情并忽略迟到响应。
+
+
+## 稳定分页与后台任务指标
+
+日志与通知死信均支持游标模式：
+
+- 首次：`GET /api/admin/logs?pagination=cursor&limit=50` 或 `GET /api/admin/notifications/dead?pagination=cursor`。
+- 返回 `{"items":[],"next_cursor":""}`；`next_cursor` 非空时，下一页将其作为 `cursor` 参数传回，并保持原筛选条件。空字符串表示没有下一页。
+- 日志按 `(created_at,id)`、死信按 `(dead_at,id)` 倒序。游标保持数据库时间精度，客户端应视为不透明字符串；无效值返回 `400/invalid_cursor`。
+- 未指定 `pagination=cursor` 或 `cursor` 时，仍返回数组并支持原 `offset`。游标模式忽略 offset，不提供总页数；返回首页可获取最新记录。该模式不是跨页数据库快照，历史记录被清理或死信被重试后会自然消失。
+
+`gateway.transport_cache_entries` / `transport_cache_limit` 显示当前 HTTP 客户端配置缓存数量/上限（32）。淘汰和停机关闭空闲连接，在途响应不被关闭。
+
+`cleanup` 返回最近清理轮次的 `started_at`、`duration_ms`、`skipped` 和 `tables`。每张表包括 `table`、`deleted`、`duration_ms`、`budget_exhausted`、`failed`；预算耗尽表示仍需后续清理，不是积压总量。`skipped=true` 表示本实例因其他实例持有锁而跳过。
+
+通知任务以单调递增的租约版本领取；完成、失败、死信、续租均校验版本及有效期。手动重试也推进版本，避免尝试次数重置后旧 worker 回写。每批预领 5 条，满批立即继续；发送前续租 60 秒，续租和投递合计受 20 秒时限限制。通知仍为至少一次投递，远端已接收但确认落库失败时可能重复；本地租约不能保证外部发送恰好一次。

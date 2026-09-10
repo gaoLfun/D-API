@@ -4,6 +4,16 @@ All notable changes to D-API will be documented in this file. The format is base
 
 ## Unreleased
 
+### Reliability and maintenance
+
+- 修复代理总超时空 200、错误正文阻塞切换和慢客户端长期占用；增加请求体预算。
+- 修复 Messages 缓存写入重复计价，保留缓存命中率口径，支持版本化、幂等的历史差额修正。
+- 统一 Webhook、探测和网关持久化错误脱敏；修复登录限流过期清理并限制容量。
+- 识别 SSE 失败/不完整终止，统一告警、日志失败筛选，区分客户端断开和上游失败。
+- 数据库按版本迁移；日/小时汇总独立保留；新增运行指标及通知死信查看/重试。
+- 管理台按操作设置超时、支持模拟取消、允许透支余额并明确未知币种；价格摘要按需加载、统计短缓存和 SQL 汇总。
+- 拆分网关/管理 API/前端模块，明确接口类型；CI 加入浏览器流程、插件检查和 govulncheck，插件依赖接入 Dependabot。
+
 ### Added
 
 - 错误率告警保存统计快照与失败请求标识，支持从告警历史查看对应窗口的上游失败尝试；明确首次、持续、再次触发与恢复提醒。
@@ -23,7 +33,7 @@ All notable changes to D-API will be documented in this file. The format is base
   hashed source versions and atomic updates that preserve existing prices on
   download or parse failures.
 - Historical cost backfill for unknown request costs, limited to 365 days and
-  preserving existing cost values and retained aggregates.
+  preserving unrelated existing costs and retained aggregates; legacy Messages costs receive versioned delta corrections.
 - Dashboard topology view for inspecting client keys, group decisions, and
   normalized upstream clusters alongside the existing upstream status table.
 - Per-upstream balance protection that pauses exhausted routes, automatically

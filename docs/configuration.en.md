@@ -43,7 +43,12 @@ command documented in [Deployment](deployment.en.md).
 | `DAPI_ADDR` | `:8080` | Address used by the Go HTTP server |
 | `DAPI_WEB_DIR` | `web/dist` | Directory containing the built admin SPA |
 | `DAPI_SESSION_TTL` | `24h` | Administrator session lifetime |
-| `DAPI_LOG_RETENTION` | `720h` | Request-log retention; cleanup runs daily |
+| `DAPI_LOG_RETENTION` | `720h` | Raw request, audit and alert log retention |
+| `DAPI_DAILY_USAGE_RETENTION` | `8760h` | Independent daily rollup retention |
+| `DAPI_HOURLY_USAGE_RETENTION` | `2160h` | Independent hourly rollup retention |
+| `DAPI_DOWNSTREAM_WRITE_TIMEOUT` | `30s` | Per-write/flush limit, bounded by the request deadline |
+| `DAPI_MAX_BUFFERED_RESPONSE_BYTES` | `536870912` | Shared capacity budget for buffered non-stream responses, including old and new allocations while growing |
+| `DAPI_MAX_BUFFERED_REQUEST_BYTES` | `536870912` | Weighted request-body reservation budget in bytes |
 | `DAPI_HEALTH_INTERVAL` | `30s` | Automatic upstream health-check interval |
 | `DAPI_BALANCE_INTERVAL` | `10m` | Automatic balance-check interval |
 | `DAPI_TRUST_PROXY` | `false` | Trust a valid `X-Real-IP` supplied by the immediate proxy |
@@ -139,8 +144,9 @@ The following values are stored in PostgreSQL rather than environment variables:
 - Maximum upstream attempts per request (1 to 5, default 3)
 - Notification channels and alert rules
 
-The built-in cleanup job runs once per day and removes request logs, daily usage,
-audit entries, alert events, and expired sessions older than `DAPI_LOG_RETENTION`.
+Cleanup runs at startup and hourly, with an advisory lock per database schema to coordinate replicas. Each table has a 15-second budget; batches delete at most 1,000 rows and yield for 25ms. Unfinished work resumes in the next round. The job applies `DAPI_LOG_RETENTION` to raw request, audit and alert logs.
+Daily and hourly rollups use their independent retention settings; sessions use their expiry time.
+Latency statistics become unavailable after raw logs are removed, while retained rollups remain usable.
 Cleanup is best effort and does not replace PostgreSQL backups or partitioning
 for very large installations.
 
@@ -152,3 +158,9 @@ do not retain Access Token or User ID values.
 
 `DAPI_TEST_DATABASE_URL` enables PostgreSQL integration tests. Tests create an
 isolated schema inside that database and skip when the variable is absent.
+
+Body reservations use eight times Content-Length to account for parsing and model rewrites. Unknown lengths reserve eight times the 32 MiB body limit, so the default budget admits two such requests concurrently. Exhaustion returns 429. This is a buffer budget, not a process RSS limit.
+
+Non-stream responses reserve buffer capacity as they grow. Budget exhaustion returns `503/response_budget_exceeded` with `Retry-After: 1`, without retrying or penalizing an upstream. Reservations are released on success, read/write failure, and cancellation. The per-response limit remains 32 MiB. This is a buffer-capacity budget, not a total RSS limit.
+
+When the request-log queue is full, synchronous fallback permits at most four writers and 64 waiting callers, with a 100 ms queue wait limit. Exhausted capacity, wait timeouts, or recorder shutdown count the record as dropped. Metrics expose active/waiting fallback callers, attempts, rejected records, accumulated wait time, and total fallback duration. Database outages can still cause log loss.
