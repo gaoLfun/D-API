@@ -40,6 +40,7 @@ jobs:
       - run: go test ./...
       - run: go vet ./...
       - run: go test -race ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
   frontend:
     runs-on: ubuntu-latest
@@ -56,6 +57,30 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - run: npm audit --audit-level=high
+      - run: npx playwright install --with-deps chromium
+      - run: npm run visual
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-test-results
+          path: web/test-results/
+
+  plugin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/paseo-relay-usage
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: plugins/paseo-relay-usage/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
       - run: npm audit --audit-level=high
 
   docker:
