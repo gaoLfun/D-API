@@ -59,3 +59,33 @@ describe('request', () => {
     }
   })
 })
+
+describe('operation timeouts', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+  it('模型测试超过十五秒仍继续，调用方仍可取消', async () => {
+    vi.useFakeTimers()
+    const caller = new AbortController()
+    let signal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_path, options: RequestInit) => {
+      signal = options.signal as AbortSignal
+      return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal?.reason), { once: true }))
+    }))
+    const pending = request('/api/admin/upstreams/test-model', { signal: caller.signal })
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(16_000)
+    expect(signal?.aborted).toBe(false)
+    caller.abort()
+    await assertion
+  })
+  it('封装允许覆盖超时', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_path, options: RequestInit) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+    })))
+    const { api } = await import('./api')
+    const pending = api.post('/api/admin/pricing/backfill', {}, { timeoutMs: 25 })
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' })
+    await vi.advanceTimersByTimeAsync(26)
+    await assertion
+  })
+})

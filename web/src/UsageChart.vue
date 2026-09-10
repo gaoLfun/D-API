@@ -3,38 +3,15 @@ import {
   BarController, BarElement, CategoryScale, Chart, Legend, LinearScale,
   LineController, LineElement, PointElement, Tooltip,
 } from 'chart.js'
+import type { ChartConfiguration, Plugin } from 'chart.js'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-interface UsageRow {
-  day?: string
-  hour?: string
-  date?: string
-  label?: string
-  dimension?: string
-  dimension_label?: string
-  upstream_name?: string
-  api_key_name?: string
-  protocol?: string
-  model?: string
-  requests?: number
-  successes?: number
-  tokens?: number
-  input_tokens?: number
-  output_tokens?: number
-  cached_input_tokens?: number
-  cache_creation_input_tokens?: number
-  cache_read_tokens?: number
-  cache_write_tokens?: number
-  avg_duration_ms?: number
-  average_duration_ms?: number
-  p95_duration_ms?: number
-  p95_ms?: number
-  cost_usd?: number
-}
+import { reducedMotion } from './motion'
+import type { UsageRow } from './types'
 
 type UsageMetric = 'overview' | 'requests' | 'tokens' | 'latency' | 'cache' | 'cost'
 
-const props = withDefaults(defineProps<{ rows: UsageRow[]; theme: 'light' | 'dark'; rangeLabel?: string; metric?: UsageMetric }>(), {
+const props = withDefaults(defineProps<{ rows: UsageRow[]; theme: 'light' | 'dark'; rangeLabel?: string; metric?: UsageMetric; selected?: UsageRow | null }>(), {
   rangeLabel: '近期',
   metric: 'overview',
 })
@@ -42,6 +19,21 @@ const chartLabel = computed(() => {
   const metric = { overview: '请求与 Token', requests: '请求与成功', tokens: '输入、输出与缓存 Token', cache: '缓存读写 Token', latency: '平均与 P95 耗时', cost: '估算成本' }[props.metric]
   return `${props.rangeLabel}${metric}趋势图；详细数据见下方明细表`
 })
+const emit = defineEmits<{ select: [row: UsageRow | null] }>()
+const rowKey = (row: UsageRow) => JSON.stringify([row.hour || row.day || row.date, row.upstream_id, row.api_key_id, row.group_id, row.group_name, row.upstream_name, row.api_key_name, row.protocol, row.model, row.label, row.dimension_label])
+const selectedIndex = computed(() => props.selected ? props.rows.findIndex(row => rowKey(row) === rowKey(props.selected!)) : -1)
+function selectIndex(index: number) { emit('select', props.rows[index] || null) }
+const selectionLine: Plugin = {
+ id: 'selectionLine',
+ afterDatasetsDraw(chart) {
+  const index = selectedIndex.value
+  if (index < 0 || !chart.scales.x) return
+  const x = chart.scales.x.getPixelForValue(index)
+  const { ctx, chartArea } = chart
+  ctx.save(); ctx.strokeStyle = color('--accent', '#176d4f'); ctx.lineWidth = 1.5; ctx.setLineDash([4, 3])
+  ctx.beginPath(); ctx.moveTo(x, chartArea.top); ctx.lineTo(x, chartArea.bottom); ctx.stroke(); ctx.restore()
+ },
+}
 const canvas = ref<HTMLCanvasElement | null>(null)
 let chart: Chart | null = null
 let renderSequence = 0
@@ -159,16 +151,20 @@ async function renderChart() {
   await nextTick()
   await document.fonts.ready
   if (sequence !== renderSequence || !canvas.value) return
-  chart?.destroy()
-  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches
+  const reduceMotion = reducedMotion()
   Chart.defaults.font.family = getComputedStyle(document.body).fontFamily
-  chart = new Chart(canvas.value, {
+  const config: ChartConfiguration = {
+    plugins: [selectionLine],
     type: 'bar',
     data: {
       labels: props.rows.map(rowLabel),
       datasets: datasets(),
     },
     options: {
+      onClick: (event, elements) => {
+        if (!elements.length || !event.native) return
+        selectIndex(elements[0]!.index)
+      },
       responsive: true,
       maintainAspectRatio: false,
       animation: reduceMotion ? false : { duration: 260 },
@@ -239,20 +235,42 @@ async function renderChart() {
         },
       },
     },
-  })
+  }
+  if (chart) {
+    const hidden = new Map(chart.data.datasets.map((dataset, index) => [dataset.label, !chart!.isDatasetVisible(index)]))
+    chart.data = config.data
+    chart.options = config.options || {}
+    chart.data.datasets.forEach((dataset,index) => chart!.setDatasetVisibility(index, !hidden.get(dataset.label)))
+    chart.update(reduceMotion ? 'none' : undefined)
+  } else { chart = new Chart(canvas.value, config) }
 }
 
-onMounted(renderChart)
+const motionPreference = matchMedia('(prefers-reduced-motion: reduce)')
+onMounted(() => { void renderChart(); motionPreference.addEventListener('change', renderChart) })
+watch(selectedIndex, () => chart?.draw())
 watch(() => [props.rows, props.theme, props.metric], renderChart, { deep: true })
 onBeforeUnmount(() => {
   renderSequence++
+  motionPreference.removeEventListener('change', renderChart)
   chart?.destroy()
   chart = null
 })
 </script>
 
 <template>
-  <canvas ref="canvas" role="img" :aria-label="chartLabel">
-    {{ chartLabel }}。
-  </canvas>
+  <div class="usage-chart">
+    <div class="chart-canvas"><canvas ref="canvas" role="img" :aria-label="chartLabel">{{ chartLabel }}。</canvas></div>
+    <div class="chart-selection-control">
+      <label>定位时间<select aria-label="定位图表时间" :value="selectedIndex" @change="selectIndex(Number(($event.target as HTMLSelectElement).value))"><option :value="-1">选择时间，查看明细</option><option v-for="(row, index) in rows" :key="rowKey(row)" :value="index">{{ row.hour ? new Date(row.hour).toLocaleString('zh-CN') : (row.day || row.date || '').slice(0, 10) }} · {{ row.label || row.dimension_label || row.upstream_name || row.api_key_name || row.group_name || row.model || row.protocol || '全部' }}</option></select></label>
+      <button v-if="selectedIndex >= 0" class="text-button" @click="selectIndex(-1)">清除定位</button>
+    </div>
+  </div>
 </template>
+<style scoped>
+.usage-chart { height:100%; display:flex; flex-direction:column; min-width:0; }
+.chart-canvas { position:relative; flex:1; min-height:0; }
+.chart-selection-control { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:8px; padding-top:8px; font-size:12px; }
+.chart-selection-control label { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:8px; min-width:0; white-space:nowrap; }
+.chart-selection-control select { min-height:30px; padding:4px 8px; max-width:280px; min-width:0; width:100%; }
+@media(max-width:640px) { .chart-selection-control select { max-width:100%; } }
+</style>

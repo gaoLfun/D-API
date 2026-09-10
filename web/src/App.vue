@@ -8,6 +8,15 @@ import {
   ShieldCheck, Sun, Trash2, Upload, Webhook, X,
 } from 'lucide-vue-next'
 import { ApiError, api, listOf } from './api'
+import { usePricing } from './usePricing'
+import { useCursorPage } from './useCursorPage'
+import LoadNotice from './LoadNotice.vue'
+import Collapse from './Collapse.vue'
+import { vChangeGlow, retireOverlay, activateOverlay, reducedMotion } from './motion'
+import { usageWindow, reportWindow, clipWindow } from './drilldown'
+import { balanceRank, maxBalanceUpstream, fmtBalance, groupBalance, groupBalanceMeta, fmtBalanceUsed, balanceUsedUpdatedAt } from './balance'
+import { fmtDate, fmtNumber, fmtMetric, fmtDuration, fmtCurrency, fmtPercent } from './format'
+const OperationsPanel = defineAsyncComponent(() => import('./OperationsPanel.vue'))
 const UsageChart = defineAsyncComponent(() => import('./UsageChart.vue'))
 import {
   COMMON_UPSTREAM_MODELS, DEFAULT_UPSTREAM_PROTOCOLS, UPSTREAM_PROTOCOLS, bulkSetModels, connectionTestText, modelBatchSelection,
@@ -18,146 +27,8 @@ import type { UpstreamUserAgentMode } from './upstream-form'
 type View = 'dashboard' | 'groups' | 'upstreams' | 'keys' | 'logs' | 'usage' | 'channels' | 'settings'
 type Theme = 'auto' | 'light' | 'dark'
 type CCSwitchApp = 'claude' | 'codex' | 'gemini'
-type Json = Record<string, any>
 
-interface Upstream {
-  id: number
-  name: string
-  kind: 'newapi' | 'sub2api'
-  base_url: string
-  user_agent?: string
-  enabled: boolean
-  balance_protection_enabled?: boolean
-  balance_suspended?: boolean
-  zero_balance_checks?: number
-  priority: number
-  protocols: string[]
-  models: string[]
-  models_locked?: boolean
-  pricing_profile_id?: number
-  model_aliases: Record<string, string>
-  connect_timeout_ms?: number
-  first_byte_timeout_ms?: number
-  idle_timeout_ms?: number
-  failure_threshold: number
-  cooldown_seconds?: number
-  health_status: string
-  consecutive_failures?: number
-  circuit_open_until?: string
-  last_check_at?: string
-  last_error?: string
-  today_requests?: number
-  today_tokens?: number
-  today_cost_usd?: number
-  today_cost_coverage?: number
-  lifetime_requests?: number
-  lifetime_cost_usd?: number
-  lifetime_cost_coverage?: number
-  balance?: { status?: string; available?: number; used?: number; currency?: string; unlimited?: boolean; updated_at?: string; last_success_at?: string }
-}
-
-interface UpstreamGroup {
-  key: string
-  base_url: string
-  items: Upstream[]
-  priority: number
-  total: number
-  healthy: number
-  enabled: number
-  available: number
-  balance_suspended: number
-  circuit_open: number
-  protocols: string[]
-  models: string[]
-  today_requests: number
-  today_tokens: number
-  last_check_at?: string
-}
-
-interface ClientKey {
-  id: number
-  name: string
-  prefix?: string
-  key_prefix?: string
-  enabled: boolean
-  protocols: string[]
-  models: string[]
-  last_used_at?: string
-  created_at: string
-  group_id: number
-  group_name?: string
-}
-
-interface Group {
-  id: number
-  name: string
-  enabled: boolean
-  upstream_ids: number[]
-  key_count: number
-  created_at: string
-  updated_at: string
-}
-
-interface RequestLog {
-  id?: number
-  request_id: string
-  upstream_id?: number
-  upstream_name?: string
-  group_name?: string
-  api_key_name?: string
-  protocol: string
-  model: string
-  status_code: number
-  duration_ms: number
-  ttfb_ms?: number | null
-  ttft_ms?: number | null
-  attempts: Array<{ upstream_id?: number; upstream_name?: string; status_code?: number; error?: string; duration_ms?: number; ttfb_ms?: number | null; ttft_ms?: number | null }>
-  usage?: {
-    input_tokens?: number
-    output_tokens?: number
-    cached_input_tokens?: number
-    cache_creation_input_tokens?: number
-    uncached_input_tokens?: number
-  }
-  error_code?: string
-  cost_usd?: number
-  created_at: string
-}
-
-interface Channel {
-  id: number
-  name: string
-  kind: 'email' | 'webhook'
-  enabled: boolean
-  created_at?: string
-}
-
-interface AlertRule {
-  id: number
-  event: string
-  upstream_id?: number
-  threshold: number
-  window_seconds: number
-  cooldown_seconds: number
-  max_notifications: number
-  enabled: boolean
-}
-
-interface ModelProtocolResult {
-  protocol: string
-  status: 'success' | 'degraded' | 'failed'
-  status_code?: number
-  latency_ms: number
-  ping_latency_ms?: number
-  error?: string
-}
-
-interface ModelTestReport {
-  model: string
-  status: 'available' | 'partial' | 'unavailable'
-  results: ModelProtocolResult[]
-  error?: string
-}
+import type { Upstream, UpstreamGroup, ClientKey, Group, RequestLog, Channel, AlertRule, ModelProtocolResult, ModelTestReport, UsageRow, UsageReport, Dashboard, PricingData, PricingProfile, ModelPrice, KeySecret, ProbeResult } from './types'
 
 const navItems = [
   { id: 'dashboard' as View, label: '总览', icon: LayoutDashboard },
@@ -203,7 +74,7 @@ const expandedMobileRow = ref('')
 const sortState = reactive<Record<string, { key: string; direction: 1 | -1 }>>({})
 
 const auth = ref<'checking' | 'guest' | 'ready'>('checking')
-const admin = ref<Json>({})
+const admin = ref<{ username?: string }>({})
 const loginForm = reactive({ username: '', password: '' })
 const loginError = ref('')
 const loginBusy = ref(false)
@@ -221,22 +92,28 @@ const refreshError = ref('')
 let dashboardRangeController: AbortController | null = null
 let dashboardRangeSequence = 0
 
-const dashboard = ref<Json>({})
-const dashboardCostRows = ref<Json[]>([])
-const dashboardRangeUsage = ref<Json[]>([])
-const pricing = ref<Json>({})
-const pricingModal = ref(false)
-const editingPricing = ref<number | null>(null)
-const pricingForm = reactive({ name: '', provider: '', source_url: '', source_version: 'custom', prices: '' })
+const dashboard = ref<Dashboard>({})
+const dashboardCostRows = ref<UsageRow[]>([])
+const dashboardRangeUsage = ref<UsageRow[]>([])
+const saving = ref(false)
+const { pricingLoading, closePricingProfile, pricing, pricingModal, editingPricing, pricingForm, refreshPricing, backfillPricing, openPricingProfile, savePricingProfile, removePricingProfile, pricingProfileName } = usePricing({ saving, notify, requestConfirmation, loadCurrent })
 const dashboardRange = ref<'24h' | '7d' | '30d'>(['24h', '7d', '30d'].includes(readStored('dapi-dashboard-range') || '') ? readStored('dapi-dashboard-range') as '24h' | '7d' | '30d' : '24h')
 const dashboardMetric = ref<'requests' | 'tokens' | 'cache' | 'cost'>(['requests', 'tokens', 'cache', 'cost'].includes(readStored('dapi-dashboard-metric') || '') ? readStored('dapi-dashboard-metric') as 'requests' | 'tokens' | 'cache' | 'cost' : 'requests')
 const dashboardRouteView = ref<'current' | 'topology'>(readStored('dapi-dashboard-route-view') === 'topology' ? 'topology' : 'current')
 const dashboardMetricsExpanded = ref(false)
 const dashboardCompare = ref(false)
-const dashboardComparison = ref<Json>({})
+const dashboardComparison = ref<UsageReport>({})
 const dashboardComparisonLoading = ref(false)
 const upstreams = ref<Upstream[]>([])
 const upstreamGroupDrawer = ref<UpstreamGroup | null>(null)
+let upstreamReturnGroup = ''
+let returnOverlayFocus = ''
+const savedUpstreamID = ref<number | null>(null)
+let savedUpstreamTimer = 0
+const upstreamFormError = ref('')
+const bulkState = reactive({ running: false, action: 'check' as 'check' | 'balance', completed: 0, items: [] as { id: number; name: string; status: 'queued' | 'running' | 'success' | 'failed'; error: string }[] })
+const bulkFailed = computed(() => bulkState.items.filter(item => item.status === 'failed'))
+let bulkController: AbortController | null = null
 const upstreamFilter = reactive({ search: '', status: 'all', protocol: 'all' })
 Object.assign(upstreamFilter, readStoredJSON('dapi-upstream-filter', {}))
 const upstreamSelectedIds = ref<number[]>([])
@@ -244,16 +121,19 @@ const groups = ref<Group[]>([])
 const keys = ref<ClientKey[]>([])
 const keyFilter = reactive({ search: '', status: 'all', group_id: '' })
 Object.assign(keyFilter, readStoredJSON('dapi-key-filter', {}))
-const logs = ref<RequestLog[]>([])
-const usage = ref<Json>({})
+const logPages = useCursorPage<RequestLog>()
+const { items: logs, page: logPage, nextCursor: logNextCursor, busy: logsBusy, error: logsError, loaded: logsLoaded } = logPages
+const usage = ref<UsageReport>({})
+const usageLoaded = ref(false)
 const channels = ref<Channel[]>([])
 type AlertHistoryEntry = { type: string; state: string; previous?: string; upstream_id?: number; upstream_name?: string; message: string; at: string; notification_number?: number; evidence?: { window_start: string; window_end: string; failed_request_ids?: string[] } }
 const alertHistory = ref<AlertHistoryEntry[]>([])
 const alertHistoryOffset = ref(0)
 const alertRules = ref<AlertRule[]>([])
 const maxAttempts = ref(3)
-const logFilter = reactive({ status: '', upstream_id: '', group_id: '', scope: '', since: '', until: '', limit: 50, offset: 0 })
+const logFilter = reactive({ status: '', upstream_id: '', group_id: '', api_key_id: '', model: '', protocol: '', upstream_base_url: '', scope: '', since: '', until: '', limit: 50, offset: 0 })
 Object.assign(logFilter, readStoredJSON('dapi-log-filter', {}))
+const appliedLogFilter = ref({ ...logFilter })
 const expandedLog = ref<string | null>(null)
 const usageFilter = reactive({
   days: 30,
@@ -267,6 +147,8 @@ const usageFilter = reactive({
   model: '',
 })
 Object.assign(usageFilter, readStoredJSON('dapi-usage-filter', {}))
+const appliedUsageFilter = ref({ ...usageFilter })
+const appliedUsageWindow = ref(reportWindow(usageFilter.days))
 const usageMetric = ref<'requests' | 'tokens' | 'latency' | 'cache'>('requests')
 const mobileFiltersOpen = ref(false)
 const notificationSection = ref<'channels' | 'alerts' | 'history'>('channels')
@@ -298,7 +180,7 @@ const keySimulationTarget = ref<ClientKey | null>(null)
 const keySimulationProtocol = ref('responses')
 const keySimulationModel = ref('')
 const keySimulationBusy = ref(false)
-const keySimulationResult = ref<Json | null>(null)
+const keySimulationResult = ref<{ ok: boolean; status: number; duration_ms: number; detail: string } | null>(null)
 const groupModal = ref(false)
 const editingGroup = ref<number | null>(null)
 const groupForm = reactive({ name: '', enabled: true, upstream_ids: [] as number[] })
@@ -323,7 +205,6 @@ let resolveConfirmation: ((confirmed: boolean) => void) | null = null
 const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '' })
 const channelForm = reactive({ name: '', kind: 'webhook' as 'email' | 'webhook', provider: '', enabled: true, target: '', smtp_host: '', smtp_port: 587, username: '', password: '' })
 const newRule = reactive({ event: 'low_balance', upstream_id: '', threshold: 5, window_seconds: 300, cooldown_seconds: 1800, max_notifications: 3 })
-const saving = ref(false)
 
 const setupSteps = computed(() => [
   { id: 'upstream', label: '添加第一个上游', description: '配置 Base URL、Key 并获取模型', done: upstreams.value.length > 0, view: 'upstreams' as View },
@@ -349,7 +230,7 @@ watch(autoRefresh, (enabled) => {
   if (autoRefreshTimer !== null) window.clearInterval(autoRefreshTimer)
   autoRefreshTimer = enabled
     ? window.setInterval(() => {
-      if (auth.value === 'ready' && document.visibilityState === 'visible' && !loading.value && !activeOverlayId.value) void loadCurrent()
+      if (auth.value === 'ready' && document.visibilityState === 'visible' && !loading.value && !activeOverlayId.value && !refreshPaused.value) void loadCurrent(true)
     }, 30000)
     : null
 }, { immediate: true })
@@ -471,26 +352,26 @@ function topologyGroupNodeState(group: UpstreamGroup) {
   if (!topologyHasFocus.value) return ''
   return group.items.some((item) => topologyFocusedUpstreamIDs.value.has(item.id)) ? 'is-focused' : 'is-dimmed'
 }
-const dashboardRows = computed<Json[]>(() => {
+const dashboardRows = computed<UsageRow[]>(() => {
   const rows = dashboard.value.daily
   return Array.isArray(rows) ? rows : []
 })
-const dashboardHourlyRows = computed<Json[]>(() => Array.isArray(dashboard.value.hourly) ? dashboard.value.hourly : [])
-const dashboardChartRows = computed<Json[]>(() => {
+const dashboardHourlyRows = computed<UsageRow[]>(() => Array.isArray(dashboard.value.hourly) ? dashboard.value.hourly : [])
+const dashboardChartRows = computed<UsageRow[]>(() => {
   if (dashboardRange.value === '24h') return dashboardHourlyRows.value.length ? dashboardHourlyRows.value : dashboardRows.value
   return dashboardRangeUsage.value
 })
-const dashboardTrendTotals = computed(() => dashboardChartRows.value.reduce((sum, row) => ({
-  requests: sum.requests + Number(row.requests || 0),
-  tokens: sum.tokens + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
+const dashboardTrendTotals = computed(() => (selectedChartRow.value ? [selectedChartRow.value] : dashboardChartRows.value).reduce<{ requests: number; tokens: number; cached: number; cost: number }>((sum, row) => ({
+  requests: Number(sum.requests || 0) + Number(row.requests || 0),
+  tokens: Number(sum.tokens || 0) + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
   cached: sum.cached + Number(row.cached_input_tokens || 0),
   cost: sum.cost + Number(row.cost_usd || 0),
 }), { requests: 0, tokens: 0, cached: 0, cost: 0 }))
-function usageTotalsFromRows(rows: Json[]) {
-  return rows.reduce((sum, row) => ({
-    requests: sum.requests + Number(row.requests || 0),
-    successes: sum.successes + Number(row.successes || 0),
-    tokens: sum.tokens + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
+function usageTotalsFromRows(rows: UsageRow[]) {
+  return rows.reduce<{ requests: number; successes: number; tokens: number; cost: number }>((sum, row) => ({
+    requests: Number(sum.requests || 0) + Number(row.requests || 0),
+    successes: Number(sum.successes || 0) + Number(row.successes || 0),
+    tokens: Number(sum.tokens || 0) + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
     cost: sum.cost + Number(row.cost_usd || 0),
   }), { requests: 0, successes: 0, tokens: 0, cost: 0 })
 }
@@ -500,7 +381,7 @@ const dashboardComparisonTotals = computed(() => {
     requests: Number(supplied.requests || 0), successes: Number(supplied.successes || 0),
     tokens: Number(supplied.input_tokens || 0) + Number(supplied.output_tokens || 0), cost: Number(supplied.cost_usd || 0),
   }
-  return usageTotalsFromRows(listOf<Json>(dashboardComparison.value.daily || dashboardComparison.value.items))
+  return usageTotalsFromRows(listOf<UsageRow>(dashboardComparison.value.daily || dashboardComparison.value.items))
 })
 const dashboardComparisonReady = computed(() => dashboardCompare.value && dashboardRange.value !== '24h' && !dashboardComparisonLoading.value && Boolean(Object.keys(dashboardComparison.value).length))
 function dashboardDelta(key: 'requests' | 'tokens' | 'cost') {
@@ -521,8 +402,8 @@ function dashboardDeltaTone(key: 'requests' | 'tokens' | 'cost') {
   return delta == null ? '' : delta >= 0 ? 'up' : 'down'
 }
 const dashboardTotals = computed(() => dashboardRows.value.reduce((sum, row) => ({
-  requests: sum.requests + Number(row.requests || 0),
-  tokens: sum.tokens + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
+  requests: Number(sum.requests || 0) + Number(row.requests || 0),
+  tokens: Number(sum.tokens || 0) + Number(row.tokens ?? (Number(row.input_tokens || 0) + Number(row.output_tokens || 0))),
 }), { requests: 0, tokens: 0 }))
 const dashboardCost = computed(() => Number(dashboard.value.cost_usd_24h || 0))
 const dashboardCostCNY = computed(() => dashboardCost.value * Number(pricing.value.usd_cny_rate || 7.2))
@@ -567,7 +448,7 @@ const summary = computed(() => {
             latency: Number(stats.avg_latency_ms ?? stats.average_latency_ms ?? 0),
   }
 })
-const usageRows = computed<Json[]>(() => {
+const usageRows = computed<UsageRow[]>(() => {
   const raw = usage.value.daily ?? usage.value.trend ?? usage.value.items ?? usage.value.data ?? []
   return Array.isArray(raw) ? raw : []
 })
@@ -575,15 +456,15 @@ const usageTotals = computed(() => {
   const supplied = usage.value.totals || usage.value.summary
   if (supplied) return supplied
   return usageRows.value.reduce((sum, row) => ({
-    requests: sum.requests + Number(row.requests || 0),
-    input_tokens: sum.input_tokens + Number(row.input_tokens || 0),
-    output_tokens: sum.output_tokens + Number(row.output_tokens || 0),
-    cached_input_tokens: sum.cached_input_tokens + Number(row.cached_input_tokens || 0),
-    cache_creation_input_tokens: sum.cache_creation_input_tokens + Number(row.cache_creation_input_tokens || row.cache_write_tokens || 0),
-    successes: sum.successes + Number(row.successes || 0),
-    duration_ms: sum.duration_ms + Number(row.duration_ms || row.total_duration_ms || 0),
-    cost_usd: sum.cost_usd + Number(row.cost_usd || 0),
-    cost_known_requests: sum.cost_known_requests + Number(row.cost_known_requests || 0),
+    requests: Number(sum.requests || 0) + Number(row.requests || 0),
+    input_tokens: Number(sum.input_tokens || 0) + Number(row.input_tokens || 0),
+    output_tokens: Number(sum.output_tokens || 0) + Number(row.output_tokens || 0),
+    cached_input_tokens: Number(sum.cached_input_tokens || 0) + Number(row.cached_input_tokens || 0),
+    cache_creation_input_tokens: Number(sum.cache_creation_input_tokens || 0) + Number(row.cache_creation_input_tokens || row.cache_write_tokens || 0),
+    successes: Number(sum.successes || 0) + Number(row.successes || 0),
+    duration_ms: Number(sum.duration_ms || 0) + Number(row.duration_ms || row.total_duration_ms || 0),
+    cost_usd: Number(sum.cost_usd || 0) + Number(row.cost_usd || 0),
+    cost_known_requests: Number(sum.cost_known_requests || 0) + Number(row.cost_known_requests || 0),
   }), { requests: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, successes: 0, duration_ms: 0, cost_usd: 0, cost_known_requests: 0 })
 })
 const usageInputTokens = computed(() => Number(usageTotals.value.input_tokens ?? 0))
@@ -644,6 +525,8 @@ const activeOverlayId = computed(() => {
   if (keySimulationModal.value) return 'key-simulation'
   if (passwordModal.value) return 'password'
   if (channelModal.value) return 'channel'
+  if (groupModal.value) return 'group'
+  if (pricingModal.value) return 'pricing'
   if (keyModal.value) return 'key'
   if (upstreamModal.value) return 'upstream'
   if (upstreamGroupDrawer.value) return 'upstream-group'
@@ -715,14 +598,15 @@ function toggleSort(table: string, key: string) {
   sortState[table] = { key, direction: current?.key === key && current.direction === 1 ? -1 : 1 }
 }
 
-function sortValue(item: Json, key: string): string | number {
+function sortValue(item: object, key: string): string | number {
+  const sortable = item as Partial<Upstream> & { items?: Upstream[]; usage?: RequestLog['usage'] }
   if (key === 'balance') {
-    const entries = Array.isArray(item.items) ? item.items as Upstream[] : [item as Upstream]
+    const entries = Array.isArray(sortable.items) ? sortable.items : [sortable as Upstream]
     return Math.max(...entries.map((entry) => balanceRank(entry)))
   }
-  if (key === 'models') return Number(item.models?.length || 0)
-  if (key === 'tokens') return Number(item.usage?.input_tokens || 0) + Number(item.usage?.output_tokens || 0)
-  const value = key.split('.').reduce<any>((result, part) => result?.[part], item)
+  if (key === 'models') return Number(sortable.models?.length || 0)
+  if (key === 'tokens') return Number(sortable.usage?.input_tokens || 0) + Number(sortable.usage?.output_tokens || 0)
+  const value = key.split('.').reduce<unknown>((result, part) => result && typeof result === 'object' ? (result as Record<string, unknown>)[part] : undefined, item)
   if (typeof value === 'boolean') return value ? 1 : 0
   if (typeof value === 'number') return value
   const timestamp = typeof value === 'string' && /(_at|day)$/.test(key) ? Date.parse(value) : Number.NaN
@@ -733,8 +617,8 @@ function sortRows<T extends object>(rows: T[], table: string) {
   const current = sortState[table]
   if (!current) return rows
   return [...rows].sort((left, right) => {
-    const a = sortValue(left as Json, current.key)
-    const b = sortValue(right as Json, current.key)
+    const a = sortValue(left, current.key)
+    const b = sortValue(right, current.key)
     return (typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b), 'zh-CN')) * current.direction
   })
 }
@@ -751,9 +635,9 @@ function toggleLog(requestID: string) {
 
 function setLogPreset(preset: 'all' | 'errors') {
   if (preset === 'errors') logFilter.status = 'error'
-  else Object.assign(logFilter, { status: '', upstream_id: '', group_id: '', scope: '', since: '', until: '' })
+  else Object.assign(logFilter, { status: '', upstream_id: '', group_id: '', api_key_id: '', model: '', protocol: '', upstream_base_url: '', scope: '', since: '', until: '' })
   logFilter.offset = 0
-  void loadLogs()
+  void loadLogs(undefined, 0)
 }
 
 function attemptWidth(item: RequestLog, duration?: number) {
@@ -785,7 +669,7 @@ async function copyValue(value: string, label = '内容') {
 }
 
 async function resolveClientKey(item: ClientKey, signal?: AbortSignal) {
-  const result = await api.get<Json>(`/api/admin/keys/${item.id}/secret`, { signal })
+  const result = await api.get<KeySecret>(`/api/admin/keys/${item.id}/secret`, { signal })
   const rawKey = result?.key || result?.api_key || result?.secret || ''
   if (!rawKey) throw new Error('该密钥没有可复制的加密副本，请重新创建密钥')
   return rawKey
@@ -803,8 +687,8 @@ function settleConfirmation(confirmed: boolean) {
 }
 
 function activeOverlay() {
-  if (ccswitchModal.value) return document.querySelector<HTMLElement>('.ccswitch-backdrop') || null
-  return Array.from(document.querySelectorAll<HTMLElement>('.modal-backdrop, .drawer-backdrop')).at(-1) || null
+  if (ccswitchModal.value) return document.querySelector<HTMLElement>('.ccswitch-backdrop:not([inert])') || null
+  return Array.from(document.querySelectorAll<HTMLElement>('.modal-backdrop:not([inert]), .drawer-backdrop:not([inert])')).at(-1) || null
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
@@ -817,6 +701,8 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     else if (passwordModal.value) passwordModal.value = false
     else if (channelModal.value) channelModal.value = false
     else if (keyModal.value) keyModal.value = false
+    else if (groupModal.value) groupModal.value = false
+    else if (pricingModal.value) closePricingProfile()
     else if (upstreamModal.value) closeUpstream()
     else if (upstreamGroupDrawer.value) upstreamGroupDrawer.value = null
     return
@@ -838,13 +724,18 @@ watch(activeOverlayId, async (current, previous) => {
     if (!previous) restoreFocus = document.activeElement as HTMLElement
     await nextTick()
     const overlay = activeOverlay()
-    const target = overlay?.querySelector<HTMLElement>('[autofocus]') || overlay?.querySelector<HTMLElement>('button, input, select, textarea')
+    const target = (returnOverlayFocus ? overlay?.querySelector<HTMLElement>(returnOverlayFocus) : null) || overlay?.querySelector<HTMLElement>('[autofocus]') || overlay?.querySelector<HTMLElement>('button, input, select, textarea')
     target?.focus()
-  } else if (previous) {
-    restoreFocus?.focus()
-    restoreFocus = null
+    returnOverlayFocus = ''
+  } else if (previous && reducedMotion()) {
+    restoreOverlayFocus()
   }
 })
+function restoreOverlayFocus() {
+ if (activeOverlayId.value) return
+ if (restoreFocus?.isConnected) restoreFocus.focus({ preventScroll: true })
+ restoreFocus = null
+}
 
 function notify(message: string, error = false) {
   window.clearTimeout(toastTimer)
@@ -877,6 +768,8 @@ async function logout() {
     closeCCSwitch()
     closeSecret()
     auth.value = 'guest'
+    navigationSnapshots.clear()
+    bulkController?.abort()
     loginForm.password = ''
   }
 }
@@ -888,20 +781,55 @@ async function changePassword() {
     await api.put('/api/admin/password', { current_password: passwordForm.current_password, new_password: passwordForm.new_password })
     passwordModal.value = false
     auth.value = 'guest'
+    navigationSnapshots.clear()
+    bulkController?.abort()
     loginForm.password = ''
     Object.assign(passwordForm, { current_password: '', new_password: '', confirm_password: '' })
     notify('密码已修改，请重新登录')
   } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
 }
 
-async function go(next: View) {
-  view.value = next
-  menuOpen.value = false
-  if (location.hash !== `#${next}`) history.pushState(null, '', `#${next}`)
-  await loadCurrent()
+const navigationSnapshots = new Map<string, ReturnType<typeof captureNavigation>>()
+let currentEntry = ''
+let navigationSequence = 0
+let focusSequence = 0
+const selectedChartRow = ref<UsageRow | null>(null)
+const selectedUsageRow = ref<UsageRow | null>(null)
+let logDrilldownPending = false
+const refreshPaused = computed(() => (view.value === 'logs' && (logPage.value > 0 || Boolean(expandedLog.value))) || view.value === 'channels' || view.value === 'settings' || (view.value === 'dashboard' && Boolean(selectedChartRow.value)) || (view.value === 'usage' && Boolean(selectedUsageRow.value)) || bulkState.running)
+function captureNavigation() {
+ const focused = document.activeElement as HTMLElement | null
+ if (focused && focused !== document.body && !focused.closest('.modal-backdrop,.drawer-backdrop')) focused.dataset.navFocus ||= String(++focusSequence)
+ return { view: view.value, complete: view.value === 'logs' ? logsLoaded.value && !logsBusy.value && !logsError.value : view.value === 'usage' ? usageLoaded.value && !loading.value && !refreshError.value : true, logFilter: { ...logFilter }, appliedLogFilter: { ...appliedLogFilter.value }, logs: logPages.snapshot(), expandedLog: expandedLog.value,
+  upstreamFilter: { ...upstreamFilter }, keyFilter: { ...keyFilter }, usageFilter: { ...usageFilter }, usage: usage.value, usageLoaded: usageLoaded.value, appliedUsageFilter: { ...appliedUsageFilter.value }, appliedUsageWindow: { ...appliedUsageWindow.value },
+  sort: structuredClone(Object.fromEntries(Object.entries(sortState).map(([key,value]) => [key, { ...value }]))),
+  updated: lastUpdatedAt.value, scroll: window.scrollY, focus: focused?.dataset.navFocus, focusLog: focused?.closest<HTMLElement>('[data-log-id]')?.dataset.logId, focusLabel: focused?.getAttribute('aria-label'), focusText: focused?.tagName === 'BUTTON' ? focused.textContent?.trim() : '', chart: selectedChartRow.value, usageRow: selectedUsageRow.value,
+  dashboardRange: dashboardRange.value, dashboardMetric: dashboardMetric.value, dashboardRouteView: dashboardRouteView.value,
+  topologyKey: topologyFocusKeyId.value, topologyGroup: topologyFocusGroupId.value, notificationSection: notificationSection.value,
+ }
+}
+function rememberNavigation() {
+ if (!currentEntry) currentEntry = `dapi-${Date.now()}-${++navigationSequence}`
+ navigationSnapshots.set(currentEntry, captureNavigation())
+ if (navigationSnapshots.size > 40) navigationSnapshots.delete(navigationSnapshots.keys().next().value!)
+}
+async function go(next: View, prepare?: () => void) {
+ rememberNavigation()
+ history.replaceState({ ...history.state, dapiEntry: currentEntry }, '', location.href)
+ const push = view.value !== next || Boolean(prepare)
+ prepare?.()
+ view.value = next
+ menuOpen.value = false
+ if (push) {
+  currentEntry = `dapi-${Date.now()}-${++navigationSequence}`
+  history.pushState({ dapiEntry: currentEntry }, '', `#${next}`)
+ }
+ await loadCurrent()
+ if (view.value === next && push) { await nextTick(); window.scrollTo({ top: 0, behavior: 'instant' }) }
 }
 
 function beginPageLoad() {
+  for (const controller of dashboardPartControllers.values()) controller.abort()
   pageLoadController?.abort()
   dashboardRangeController?.abort()
   dashboardRangeController = null
@@ -922,34 +850,92 @@ function viewFromLocation() {
   return navItems.some((item) => item.id === hash) ? hash : 'dashboard'
 }
 
-function handleHistoryNavigation() {
-  const next = viewFromLocation()
-  if (next === view.value) return
-  view.value = next
-  void loadCurrent()
+async function handleHistoryNavigation() {
+ const next = viewFromLocation()
+ const target = history.state?.dapiEntry as string | undefined
+ if (target === currentEntry && next === view.value) return
+ rememberNavigation()
+ pageLoadController?.abort(); dashboardRangeController?.abort(); logPages.cancel(); ++pageLoadSequence
+ for (const controller of dashboardPartControllers.values()) controller.abort()
+ pageLoadController = null; loading.value = false
+ currentEntry = target || `dapi-${Date.now()}-${++navigationSequence}`
+ history.replaceState({ ...history.state, dapiEntry: currentEntry }, '', location.href)
+ const saved = navigationSnapshots.get(currentEntry)
+ view.value = next; menuOpen.value = false; refreshError.value = ''
+ if (saved?.view === next) {
+  lastUpdatedAt.value = saved.updated
+  Object.assign(logFilter, saved.logFilter); appliedLogFilter.value = { ...saved.appliedLogFilter }; logPages.restore(saved.logs); expandedLog.value = saved.expandedLog
+  Object.assign(upstreamFilter, saved.upstreamFilter); Object.assign(keyFilter, saved.keyFilter); Object.assign(usageFilter, saved.usageFilter); usage.value = saved.usage; usageLoaded.value = saved.usageLoaded; appliedUsageFilter.value = { ...saved.appliedUsageFilter }; appliedUsageWindow.value = { ...saved.appliedUsageWindow }
+  for (const key of Object.keys(sortState)) delete sortState[key]
+  Object.assign(sortState, saved.sort); selectedChartRow.value = saved.chart; selectedUsageRow.value = saved.usageRow
+  dashboardRange.value = saved.dashboardRange; dashboardMetric.value = saved.dashboardMetric; dashboardRouteView.value = saved.dashboardRouteView
+  topologyFocusKeyId.value = saved.topologyKey; topologyFocusGroupId.value = saved.topologyGroup; notificationSection.value = saved.notificationSection
+  // Logs and reports restore the exact viewed result; users can explicitly refresh.
+  if (!saved.complete || (next !== 'logs' && next !== 'usage')) await loadCurrent()
+  if (next === 'dashboard' && saved.chart) selectedChartRow.value = dashboardChartRows.value.find(row => (row.hour || row.day || row.date) === (saved.chart!.hour || saved.chart!.day || saved.chart!.date)) || null
+  await nextTick()
+  if (currentEntry !== target) return
+  window.scrollTo({ top: saved.scroll, behavior: 'instant' })
+  const focus = (saved.focusLog ? document.querySelector<HTMLElement>(`[data-log-id="${CSS.escape(saved.focusLog)}"]`) : null)
+    || (saved.focusLabel ? document.querySelector<HTMLElement>(`[aria-label="${CSS.escape(saved.focusLabel)}"]`) : null)
+    || (saved.focus ? document.querySelector<HTMLElement>(`[data-nav-focus="${saved.focus}"]`) : null)
+    || (saved.focusText ? Array.from(document.querySelectorAll<HTMLButtonElement>('.content button')).find(button => button.textContent?.trim() === saved.focusText) : null)
+  focus?.focus({ preventScroll: true })
+ } else { await loadCurrent() }
 }
 
-async function loadCurrent() {
+type DashboardPart = 'dashboard' | 'upstreams' | 'cost' | 'pricing' | 'groups' | 'keys'
+const dashboardParts: DashboardPart[] = ['dashboard', 'upstreams', 'cost', 'pricing', 'groups', 'keys']
+const dashboardState = reactive(Object.fromEntries(dashboardParts.map(key => [key, { busy: false, error: '', updated: 0 }])) as Record<DashboardPart, { busy: boolean; error: string; updated: number }>)
+const dashboardPartControllers = new Map<DashboardPart, AbortController>()
+const setupLoaded = computed(() => ['upstreams', 'groups', 'keys'].every(key => dashboardState[key as DashboardPart].updated > 0))
+async function loadDashboardPart(part: DashboardPart, sequence: number, parent?: AbortSignal, background = false) {
+ const state = dashboardState[part]
+ if (background && ['pricing', 'groups', 'keys'].includes(part) && !state.error && Date.now() - state.updated < 60_000) return
+ dashboardPartControllers.get(part)?.abort()
+ const current = new AbortController()
+ dashboardPartControllers.set(part, current)
+ const abort = () => current.abort()
+ if (parent?.aborted) abort()
+ else parent?.addEventListener('abort', abort, { once: true })
+ state.busy = true; state.error = ''
+ try {
+  const paths: Record<DashboardPart, string> = { dashboard: '/api/admin/dashboard', upstreams: '/api/admin/upstreams', cost: '/api/admin/usage?days=30&granularity=day&dimension=model&top_n=8', pricing: '/api/admin/pricing?summary=true', groups: '/api/admin/groups', keys: '/api/admin/keys' }
+  const result = await api.get<unknown>(paths[part], { signal: current.signal })
+  if (current.signal.aborted || sequence !== pageLoadSequence) return
+  switch (part) {
+   case 'dashboard': dashboard.value = result as Dashboard || {}; lastUpdatedAt.value = new Date(); refreshError.value = ''; break
+   case 'upstreams': upstreams.value = listOf<Upstream>(result); triggerTopologyPulse(); break
+   case 'cost': { const report = result as UsageReport; dashboardCostRows.value = listOf<UsageRow>(report?.daily || report?.items); break }
+   case 'pricing': pricing.value = result as PricingData || {}; break
+   case 'groups': groups.value = listOf<Group>(result); break
+   case 'keys': keys.value = listOf<ClientKey>(result); break
+  }
+  state.updated = Date.now()
+ } catch (error) {
+  if (current.signal.aborted || sequence !== pageLoadSequence) return
+  if (error instanceof ApiError && error.status === 401) {
+   auth.value = 'guest'; autoRefresh.value = false; pageLoadController?.abort()
+   for (const controller of dashboardPartControllers.values()) controller.abort()
+  } else { state.error = errorMessage(error); if (part === 'dashboard') refreshError.value = state.error }
+ } finally {
+  parent?.removeEventListener('abort', abort)
+  if (dashboardPartControllers.get(part) === current) { state.busy = false; dashboardPartControllers.delete(part) }
+ }
+}
+function retryDashboardPart(part: DashboardPart) { void loadDashboardPart(part, pageLoadSequence, pageLoadController?.signal) }
+
+async function loadCurrent(background?: unknown) {
   const { controller, sequence } = beginPageLoad()
   const signal = controller.signal
   try {
     if (view.value === 'dashboard') {
-      const [dash, ups, costData, pricingData, groupData, keyData] = await Promise.all([
-        api.get<Json>('/api/admin/dashboard', { signal }), api.get('/api/admin/upstreams', { signal }),
-        api.get<Json>('/api/admin/usage?days=30&granularity=day&dimension=model&top_n=8', { signal }),
-        api.get<Json>('/api/admin/pricing', { signal }),
-        api.get('/api/admin/groups', { signal }), api.get('/api/admin/keys', { signal }),
+      await Promise.all([
+        ...dashboardParts.map(part => loadDashboardPart(part, sequence, signal, background === true)),
+        ...(dashboardRange.value !== '24h' ? [loadDashboardRange(signal)] : []),
       ])
-      dashboard.value = dash || {}
-      upstreams.value = listOf<Upstream>(ups)
-      dashboardCostRows.value = listOf<Json>(costData?.daily || costData?.items)
-      pricing.value = pricingData || {}
-      groups.value = listOf<Group>(groupData)
-      keys.value = listOf<ClientKey>(keyData)
-      triggerTopologyPulse()
-      if (dashboardRange.value !== '24h') await loadDashboardRange(signal)
     } else if (view.value === 'upstreams') {
-      const [upstreamData, pricingData] = await Promise.all([api.get('/api/admin/upstreams', { signal }), api.get<Json>('/api/admin/pricing', { signal })])
+      const [upstreamData, pricingData] = await Promise.all([api.get('/api/admin/upstreams', { signal }), api.get<PricingData>('/api/admin/pricing?summary=true', { signal })])
       upstreams.value = listOf<Upstream>(upstreamData)
       pricing.value = pricingData || {}
     }
@@ -964,9 +950,11 @@ async function loadCurrent() {
       groups.value = listOf<Group>(groupData)
     }
     else if (view.value === 'logs') {
-      const [, upstreamData, groupData] = await Promise.all([loadLogs(signal), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/groups', { signal })])
+      const firstPage = logDrilldownPending; logDrilldownPending = false
+      const [, upstreamData, groupData, keyData] = await Promise.all([loadLogs(signal, firstPage ? 0 : undefined, background === true ? appliedLogFilter.value : { ...logFilter }), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/groups', { signal }), api.get('/api/admin/keys', { signal })])
       upstreams.value = listOf<Upstream>(upstreamData)
       groups.value = listOf<Group>(groupData)
+      keys.value = listOf<ClientKey>(keyData)
     }
     else if (view.value === 'usage') {
       const [, upstreamData, keyData, groupData] = await Promise.all([loadUsage(signal), api.get('/api/admin/upstreams', { signal }), api.get('/api/admin/keys', { signal }), api.get('/api/admin/groups', { signal })])
@@ -982,10 +970,10 @@ async function loadCurrent() {
  alertHistory.value = listOf<AlertHistoryEntry>(historyData)
       upstreams.value = listOf<Upstream>(upstreamData)
     } else if (view.value === 'settings') {
-      const settingsData = await api.get<Json>('/api/admin/settings', { signal })
+      const settingsData = await api.get<{ max_attempts: number }>('/api/admin/settings', { signal })
       maxAttempts.value = Number(settingsData.max_attempts || 3)
     }
-    lastUpdatedAt.value = new Date()
+    if (isCurrentPageLoad(sequence) && view.value !== 'dashboard') lastUpdatedAt.value = new Date()
   } catch (error) {
     if (isAbortError(error) || !isCurrentPageLoad(sequence)) return
     if (error instanceof ApiError && error.status === 401) {
@@ -1033,6 +1021,7 @@ function exportUsageCSV() {
 }
 
 async function loadDashboardRange(signal?: AbortSignal) {
+  selectedChartRow.value = null
   const sequence = ++dashboardRangeSequence
   dashboardRangeController?.abort()
   if (dashboardRange.value === '24h') {
@@ -1060,11 +1049,11 @@ async function loadDashboardRange(signal?: AbortSignal) {
   const query = (start: Date, end: Date) => `/api/admin/usage?granularity=day&dimension=&top_n=1&from=${fmt(start)}&to=${fmt(end)}`
   dashboardComparisonLoading.value = true
   try {
-    const currentRequest = api.get<Json>(query(from, to), { signal: controller.signal })
-    const previousRequest = dashboardCompare.value ? api.get<Json>(query(previousFrom, previousTo), { signal: controller.signal }) : Promise.resolve<Json>({})
+    const currentRequest = api.get<UsageReport>(query(from, to), { signal: controller.signal })
+    const previousRequest = dashboardCompare.value ? api.get<UsageReport>(query(previousFrom, previousTo), { signal: controller.signal }) : Promise.resolve<UsageReport>({})
     const [result, previous] = await Promise.all([currentRequest, previousRequest])
     if (controller.signal.aborted || sequence !== dashboardRangeSequence) return
-    dashboardRangeUsage.value = listOf<Json>(result?.daily || result?.items)
+    dashboardRangeUsage.value = listOf<UsageRow>(result?.daily || result?.items)
     dashboardComparison.value = previous || {}
   } catch (error) { if (!isAbortError(error)) notify(errorMessage(error), true) }
   finally {
@@ -1079,63 +1068,6 @@ async function loadDashboardRange(signal?: AbortSignal) {
 function toggleDashboardCompare() {
   dashboardCompare.value = !dashboardCompare.value
   void loadDashboardRange()
-}
-
-async function refreshPricing() {
-  saving.value = true
-  try {
-    await api.post('/api/admin/pricing/refresh')
-    pricing.value = await api.get<Json>('/api/admin/pricing')
-    notify('LiteLLM 价格已同步；手动档案仍作为兜底')
-  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
-}
-
-async function backfillPricing() {
-  if (!(await requestConfirmation('回算历史成本', '将按请求发生时有效的价格档案补齐最近 365 天未知成本。'))) return
-  saving.value = true
-  try {
-    const result = await api.post<Json>('/api/admin/pricing/backfill', {})
-    await loadCurrent()
-    notify(`已回算 ${Number(result?.logs_updated || 0).toLocaleString()} 条请求成本`)
-  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
-}
-
-function openPricingProfile(profile?: Json) {
-  editingPricing.value = profile?.id ?? null
-  const prices = listOf<Json>(profile?.prices).map((price) => [price.model, price.input_usd_per_million, price.output_usd_per_million, price.cache_read_usd_per_million, price.cache_write_usd_per_million].join(', ')).join('\n')
-  Object.assign(pricingForm, profile ? { name: profile.name, provider: profile.provider || '', source_url: profile.source_url || '', source_version: profile.source_version || 'custom', prices } : { name: '', provider: '', source_url: '', source_version: 'custom', prices: '' })
-  pricingModal.value = true
-}
-
-async function savePricingProfile() {
-  const prices = pricingForm.prices.split('\n').map((line) => line.split(',').map((value) => value.trim())).filter((parts) => parts[0]).map(([model, input, output, cacheRead, cacheWrite]) => ({ model, input_usd_per_million: Number(input || 0), output_usd_per_million: Number(output || 0), cache_read_usd_per_million: Number(cacheRead || 0), cache_write_usd_per_million: Number(cacheWrite || 0) }))
-  if (prices.some((price) => !Number.isFinite(price.input_usd_per_million) || !Number.isFinite(price.output_usd_per_million) || !Number.isFinite(price.cache_read_usd_per_million) || !Number.isFinite(price.cache_write_usd_per_million))) {
-    notify('价格必须是数字', true)
-    return
-  }
-  saving.value = true
-  try {
-    const payload = { name: pricingForm.name, provider: pricingForm.provider, source_url: pricingForm.source_url, source_version: pricingForm.source_version, prices }
-    if (editingPricing.value) await api.put(`/api/admin/pricing/profiles/${editingPricing.value}`, payload)
-    else await api.post('/api/admin/pricing/profiles', payload)
-    pricing.value = await api.get<Json>('/api/admin/pricing')
-    pricingModal.value = false
-    notify(editingPricing.value ? '价格档案已更新' : '价格档案已创建')
-  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
-}
-
-async function removePricingProfile(profile: Json) {
-  if (!(await requestConfirmation('删除价格档案', `“${profile.name}”将被删除，已绑定上游会恢复为未计价。`))) return
-  try {
-    await api.delete(`/api/admin/pricing/profiles/${profile.id}`)
-    pricing.value = await api.get<Json>('/api/admin/pricing')
-    notify('价格档案已删除')
-  } catch (error) { notify(errorMessage(error), true) }
-}
-
-function pricingProfileName(id?: number) {
-  if (!id) return '未计价'
-  return listOf<Json>(pricing.value.profiles).find((profile) => Number(profile.id) === Number(id))?.name || `档案 #${id}`
 }
 
 function groupStatusText(group: UpstreamGroup) {
@@ -1190,23 +1122,94 @@ function openUpstreamGroup(group: UpstreamGroup) {
   upstreamGroupDrawer.value = group
 }
 
+function drillLogs(filters: Partial<typeof logFilter>) {
+ void go('logs', () => {
+  logDrilldownPending = true
+  Object.assign(logFilter, { status: '', scope: '', upstream_id: '', upstream_base_url: '', group_id: '', api_key_id: '', model: '', protocol: '', since: '', until: '', offset: 0 }, filters)
+ })
+}
 function inspectAlert(entry: AlertHistoryEntry) {
  if (!entry.evidence) return
- Object.assign(logFilter,{status:'attempt_error',scope:'attempts',upstream_id:String(entry.upstream_id || ''),group_id:'',since:entry.evidence.window_start,until:entry.evidence.window_end,offset:0})
- void go('logs')
+ drillLogs({ status: 'attempt_error', scope: 'attempts', upstream_id: String(entry.upstream_id || ''), since: entry.evidence.window_start, until: entry.evidence.window_end })
+}
+function chartWindowLabel(row: UsageRow, source: 'dashboard' | 'usage') {
+ const bucket = usageWindow(row, source === 'usage' ? appliedUsageFilter.value.granularity : 'day')
+ const window = bucket && source === 'usage' ? clipWindow(bucket, appliedUsageWindow.value) : bucket
+ return window ? `${fmtDate(window.since)} 至 ${fmtDate(window.until)}` : '时间不可用'
+}
+function canDrillUsage(row: UsageRow) {
+ const dimension = appliedUsageFilter.value.dimension
+ if (usageDimensionLabel(row) === '其他') return false
+ if (dimension === 'upstream') return /^https?:/.test(row.upstream_name || '')
+ if (dimension === 'api_key') return Number(row.api_key_id) > 0
+ if (dimension === 'group') return Number(row.group_id) > 0
+ return dimension === 'model' ? Boolean(row.model) : dimension === 'protocol' ? Boolean(row.protocol) : true
+}
+function inspectChartRow(row: UsageRow, source: 'dashboard' | 'usage') {
+ const bucket = usageWindow(row, source === 'usage' ? appliedUsageFilter.value.granularity : 'day')
+ const window = bucket && source === 'usage' ? clipWindow(bucket, appliedUsageWindow.value) : bucket
+ if (!window) return
+ const filter: Partial<typeof logFilter> = { ...window }
+ if (source === 'usage') {
+  if (!canDrillUsage(row)) return
+  const dimension = appliedUsageFilter.value.dimension
+  if (dimension === 'upstream') { filter.upstream_base_url = row.upstream_name || ''; filter.upstream_id = appliedUsageFilter.value.upstream_id }
+  if (dimension === 'api_key') filter.api_key_id = String(row.api_key_id)
+  if (dimension === 'group') filter.group_id = String(row.group_id)
+  if (dimension === 'model') filter.model = row.model || ''
+  if (dimension === 'protocol') filter.protocol = row.protocol || ''
+ }
+ drillLogs(filter)
+}
+function inspectUpstreamID(id: number) {
+ const group = upstreamGroups.value.find(group => group.items.some(item => item.id === id))
+ if (group) openUpstreamGroup(group)
+ else notify('该上游已删除或不可用，历史尝试记录仍可查看', true)
+}
+function inspectTopologyLogs() {
+ if (topologyFocusedKey.value) drillLogs({ api_key_id: String(topologyFocusedKey.value.id) })
+ else if (topologyFocusedGroup.value) drillLogs({ group_id: String(topologyFocusedGroup.value.id) })
+}
+function inspectTopologyUsage() {
+ const key = topologyFocusedKey.value, group = topologyFocusedGroup.value
+ void go('usage', () => Object.assign(usageFilter, { dimension: key ? 'api_key' : 'group', api_key_id: key ? String(key.id) : '', group_id: key ? '' : String(group?.id || ''), upstream_id: '', protocol: '', model: '' }))
+}
+function editTopologyFocus() {
+ if (topologyFocusedKey.value) openKey(topologyFocusedKey.value)
+ else if (topologyFocusedGroup.value) openGroup(topologyFocusedGroup.value)
+}
+const logFilterChips = computed(() => {
+ const f = appliedLogFilter.value
+ const result: { key: keyof typeof logFilter; label: string }[] = []
+ if (f.status) result.push({ key: 'status', label: ({ success: '成功', error: '请求失败', attempt_error: '上游尝试失败' } as Record<string,string>)[f.status] || f.status })
+ if (f.upstream_id) result.push({ key: 'upstream_id', label: `上游：${upstreams.value.find(item => item.id === Number(f.upstream_id))?.name || '#'+f.upstream_id}` })
+ if (f.upstream_base_url) result.push({ key: 'upstream_base_url', label: `集群：${f.upstream_base_url}` })
+ if (f.group_id) result.push({ key: 'group_id', label: `分组：${groups.value.find(item => item.id === Number(f.group_id))?.name || '#'+f.group_id}` })
+ if (f.api_key_id) result.push({ key: 'api_key_id', label: `客户端：${keys.value.find(item => item.id === Number(f.api_key_id))?.name || '#'+f.api_key_id}` })
+ if (f.model) result.push({ key: 'model', label: `模型：${f.model}` })
+ if (f.protocol) result.push({ key: 'protocol', label: `协议：${f.protocol}` })
+ if (f.since || f.until) result.push({ key: 'since', label: `${f.since ? fmtDate(f.since) : '不限开始'} — ${f.until ? fmtDate(f.until) : '不限结束'}` })
+ return result
+})
+function removeLogFilter(key: keyof typeof logFilter) {
+ Object.assign(logFilter, appliedLogFilter.value)
+ if (key === 'since') { logFilter.since = ''; logFilter.until = '' }
+ else if (key === 'status') { logFilter.status = ''; logFilter.scope = '' }
+ else if (key !== 'limit' && key !== 'offset') logFilter[key] = ''
+ void loadLogs(undefined, 0)
 }
 
-async function loadLogs(signal?: AbortSignal) {
+async function loadLogs(signal?: AbortSignal, target = logsError.value ? logPages.attemptedPage.value : logPage.value, filter = { ...logFilter }) {
   const cycle = signal ? null : beginPageLoad()
   const requestSignal = signal || cycle!.controller.signal
-  const query = new URLSearchParams({ limit: String(logFilter.limit), offset: String(logFilter.offset) })
-  for (const key of ['scope','since','until'] as const) { if(logFilter[key]) query.set(key,logFilter[key]) }
-  if (logFilter.status) query.set('status', logFilter.status)
-  if (logFilter.upstream_id) query.set('upstream_id', logFilter.upstream_id)
-  if (logFilter.group_id) query.set('group_id', logFilter.group_id)
+  const query = new URLSearchParams({ limit: String(filter.limit) })
+  for (const key of ['scope','since','until','model','api_key_id','protocol','upstream_base_url'] as const) { if(filter[key]) query.set(key,filter[key]) }
+  if (filter.status) query.set('status', filter.status)
+  if (filter.upstream_id) query.set('upstream_id', filter.upstream_id)
+  if (filter.group_id) query.set('group_id', filter.group_id)
   try {
-    const result = await api.get<RequestLog[] | Json>(`/api/admin/logs?${query}`, { signal: requestSignal })
-    if (!requestSignal.aborted && (!cycle || isCurrentPageLoad(cycle.sequence))) logs.value = listOf<RequestLog>(result)
+    await logPages.load(`/api/admin/logs?${query}`, target, requestSignal)
+    if (!requestSignal.aborted) { appliedLogFilter.value = { ...filter }; expandedLog.value = null; lastUpdatedAt.value = new Date() }
   } catch (error) {
     if (!cycle) throw error
     if (!isAbortError(error)) notify(errorMessage(error), true)
@@ -1219,19 +1222,21 @@ async function loadLogs(signal?: AbortSignal) {
 }
 
 async function loadUsage(signal?: AbortSignal) {
+  const requestedFilter = { ...usageFilter }
+  const bounds = reportWindow(requestedFilter.days)
   const cycle = signal ? null : beginPageLoad()
   const requestSignal = signal || cycle!.controller.signal
   const query = new URLSearchParams({
-    days: String(usageFilter.days),
-    granularity: usageFilter.granularity,
-    dimension: usageFilter.dimension,
-    top_n: String(usageFilter.topN),
+    days: String(requestedFilter.days),
+    granularity: requestedFilter.granularity,
+    dimension: requestedFilter.dimension,
+    top_n: String(requestedFilter.topN),
   })
-  const filterKey = ({ upstream: 'upstream_id', api_key: 'api_key_id', group: 'group_id', protocol: 'protocol', model: 'model' } as Record<string, keyof typeof usageFilter>)[usageFilter.dimension]
-  if (filterKey && usageFilter[filterKey]) query.set(filterKey, String(usageFilter[filterKey]))
+  const filterKey = ({ upstream: 'upstream_id', api_key: 'api_key_id', group: 'group_id', protocol: 'protocol', model: 'model' } as Record<string, keyof typeof usageFilter>)[requestedFilter.dimension]
+  if (filterKey && requestedFilter[filterKey]) query.set(filterKey, String(requestedFilter[filterKey]))
   try {
-    const result = await api.get<Json>(`/api/admin/usage?${query}`, { signal: requestSignal })
-    if (!requestSignal.aborted && (!cycle || isCurrentPageLoad(cycle.sequence))) usage.value = result
+    const result = await api.get<UsageReport>(`/api/admin/usage?${query}`, { signal: requestSignal })
+    if (!requestSignal.aborted && (!cycle || isCurrentPageLoad(cycle.sequence))) { usage.value = result; usageLoaded.value = true; appliedUsageFilter.value = requestedFilter; appliedUsageWindow.value = bounds; selectedUsageRow.value = null }
   } catch (error) {
     if (!cycle) throw error
     if (!isAbortError(error)) notify(errorMessage(error), true)
@@ -1249,6 +1254,8 @@ async function applyUsageFilters() {
 }
 
 function openUpstream(item?: Upstream) {
+  upstreamFormError.value = ''
+  upstreamReturnGroup = upstreamGroupDrawer.value?.key || ''
   upstreamGroupDrawer.value = null
   modelTestRun++
   singleModelTestController?.abort()
@@ -1335,13 +1342,13 @@ function isAbortError(error: unknown) {
 }
 
 async function probeUpstream() {
-  return api.post<Json>('/api/admin/upstreams/test', { ...upstreamPayload(), id: editingUpstream.value || 0 })
+  return api.post<ProbeResult>('/api/admin/upstreams/test', { ...upstreamPayload(), id: editingUpstream.value || 0 })
 }
 
 async function requestModelTest(model: string, audit: boolean, signal?: AbortSignal) {
   const report = await api.post<ModelTestReport>('/api/admin/upstreams/test-model', {
     ...upstreamPayload(), id: editingUpstream.value || 0, model, audit,
-  }, { signal })
+  }, { signal, timeoutMs: Math.max(210_000, Number(upstreamForm.connect_timeout_ms || 5000) + Number(upstreamForm.first_byte_timeout_ms || 180000) + 25_000) })
   return { ...report, model: report.model || model, results: Array.isArray(report.results) ? report.results : [] }
 }
 
@@ -1399,6 +1406,7 @@ function closeUpstream() {
   singleModelTestController = null
   testingModelNames.value = []
   upstreamModal.value = false
+  reopenUpstreamGroup()
 }
 
 async function testSelectedModels() {
@@ -1493,19 +1501,34 @@ async function fetchUpstreamModels() {
   } finally { fetchingModels.value = false }
 }
 
+function reopenUpstreamGroup() {
+ if (upstreamReturnGroup) { upstreamGroupDrawer.value = upstreamGroups.value.find(group => group.key === upstreamReturnGroup) || null; if (editingUpstream.value) returnOverlayFocus = `[data-edit-upstream="${editingUpstream.value}"]` }
+ upstreamReturnGroup = ''
+}
+async function refreshUpstreamContext() {
+ const [ups, prices] = await Promise.all([api.get('/api/admin/upstreams'), api.get<PricingData>('/api/admin/pricing?summary=true')])
+ upstreams.value = listOf<Upstream>(ups); pricing.value = prices || {}
+ if (upstreamGroupDrawer.value) upstreamGroupDrawer.value = upstreamGroups.value.find(group => group.key === upstreamGroupDrawer.value?.key) || null
+}
 async function saveUpstream() {
-  if (activeModelTestRun) stopModelTests()
-  singleModelTestController?.abort()
-  singleModelTestController = null
-  saving.value = true
-  try {
-    const payload = upstreamPayload()
-    if (editingUpstream.value) await api.put(`/api/admin/upstreams/${editingUpstream.value}`, payload)
-    else await api.post('/api/admin/upstreams', payload)
-    upstreamModal.value = false
-    notify(editingUpstream.value ? '上游已更新' : '上游已添加')
-    await loadCurrent()
-  } catch (error) { notify(errorMessage(error), true) } finally { saving.value = false }
+ if (saving.value) return
+ if (!upstreamForm.protocols.length) { upstreamFormError.value = '请至少选择一个协议'; document.querySelector<HTMLElement>('.check-row input')?.focus(); return }
+ if (activeModelTestRun) stopModelTests()
+ singleModelTestController?.abort(); singleModelTestController = null
+ saving.value = true; upstreamFormError.value = ''
+ try {
+  const payload = upstreamPayload()
+  const editing = editingUpstream.value
+  const result = editing ? await api.put<{ id?: number }>(`/api/admin/upstreams/${editing}`, payload) : await api.post<{ id?: number }>('/api/admin/upstreams', payload)
+  upstreamModal.value = false
+  notify(editing ? '上游已更新' : '上游已添加')
+  try { await refreshUpstreamContext() } catch { notify('配置已保存，列表刷新失败，请手动刷新', true) }
+  savedUpstreamID.value = editing || result?.id || null
+  window.clearTimeout(savedUpstreamTimer)
+  savedUpstreamTimer = window.setTimeout(() => { savedUpstreamID.value = null }, 1200)
+  reopenUpstreamGroup()
+ } catch (error) { upstreamFormError.value = errorMessage(error); notify(upstreamFormError.value, true) }
+ finally { saving.value = false }
 }
 
 async function removeUpstream(item: Upstream) {
@@ -1517,7 +1540,7 @@ async function removeUpstream(item: Upstream) {
 async function upstreamAction(item: Upstream, action: 'check' | 'balance' | 'models') {
   upstreamGroupDrawer.value = null
   try {
-    const result = await api.post<Json>(`/api/admin/upstreams/${item.id}/${action}`)
+    const result = await api.post<ProbeResult>(`/api/admin/upstreams/${item.id}/${action}`)
     if ((action === 'check' && result?.status !== 'healthy') || (action === 'balance' && result?.status !== 'ok')) {
       notify(String(result?.error || (action === 'check' ? '连接检查失败' : '余额查询不可用')), true)
       await loadCurrent()
@@ -1543,30 +1566,35 @@ function toggleAllVisibleUpstreams(event: Event) {
     : upstreamSelectedIds.value.filter((id) => !visibleIDs.includes(id))
 }
 
-async function bulkUpstreamAction(action: 'check' | 'balance') {
-  const items = upstreams.value.filter((item) => upstreamSelectedIds.value.includes(item.id))
-  if (!items.length) return notify('请先选择上游', true)
-  saving.value = true
-  try {
-    let next = 0
-    let succeeded = 0
-    await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
-      while (next < items.length) {
-        const item = items[next++]!
-        try {
-          const result = await api.post<Json>(`/api/admin/upstreams/${item.id}/${action}`)
-          if (action === 'check' ? result?.status === 'healthy' : result?.status === 'ok') succeeded++
-        } catch { /* Count failed requests after all workers finish. */ }
-      }
-    }))
-    const failed = items.length - succeeded
-    upstreamSelectedIds.value = []
-    notify(failed
-      ? `${action === 'check' ? '检查' : '刷新余额'}完成：${succeeded} 个成功，${failed} 个失败`
-      : action === 'check' ? `已检查 ${items.length} 个上游` : `已刷新 ${items.length} 个上游余额`, failed > 0)
-    await loadCurrent()
-  } catch (error) { notify(errorMessage(error), true) }
-  finally { saving.value = false }
+async function bulkUpstreamAction(action: 'check' | 'balance', retryFailed = false) {
+ if (bulkState.running) return
+ const ids = retryFailed ? bulkFailed.value.map(item => item.id) : upstreamSelectedIds.value
+ const items = upstreams.value.filter(item => ids.includes(item.id))
+ if (!items.length) return notify('请先选择上游', true)
+ bulkController?.abort(); const controller = new AbortController(); bulkController = controller
+ bulkState.action = action; bulkState.running = true; bulkState.completed = 0
+ bulkState.items = items.map(item => ({ id: item.id, name: item.name, status: 'queued', error: '' }))
+ saving.value = true
+ try {
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+   while (next < items.length && !controller.signal.aborted) {
+    const index = next++, item = items[index]!, state = bulkState.items[index]!
+    state.status = 'running'
+    try {
+     const result = await api.post<ProbeResult>(`/api/admin/upstreams/${item.id}/${action}`, undefined, { signal: controller.signal })
+     state.status = (action === 'check' ? result?.status === 'healthy' : result?.status === 'ok') ? 'success' : 'failed'
+     if (state.status === 'failed') state.error = result?.error || (action === 'check' ? '连接检查失败' : '余额查询不可用')
+    } catch (error) { state.status = 'failed'; state.error = errorMessage(error) }
+    bulkState.completed++
+   }
+  }))
+  if (controller.signal.aborted) return
+  const failed = bulkFailed.value.length, succeeded = items.length - failed
+  upstreamSelectedIds.value = bulkFailed.value.map(item => item.id)
+  notify(failed ? `${action === 'check' ? '检查' : '刷新余额'}完成：${succeeded} 个成功，${failed} 个失败` : action === 'check' ? `已检查 ${items.length} 个上游` : `已刷新 ${items.length} 个上游余额`, failed > 0)
+  try { await refreshUpstreamContext() } catch { notify('批量操作已完成，列表刷新失败，请手动刷新', true) }
+ } finally { bulkState.running = false; saving.value = false }
 }
 
 function openChannel() {
@@ -1611,7 +1639,7 @@ async function saveKey() {
   saving.value = true
   try {
     const payload = { ...keyForm, group_id: Number(keyForm.group_id), models: keyForm.models.split(',').map((v) => v.trim()).filter(Boolean) }
-    const result: Json = editingKey.value
+    const result: KeySecret = editingKey.value
       ? await api.put(`/api/admin/keys/${editingKey.value}`, payload)
       : await api.post('/api/admin/keys', payload)
     keyModal.value = false
@@ -1661,7 +1689,10 @@ function openKeySimulation(item: ClientKey) {
   keySimulationModal.value = true
 }
 
+let keySimulationController: AbortController | null = null
 function closeKeySimulation() {
+  keySimulationController?.abort()
+  keySimulationController = null
   keySimulationModal.value = false
   keySimulationTarget.value = null
   keySimulationResult.value = null
@@ -1672,11 +1703,15 @@ async function runKeySimulation() {
   const target = keySimulationTarget.value
   const model = keySimulationModel.value.trim()
   if (!target || !model) return notify('请选择或填写模型', true)
+  keySimulationController?.abort()
+  const controller = new AbortController()
+  keySimulationController = controller
+  const timer = setTimeout(() => controller.abort(new DOMException('请求超时', 'TimeoutError')), 16 * 60_000)
   keySimulationBusy.value = true
   keySimulationResult.value = null
   const started = performance.now()
   try {
-    const secret = await resolveClientKey(target)
+    const secret = await resolveClientKey(target, controller.signal)
     const protocol = keySimulationProtocol.value
     const endpoint = protocol === 'chat' ? '/v1/chat/completions' : protocol === 'messages' ? '/v1/messages' : '/v1/responses'
     const headers: Record<string, string> = { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` }
@@ -1690,14 +1725,16 @@ async function runKeySimulation() {
       : protocol === 'chat'
         ? { model, max_tokens: 8, messages: [{ role: 'user', content: 'ping' }] }
         : { model, max_output_tokens: 8, input: 'ping' }
-    const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store' })
+    const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store', signal: controller.signal })
     const text = await response.text()
+    if (keySimulationController !== controller) return
     let detail = ''
-    try { detail = String((JSON.parse(text) as Json)?.error?.message || '') } catch { detail = text.slice(0, 180) }
+    try { detail = String((JSON.parse(text) as { error?: { message?: string } })?.error?.message || '') } catch { detail = text.slice(0, 180) }
     keySimulationResult.value = { ok: response.ok, status: response.status, duration_ms: performance.now() - started, detail }
   } catch (error) {
+    if (keySimulationController !== controller) return
     keySimulationResult.value = { ok: false, status: 0, duration_ms: performance.now() - started, detail: errorMessage(error) }
-  } finally { keySimulationBusy.value = false }
+  } finally { clearTimeout(timer); if (keySimulationController === controller) { keySimulationBusy.value = false; keySimulationController = null } }
 }
 
 async function openCCSwitch(item: ClientKey) {
@@ -1781,7 +1818,7 @@ async function fetchCCSwitchModels() {
   ccswitchModelsController = controller
   fetchingCCSwitchModels.value = true
   try {
-    const body = await api.get<Json>('/v1/models', {
+    const body = await api.get<{ data?: Array<{ id: string }> }>('/v1/models', {
       cache: 'no-store',
       headers: { Authorization: `Bearer ${ccswitchSecret.value.trim()}` },
       signal: controller.signal,
@@ -1947,35 +1984,6 @@ function statusText(status?: string) {
   return ({ healthy: '正常', unhealthy: '异常', unknown: '未知', open: '熔断', checking: '检查中' } as Record<string, string>)[status || ''] || status || '未知'
 }
 
-function fmtDate(value?: string) {
-  return value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value)) : '从未'
-}
-
-function fmtNumber(value?: number) {
-  const number = Number(value || 0)
-  const locale = Math.abs(number) > 99999 ? 'en-US' : 'zh-CN'
-  return new Intl.NumberFormat(locale, { notation: Math.abs(number) > 99999 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(number)
-}
-
-function fmtMetric(value?: number | null, suffix = '') {
-  return value == null || Number.isNaN(Number(value)) ? '—' : `${fmtNumber(Number(value))}${suffix}`
-}
-
-function fmtDuration(value?: number | null) {
-  if (value == null || Number.isNaN(Number(value))) return '—'
-  return `${(Number(value) / 1000).toFixed(2)} s`
-}
-
-function fmtCurrency(value: number, currency: 'USD' | 'CNY') {
-  return new Intl.NumberFormat('zh-CN', { style: 'currency', currency, minimumFractionDigits: currency === 'USD' && Math.abs(value) < 1 ? 4 : 2, maximumFractionDigits: currency === 'USD' && Math.abs(value) < 1 ? 6 : 2 }).format(Number(value || 0))
-}
-
-function fmtPercent(value?: number | null) {
-  if (value == null || Number.isNaN(Number(value))) return '—'
-  const number = Number(value)
-  return `${(number <= 1 ? number * 100 : number).toFixed(1)}%`
-}
-
 function logTokenHitRate(item: RequestLog) {
   const usage = item.usage
   if (!usage || (usage.cached_input_tokens == null && usage.input_tokens == null && usage.cache_creation_input_tokens == null)) return null
@@ -1987,56 +1995,12 @@ function logTokenHitRate(item: RequestLog) {
   return denominator > 0 ? cached / denominator : null
 }
 
-function usageDimensionLabel(row: Json) {
+function usageDimensionLabel(row: UsageRow) {
   return String(row.dimension_label || row.label || row.upstream_name || row.api_key_name || row.group_name || row.protocol || row.model || '总计')
 }
 
-function usageRowKey(row: Json, index: number) {
+function usageRowKey(row: UsageRow, index: number) {
   return `${row.day || row.date || index}-${usageDimensionLabel(row)}`
-}
-
-function balanceRank(upstream?: Upstream) {
-  const balance = upstream?.balance
-  if (!balance) return -3
-  if (balance.status === 'unsupported') return -2
-  if (balance.available == null && !balance.unlimited) return -1
-  // Unlimited is intentionally the lowest usable balance so a numeric
-  // account remains the representative when accounts are mixed.
-  if (balance.unlimited) return 0
-  const available = Number(balance.available)
-  return Number.isFinite(available) ? available + 1 : -1
-}
-
-function maxBalanceUpstream(items: Upstream[]) {
-  if (!items.length) return undefined
-  return items.reduce((best, item) => balanceRank(item) > balanceRank(best) ? item : best, items[0])
-}
-
-function fmtBalance(upstream?: Upstream) {
-  const balance = upstream?.balance
-  if (!balance || balance.status === 'unsupported') return '不支持'
-  if (balance.unlimited) return '无限额'
-  if (balance.available == null) return '未知'
-  return `${balance.currency || '$'} ${balance.available.toFixed(2)}`
-}
-
-function groupBalance(group: UpstreamGroup) {
-  return fmtBalance(group.total > 1 ? maxBalanceUpstream(group.items) : group.items[0])
-}
-
-function groupBalanceMeta(group: UpstreamGroup) {
-  if (group.total <= 1) return fmtDate(group.items[0]?.balance?.updated_at)
-  const selected = maxBalanceUpstream(group.items)
-  return selected ? `取最高账号：${selected.name || `#${selected.id}`}` : '暂无可用余额'
-}
-
-function fmtBalanceUsed(upstream: Upstream) {
-  const balance = upstream.balance
-  return balance?.used == null ? '暂无数据' : `${balance.currency || '$'} ${balance.used.toFixed(2)}`
-}
-
-function balanceUsedUpdatedAt(upstream: Upstream) {
-  return upstream.balance?.last_success_at || upstream.balance?.updated_at
 }
 
 function officialCostDetail(upstream: Upstream, period: 'today' | 'lifetime') {
@@ -2045,7 +2009,14 @@ function officialCostDetail(upstream: Upstream, period: 'today' | 'lifetime') {
   return `${fmtCurrency(cost, 'USD')} / ${fmtCurrency(cost * Number(pricing.value.usd_cny_rate || 7.2), 'CNY')} · 覆盖 ${fmtPercent(coverage)}`
 }
 
+let invalidFrame = 0
+function focusInvalid(event: Event) {
+ const target = event.target as HTMLInputElement
+ if (invalidFrame || !target?.scrollIntoView) return
+ invalidFrame = requestAnimationFrame(() => { invalidFrame = 0; target.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'instant' : 'smooth' }); target.focus({ preventScroll: true }) })
+}
 onMounted(async () => {
+  document.addEventListener('invalid', focusInvalid, true)
   colorScheme.addEventListener('change', applyTheme)
   window.addEventListener('keydown', handleGlobalKeydown)
   window.addEventListener('popstate', handleHistoryNavigation)
@@ -2054,12 +2025,20 @@ onMounted(async () => {
     admin.value = await api.get('/api/admin/me')
     auth.value = 'ready'
     view.value = viewFromLocation()
-    if (!location.hash) history.replaceState(null, '', '#dashboard')
+    currentEntry = `dapi-${Date.now()}-${++navigationSequence}`
+    history.scrollRestoration = 'manual'
+    history.replaceState({ dapiEntry: currentEntry }, '', location.hash || '#dashboard')
     await loadCurrent()
   } catch { auth.value = 'guest' }
 })
 
 onBeforeUnmount(() => {
+  bulkController?.abort()
+  document.removeEventListener('invalid', focusInvalid, true)
+  cancelAnimationFrame(invalidFrame)
+  window.clearTimeout(savedUpstreamTimer)
+  for (const controller of dashboardPartControllers.values()) controller.abort()
+  keySimulationController?.abort()
   if (activeModelTestRun) stopModelTests()
   singleModelTestController?.abort()
   pageLoadController?.abort()
@@ -2138,18 +2117,21 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <span class="refresh-meta" :class="{ stale: !lastUpdatedAt || refreshError }" :title="refreshError || undefined">{{ refreshError || fmtUpdatedAt(lastUpdatedAt) }}</span>
-          <label class="auto-refresh-control" title="自动刷新（30 秒）">
+          <label class="auto-refresh-control" title="每 30 秒刷新；查看明细、定位图表、批量操作或编辑配置时暂停">
             <input v-model="autoRefresh" type="checkbox" />
-            <span>自动刷新</span>
+            <span>{{ autoRefresh && refreshPaused ? '自动刷新已暂停' : '自动刷新' }}</span>
           </label>
           <button class="icon refresh" title="刷新当前页面" :disabled="loading" @click="loadCurrent"><RefreshCw :class="{ spin: loading }" :size="17" /></button>
         </div>
         <div v-if="loading" class="loading-line" aria-hidden="true"></div>
       </header>
 
-      <div class="content" :aria-busy="loading">
+      <div class="content" :aria-busy="view === 'dashboard' ? dashboardState.dashboard.busy : loading">
         <section v-if="view === 'dashboard'" class="view-stack">
-          <section v-if="!setupComplete" class="setup-panel panel">
+          <template v-for="part in (['upstreams', 'groups', 'keys'] as const)" :key="part">
+            <LoadNotice v-if="dashboardState[part].error" v-bind="dashboardState[part]" :label="({ upstreams: '上游状态', groups: '分组', keys: '客户端密钥' })[part]" @retry="retryDashboardPart(part)" />
+          </template>
+          <section v-if="setupLoaded && !setupComplete" class="setup-panel panel">
             <div class="setup-panel-head"><div><h2>完成首次配置</h2><p>按顺序完成以下步骤，快速验证网关可以正常路由。</p></div><span class="setup-progress">{{ setupSteps.filter((step) => step.done).length }}/{{ setupSteps.length }}</span></div>
             <div class="setup-steps">
               <button v-for="step in setupSteps" :key="step.id" class="setup-step" :class="{ done: step.done }" @click="go(step.view)">
@@ -2158,11 +2140,13 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </section>
-          <div class="dashboard-metric-grid dashboard-health-grid">
-            <article class="dashboard-metric"><span class="metric-icon green"><Server :size="19" /></span><div><small>可用上游</small><strong>{{ summary.healthy }}<em>/ {{ summary.total }}</em></strong><span class="metric-detail">{{ dashboard.active_alerts || 0 }} 个活跃告警</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon ink"><Activity :size="19" /></span><div><small>24 小时请求</small><strong>{{ fmtNumber(summary.requests) }}</strong><span class="metric-detail">{{ fmtNumber(dashboard.usage_requests_24h) }} 条含 Token</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon blue"><Check :size="19" /></span><div><small>成功率</small><strong>{{ summary.success.toFixed(1) }}<em>%</em></strong><span class="metric-detail">按 HTTP 2xx-3xx 统计</span></div></article>
-            <article class="dashboard-metric"><span class="metric-icon amber"><Gauge :size="19" /></span><div><small>平均延迟</small><strong>{{ fmtDuration(summary.latency) }}</strong><span class="metric-detail">24 小时请求均值</span></div></article>
+          <LoadNotice v-bind="dashboardState.dashboard" @retry="retryDashboardPart('dashboard')" />
+          <div v-if="dashboardState.dashboard.busy && !dashboardState.dashboard.updated" class="dashboard-metric-grid dashboard-health-grid" aria-label="正在加载总览指标"><article v-for="n in 4" :key="n" class="dashboard-metric metric-skeleton" aria-hidden="true"><i></i><div><span></span><strong></strong><span></span></div></article></div>
+          <div v-if="dashboardState.dashboard.updated" class="dashboard-metric-grid dashboard-health-grid">
+            <article class="dashboard-metric"><span class="metric-icon green"><Server :size="19" /></span><div><small><button class="metric-link" @click="go('upstreams')">可用上游</button></small><strong v-change-glow="summary.healthy">{{ summary.healthy }}<em>/ {{ summary.total }}</em></strong><span class="metric-detail">{{ dashboard.active_alerts || 0 }} 个活跃告警</span></div></article>
+            <article class="dashboard-metric"><span class="metric-icon ink"><Activity :size="19" /></span><div><small><button class="metric-link" @click="drillLogs({ since: new Date(Date.now() - 86400000).toISOString(), until: new Date().toISOString() })">24 小时请求</button></small><strong v-change-glow="summary.requests">{{ fmtNumber(summary.requests) }}</strong><span class="metric-detail">{{ fmtNumber(dashboard.usage_requests_24h) }} 条含 Token</span></div></article>
+            <article class="dashboard-metric"><span class="metric-icon blue"><Check :size="19" /></span><div><small><button class="metric-link" title="查看最近 24 小时失败请求" @click="drillLogs({ status: 'error', since: new Date(Date.now() - 86400000).toISOString(), until: new Date().toISOString() })">成功率</button></small><strong v-change-glow="summary.success">{{ summary.success.toFixed(1) }}<em>%</em></strong><span class="metric-detail">按 HTTP 2xx-3xx 统计</span></div></article>
+            <article class="dashboard-metric"><span class="metric-icon amber"><Gauge :size="19" /></span><div><small>平均延迟</small><strong v-change-glow="summary.latency">{{ fmtDuration(summary.latency) }}</strong><span class="metric-detail">24 小时请求均值</span></div></article>
             <template v-if="dashboardMetricsExpanded">
               <article class="dashboard-metric"><span class="metric-icon green"><ChevronRight :size="19" /></span><div><small>输入 / 输出 Token</small><strong>{{ fmtNumber(dashboard.input_tokens_24h) }} <em>/ {{ fmtNumber(dashboard.output_tokens_24h) }}</em></strong><span class="metric-detail">缓存读 {{ fmtNumber(dashboard.cached_input_tokens_24h) }}</span></div></article>
               <article class="dashboard-metric"><span class="metric-icon blue"><ChartNoAxesCombined :size="19" /></span><div><small>Token 命中率</small><strong>{{ fmtPercent(dashboardCacheHitRate) }}</strong><span class="metric-detail">缓存读 / 输入 Token</span></div></article>
@@ -2180,19 +2164,20 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div v-if="dashboardCompare" class="comparison-summary" :class="{ pending: dashboardComparisonLoading }"><span>{{ dashboardComparisonLoading ? '正在读取上周期数据…' : dashboardComparisonReady ? '环比上周期' : '选择 7 天或 30 天后可用' }}</span><template v-if="dashboardComparisonReady"><strong :class="dashboardDeltaTone('requests')">请求 {{ dashboardDeltaText('requests') }}</strong><strong :class="dashboardDeltaTone('tokens')">Token {{ dashboardDeltaText('tokens') }}</strong><strong :class="dashboardDeltaTone('cost')">成本 {{ dashboardDeltaText('cost') }}</strong></template></div>
-            <div class="chart-summary dashboard-chart-summary" aria-label="当前趋势汇总">
+            <div class="chart-summary dashboard-chart-summary" :aria-label="selectedChartRow ? '已选时段汇总' : '当前趋势汇总'">
               <span><i class="bar"></i><small>请求</small><strong>{{ fmtNumber(dashboardTrendTotals.requests) }}</strong></span><span><i class="line"></i><small>Token</small><strong>{{ fmtNumber(dashboardTrendTotals.tokens) }}</strong></span><span><i class="cache-dot"></i><small>缓存读</small><strong>{{ fmtNumber(dashboardTrendTotals.cached) }}</strong></span><span><i class="cost-dot"></i><small>成本 USD</small><strong>{{ fmtCurrency(dashboardTrendTotals.cost, 'USD') }}</strong></span>
             </div>
-            <div v-if="dashboardChartRows.length" class="chart-frame dashboard-chart-frame"><UsageChart :rows="dashboardChartRows" :theme="resolvedTheme" :metric="dashboardMetric" :range-label="dashboardRange === '24h' ? '近 24 小时' : dashboardRange === '7d' ? '近 7 天' : '近 30 天'" /></div>
-            <div v-else class="empty"><ChartNoAxesCombined :size="22" /><strong>暂无使用数据</strong><span>产生请求后显示趋势。</span></div>
+            <div v-if="dashboardChartRows.length" class="chart-frame dashboard-chart-frame"><UsageChart :rows="dashboardChartRows" :theme="resolvedTheme" :metric="dashboardMetric" :selected="selectedChartRow" @select="selectedChartRow = $event" :range-label="dashboardRange === '24h' ? '近 24 小时' : dashboardRange === '7d' ? '近 7 天' : '近 30 天'" /></div>
+            <div v-else class="empty"><ChartNoAxesCombined :size="22" /><strong>{{ dashboardState.dashboard.busy ? '正在加载使用数据…' : dashboardState.dashboard.error ? '使用数据暂不可用' : '暂无使用数据' }}</strong><span>产生请求后显示趋势。</span></div>
+            <Collapse :open="Boolean(selectedChartRow)"><div v-if="selectedChartRow" class="drilldown-bar" role="status"><div><strong>已选时段</strong><span>{{ chartWindowLabel(selectedChartRow, 'dashboard') }} · {{ fmtNumber(selectedChartRow.requests) }} 次请求</span></div><button class="secondary" @click="inspectChartRow(selectedChartRow, 'dashboard')">查看请求日志<ChevronRight :size="14" /></button></div></Collapse>
           </section>
           <div class="dashboard-detail-grid dashboard-supporting-grid">
-            <section class="panel cost-breakdown"><div class="panel-head"><div><h2>成本明细</h2><p>近 30 天 · 模型与 Token 类型</p></div><span class="muted">{{ fmtPercent(dashboardCostCoverage30d) }} 已计价 · 月度预测 {{ fmtCurrency(dashboardCostForecast30d, 'USD') }}</span></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>请求</th><th>覆盖率</th><th>Token 构成</th><th class="right">USD</th><th class="right">CNY</th></tr></thead><tbody><tr v-for="row in dashboardCostByModel" :key="row.model"><td><strong>{{ row.model }}</strong></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtPercent(row.requests ? row.known / row.requests : null) }}</td><td><small class="token-breakdown">入 {{ fmtNumber(row.input) }} · 出 {{ fmtNumber(row.output) }}<br />读 {{ fmtNumber(row.cached) }} · 写 {{ fmtNumber(row.cacheWrite) }}</small></td><td class="right"><strong>{{ fmtCurrency(row.cost_usd, 'USD') }}</strong></td><td class="right">{{ fmtCurrency(row.cost_usd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }}</td></tr><tr v-if="!dashboardCostByModel.length"><td colspan="6"><div class="empty"><CircleDollarSign :size="20" /><strong>暂无可计价成本</strong><span>绑定价格档案并产生带 Token 的请求后显示。</span></div></td></tr></tbody></table></div></section>
-            <section class="panel pricing-snapshot"><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" :disabled="saving" @click="backfillPricing"><RefreshCw :class="{ spin: saving }" :size="15" />回算成本</button><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.prices?.length || 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<Json>(pricing.profiles).length" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
+            <section class="panel cost-breakdown"><LoadNotice v-bind="dashboardState.cost" @retry="retryDashboardPart('cost')" /><div class="panel-head"><div><h2>成本明细</h2><p>近 30 天 · 模型与 Token 类型</p></div><span class="muted">{{ fmtPercent(dashboardCostCoverage30d) }} 已计价 · 月度预测 {{ fmtCurrency(dashboardCostForecast30d, 'USD') }}</span></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>请求</th><th>覆盖率</th><th>Token 构成</th><th class="right">USD</th><th class="right">CNY</th></tr></thead><tbody><tr v-for="row in dashboardCostByModel" :key="row.model"><td><button class="text-button inline-link" @click="drillLogs({ model: row.model, since: new Date(new Date().setUTCHours(0,0,0,0) - 29 * 86400000).toISOString(), until: new Date().toISOString() })">{{ row.model }}</button></td><td>{{ fmtNumber(row.requests) }}</td><td>{{ fmtPercent(row.requests ? row.known / row.requests : null) }}</td><td><small class="token-breakdown">入 {{ fmtNumber(row.input) }} · 出 {{ fmtNumber(row.output) }}<br />读 {{ fmtNumber(row.cached) }} · 写 {{ fmtNumber(row.cacheWrite) }}</small></td><td class="right"><strong>{{ fmtCurrency(row.cost_usd, 'USD') }}</strong></td><td class="right">{{ fmtCurrency(row.cost_usd * Number(pricing.usd_cny_rate || 7.2), 'CNY') }}</td></tr><tr v-if="!dashboardCostByModel.length && !dashboardState.cost.busy && !dashboardState.cost.error"><td colspan="6"><div class="empty"><CircleDollarSign :size="20" /><strong>暂无可计价成本</strong><span>绑定价格档案并产生带 Token 的请求后显示。</span></div></td></tr></tbody></table></div></section>
+            <section class="panel pricing-snapshot"><LoadNotice v-bind="dashboardState.pricing" @retry="retryDashboardPart('pricing')" /><div class="panel-head"><div><h2>价格档案</h2><p>LiteLLM 自动价格 · 手动档案兜底 · USD/CNY {{ Number(pricing.usd_cny_rate || 7.2).toFixed(2) }}</p></div><div class="row-actions"><button class="secondary" :disabled="saving" @click="backfillPricing"><RefreshCw :class="{ spin: saving }" :size="15" />回算成本</button><button class="secondary" @click="openPricingProfile()"><Plus :size="15" />新建档案</button><button class="icon" title="同步 LiteLLM 价格" :disabled="saving" @click="refreshPricing"><RefreshCw :class="{ spin: saving }" :size="16" /></button></div></div><div class="snapshot-list"><div v-for="profile in listOf<PricingProfile>(pricing.profiles)" :key="profile.id" class="snapshot-row"><div><strong>{{ profile.name }}</strong><small>{{ profile.model_count ?? profile.prices?.length ?? 0 }} 个模型 · {{ profile.source_version || '内置快照' }}</small></div><span class="muted">{{ profile.last_refreshed_at ? fmtDate(profile.last_refreshed_at) : '待同步' }}</span><div class="row-actions"><button class="icon" title="编辑价格档案" @click="openPricingProfile(profile)"><Pencil :size="15" /></button><button class="icon danger" title="删除价格档案" @click="removePricingProfile(profile)"><Trash2 :size="15" /></button></div></div><div v-if="!listOf<PricingProfile>(pricing.profiles).length && !dashboardState.pricing.busy && !dashboardState.pricing.error" class="empty"><CircleDollarSign :size="20" /><strong>暂无价格档案</strong></div></div></section>
           </div>
           <section class="panel dashboard-upstream-panel">
             <div class="panel-head dashboard-route-head">
-              <div><h2>上游状态</h2><p>{{ dashboardRouteView === 'topology' ? '按 baseurl 聚合的路由拓扑与决策路径' : '当前路由顺序与连接状态' }}</p></div>
+              <div><h2>上游状态</h2><p>{{ dashboardRouteView === 'topology' ? '路由关系预览 · 实际切换请查看请求尝试链' : '当前路由顺序与连接状态' }}</p></div>
               <div class="dashboard-route-actions">
                 <div class="segmented-control" aria-label="上游视图">
                   <button :class="{ active: dashboardRouteView === 'current' }" :aria-pressed="dashboardRouteView === 'current'" @click="dashboardRouteView = 'current'">列表</button>
@@ -2272,7 +2257,7 @@ onBeforeUnmount(() => {
                 <span class="topology-response-line" aria-hidden="true"></span>
                 <div class="topology-response-node"><span class="topology-response-icon"><Check :size="15" /></span><div><strong>响应出口</strong><small>{{ fmtNumber(summary.requests) }} 请求 · 成功率 {{ summary.success.toFixed(1) }}% · 平均 {{ fmtDuration(summary.latency) }}</small></div><span class="status" :class="summary.success >= 99 ? 'good' : summary.success >= 95 ? 'warn' : 'bad'"><i></i>{{ summary.success >= 99 ? '稳定' : summary.success >= 95 ? '关注' : '异常' }}</span></div>
               </div>
-              <section v-if="topologyHasFocus" class="topology-focus-panel" aria-live="polite"><div><strong>{{ topologyFocusedKey ? `客户端 Key：${topologyFocusedKey.name}` : `分组：${topologyFocusedGroup?.name || '未知分组'}` }}</strong><small>{{ topologyFocusedKey ? `按所属分组 · ${topologyFocusedUpstreams.length} 条候选线路` : `${topologyFocusedUpstreams.length} 条候选线路 · 按优先级尝试` }}</small></div><div class="topology-focus-route"><span v-for="item in topologyFocusedUpstreams" :key="item.id" class="topology-focus-chip"><b>P{{ item.priority }}</b>{{ item.name }}<em :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</em></span><span v-if="!topologyFocusedUpstreams.length" class="muted">暂无可用线路</span></div><button class="icon" title="清除拓扑聚焦" @click="clearTopologyFocus"><X :size="15" /></button></section>
+              <section v-if="topologyHasFocus" class="topology-focus-panel" aria-live="polite"><div><strong>{{ topologyFocusedKey ? `客户端 Key：${topologyFocusedKey.name}` : `分组：${topologyFocusedGroup?.name || '未知分组'}` }}</strong><small>{{ topologyFocusedKey ? `按所属分组 · ${topologyFocusedUpstreams.length} 条候选线路` : `${topologyFocusedUpstreams.length} 条候选线路 · 按优先级尝试` }}</small></div><div class="topology-focus-route"><span v-for="item in topologyFocusedUpstreams" :key="item.id" class="topology-focus-chip"><b>P{{ item.priority }}</b>{{ item.name }}<em :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</em></span><span v-if="!topologyFocusedUpstreams.length" class="muted">暂无可用线路</span></div><div class="topology-focus-actions"><button class="secondary" @click="inspectTopologyLogs">查看日志</button><button class="secondary" @click="inspectTopologyUsage">查看用量</button><button class="secondary" @click="editTopologyFocus">编辑配置</button></div><button class="icon" title="清除拓扑聚焦" @click="clearTopologyFocus"><X :size="15" /></button></section>
             </div>
           </section>
         </section>
@@ -2284,7 +2269,7 @@ onBeforeUnmount(() => {
           <section class="panel table-panel"><div class="table-wrap"><table>
             <thead><tr><th>名称</th><th>状态</th><th>上游</th><th>绑定密钥</th><th class="right">操作</th></tr></thead>
             <tbody>
-              <tr v-for="item in groups" :key="item.id" :class="{ subdued: !item.enabled }">
+              <tr v-for="item in groups" :key="item.id" v-change-glow="[item.name, item.enabled, item.upstream_ids?.join(',')].join(':')" :class="{ subdued: !item.enabled }">
                 <td><strong>{{ item.name }}</strong><small>创建于 {{ fmtDate(item.created_at) }}</small></td>
                 <td><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span></td>
                 <td>{{ item.upstream_ids?.map((id) => upstreams.find((upstream) => upstream.id === id)?.name || `#${id}`).join('、') || '无上游' }}</td>
@@ -2297,7 +2282,9 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else-if="view === 'upstreams'" class="view-stack">
-          <div class="action-row upstream-toolbar"><div class="toolbar-summary"><p>{{ filteredUpstreamGroups.length }}/{{ upstreamGroups.length }} 个 Base URL，数字越小优先级越高。</p><span v-if="upstreamSelectedIds.length" class="selection-count">已选 {{ upstreamSelectedIds.length }} 个 Key</span></div><div class="toolbar-actions"><button v-if="upstreamSelectedIds.length" class="secondary" :disabled="saving" @click="bulkUpstreamAction('check')"><Activity :size="15" />批量检查</button><button v-if="upstreamSelectedIds.length" class="secondary" :disabled="saving" @click="bulkUpstreamAction('balance')"><CircleDollarSign :size="15" />批量刷新余额</button><button class="primary" @click="openUpstream()"><Plus :size="17" />添加上游</button></div></div>
+          <div class="action-row upstream-toolbar"><div class="toolbar-summary"><p>{{ filteredUpstreamGroups.length }}/{{ upstreamGroups.length }} 个 Base URL，数字越小优先级越高。</p></div><button class="primary" @click="openUpstream()"><Plus :size="17" />添加上游</button></div>
+          <Transition name="batch-bar"><div v-if="upstreamSelectedIds.length || bulkState.running" class="batch-action-bar" role="region" aria-label="批量操作"><span>已选 {{ upstreamSelectedIds.length }} 个 Key</span><button class="secondary" :disabled="saving" @click="bulkUpstreamAction('check')"><Activity :size="15" />批量检查</button><button class="secondary" :disabled="saving" @click="bulkUpstreamAction('balance')"><CircleDollarSign :size="15" />批量刷新余额</button><button class="text-button" :disabled="bulkState.running" @click="upstreamSelectedIds = []">取消选择</button></div></Transition>
+          <section v-if="bulkState.items.length" class="panel batch-progress" aria-label="批量执行进度"><div class="panel-head"><div><h2>{{ bulkState.action === 'check' ? '连接检查' : '余额刷新' }}</h2><p role="status">{{ bulkState.completed }} / {{ bulkState.items.length }} 已完成 · {{ bulkFailed.length }} 个失败</p></div><button v-if="!bulkState.running && bulkFailed.length" class="secondary" @click="bulkUpstreamAction(bulkState.action, true)">仅重试失败项</button><button v-if="!bulkState.running" class="text-button" @click="bulkState.items = []">收起结果</button></div><progress :value="bulkState.completed" :max="bulkState.items.length" aria-label="批量操作完成进度"></progress><ul class="batch-results"><li v-for="item in bulkState.items" :key="item.id" v-change-glow="item.status"><strong>{{ item.name }}</strong><span :class="{ good: item.status === 'success', bad: item.status === 'failed' }"><LoaderCircle v-if="item.status === 'running'" class="spin" :size="13" />{{ ({ queued: '排队中', running: '执行中', success: '成功', failed: '失败' })[item.status] }}</span><small v-if="item.error">{{ item.error }}</small></li></ul></section>
           <div class="list-filterbar"><label><span>搜索</span><input v-model.trim="upstreamFilter.search" placeholder="Base URL 或 Key 名称" /></label><label><span>状态</span><select v-model="upstreamFilter.status"><option value="all">全部状态</option><option value="healthy">正常</option><option value="warning">关注</option><option value="error">异常</option></select></label><label><span>协议</span><select v-model="upstreamFilter.protocol"><option value="all">全部协议</option><option v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><button class="text-button" @click="Object.assign(upstreamFilter, { search: '', status: 'all', protocol: 'all' })">清除筛选</button></div>
           <section class="panel table-panel"><div class="table-wrap"><table class="upstream-table">
             <thead><tr>
@@ -2311,7 +2298,7 @@ onBeforeUnmount(() => {
             </tr></thead>
             <tbody>
               <template v-for="item in sortRows(filteredUpstreamGroups, 'upstreams')" :key="item.key">
-              <tr :class="{ subdued: item.enabled === 0 }" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
+              <tr :class="{ subdued: item.enabled === 0, 'saved-row': item.items.some(upstream => upstream.id === savedUpstreamID) }" v-change-glow="item.items.map(upstream => [upstream.name, upstream.priority, upstream.health_status, upstream.balance?.available].join(':')).join('|')" class="clickable" tabindex="0" @click="openUpstreamGroup(item)" @keydown.enter.prevent="openUpstreamGroup(item)">
                 <td><input class="upstream-checkbox" type="checkbox" :checked="item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :indeterminate="item.items.some((entry) => upstreamSelectedIds.includes(entry.id)) && !item.items.every((entry) => upstreamSelectedIds.includes(entry.id))" :aria-label="`选择 ${item.base_url} 下的 Key`" @click.stop @change="item.items.forEach((entry) => toggleUpstreamSelection(entry, $event))" /></td><td><span class="priority">{{ item.priority }}</span></td>
                 <td><strong>{{ item.base_url }}</strong><small class="cell-copy">{{ item.total }} 个 Key · {{ item.available }} 个可路由<button class="copy-button" title="复制 Base URL" @click.stop="copyValue(item.base_url, 'Base URL')"><Copy :size="12" /></button></small></td>
                 <td><span class="status" :class="groupStatusTone(item)"><i></i>{{ groupStatusText(item) }}</span><small v-if="item.total > 1">点击查看各 Key 状态</small></td>
@@ -2357,7 +2344,7 @@ onBeforeUnmount(() => {
             </tr></thead>
             <tbody>
               <template v-for="item in sortRows(filteredKeys, 'keys')" :key="item.id">
-              <tr :class="{ subdued: !item.enabled }">
+              <tr v-change-glow="[item.name, item.enabled, item.group_id, item.models?.join(',')].join(':')" :class="{ subdued: !item.enabled }">
                 <td><strong>{{ item.name }}</strong><small>创建于 {{ fmtDate(item.created_at) }}</small></td>
                 <td><code>{{ item.prefix || item.key_prefix || '-' }}••••••••</code></td>
                 <td><span class="status" :class="item.enabled ? 'good' : 'warn'"><i></i>{{ item.enabled ? '启用' : '停用' }}</span></td>
@@ -2374,13 +2361,17 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else-if="view === 'logs'" class="view-stack">
-          <form class="filterbar" @submit.prevent="logFilter.offset = 0; loadLogs()">
+          <p v-if="logsError" class="form-error" role="alert">日志加载失败：{{ logsError }}。{{ logsLoaded ? '当前仍显示上次结果。' : '' }}<button class="text-button" @click="loadLogs()">重试</button></p>
+          <p v-if="logsBusy && !logsLoaded" role="status">正在加载请求日志…</p>
+          <TransitionGroup name="filter-chip" tag="div" class="applied-filters" aria-label="已生效的日志筛选"><button v-for="chip in logFilterChips" :key="chip.key" class="filter-chip" :title="`移除筛选：${chip.label}`" @click="removeLogFilter(chip.key)">{{ chip.label }}<X :size="13" /></button></TransitionGroup>
+          <form class="filterbar logs-filterbar" @submit.prevent="loadLogs(undefined, 0)">
             <label><span>状态</span><select v-model="logFilter.status" @change="logFilter.status === 'attempt_error' && (logFilter.scope = 'attempts')"><option value="">全部</option><option value="success">成功</option><option value="error">请求最终失败</option><option value="attempt_error">上游尝试失败（告警口径）</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
             <label><span>上游匹配</span><select v-model="logFilter.scope" :disabled="logFilter.status === 'attempt_error'"><option value="">最终上游</option><option value="attempts">参与尝试的上游</option></select></label><label><span>上游</span><select v-model="logFilter.upstream_id"><option value="">全部</option><option v-for="item in upstreams" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
             <label><span>分组</span><select v-model="logFilter.group_id"><option value="">全部</option><option v-for="item in groups" :value="String(item.id)" :key="item.id">{{ item.name }}</option></select></label>
-            <button class="secondary"><Search :size="16" />筛选</button><div class="quick-filters"><button type="button" class="text-button" :class="{ active: logFilter.status === 'error' }" @click="setLogPreset('errors')">只看失败</button><button type="button" class="text-button" :class="{ active: !logFilter.status && !logFilter.upstream_id && !logFilter.group_id }" @click="setLogPreset('all')">清除筛选</button></div>
+            <label><span>客户端</span><select v-model="logFilter.api_key_id" aria-label="筛选客户端"><option value="">全部</option><option v-for="key in keys" :key="key.id" :value="String(key.id)">{{ key.name }}</option></select></label><label><span>模型</span><input v-model.trim="logFilter.model" aria-label="筛选模型" placeholder="完整模型名称" /></label>
+            <button class="secondary" :disabled="logsBusy"><Search :size="16" />{{ logsBusy ? '加载中…' : '筛选' }}</button><div class="quick-filters"><button type="button" class="text-button" :class="{ active: logFilter.status === 'error' }" @click="setLogPreset('errors')">只看失败</button><button type="button" class="text-button" :class="{ active: !logFilter.status && !logFilter.upstream_id && !logFilter.group_id }" @click="setLogPreset('all')">清除筛选</button></div>
           </form>
-          <section class="panel table-panel"><div class="table-wrap"><table>
+          <section class="panel table-panel logs-result" :class="{ 'is-refreshing': logsBusy && logsLoaded }" :aria-busy="logsBusy"><p class="table-scroll-hint">左右滑动查看完整日志，点击一行展开详情。</p><div class="table-wrap" tabindex="0" role="region" aria-label="请求日志表格"><table>
             <thead><tr>
               <th :aria-sort="ariaSort('logs', 'created_at')"><button class="sort-button" @click="toggleSort('logs', 'created_at')">时间<ArrowUpDown :size="12" /></button></th>
               <th>请求</th><th>协议 / 模型</th>
@@ -2391,15 +2382,15 @@ onBeforeUnmount(() => {
             </tr></thead>
             <tbody>
               <template v-for="item in sortRows(logs, 'logs')" :key="item.request_id">
-                <tr class="clickable" tabindex="0" role="button" :aria-expanded="expandedLog === item.request_id" :aria-label="`展开请求 ${item.request_id} 详情`" @click="toggleLog(item.request_id)" @keydown.enter.prevent="toggleLog(item.request_id)" @keydown.space.prevent="toggleLog(item.request_id)">
+                <tr class="clickable" tabindex="0" role="button" :aria-expanded="expandedLog === item.request_id" :aria-label="`展开请求 ${item.request_id} 详情`" :data-log-id="item.request_id" @click="toggleLog(item.request_id)" @keydown.enter.self.prevent="toggleLog(item.request_id)" @keydown.space.self.prevent="toggleLog(item.request_id)">
                   <td class="nowrap">{{ fmtDate(item.created_at) }}</td><td><span class="cell-copy"><code>{{ item.request_id.slice(0, 12) }}</code><button class="copy-button" title="复制完整请求 ID" @click.stop="copyValue(item.request_id, '请求 ID')"><Copy :size="12" /></button></span><small>{{ item.api_key_name || '未知客户端' }} · {{ item.group_name || '历史未分组' }}</small></td>
                   <td><strong>{{ item.protocol }}</strong><small>{{ item.model || '-' }}</small></td>
-                  <td><span class="status" :class="item.status_code < 400 ? 'good' : 'bad'"><i></i>{{ item.status_code }}</span><small v-if="item.error_code">{{ item.error_code }}</small></td>
+                  <td><span class="status" :class="item.status_code >= 200 && item.status_code < 400 && !item.error_code ? 'good' : 'bad'"><i></i>{{ item.status_code }}{{ item.error_code && item.status_code < 400 ? ' · 未完成' : '' }}</span><small v-if="item.error_code">{{ item.error_code }}</small></td>
                   <td>{{ item.upstream_name || (item.upstream_id ? `#${item.upstream_id}` : '-') }}</td><td><strong>{{ fmtDuration(item.duration_ms) }}</strong><small>TTFB {{ fmtDuration(item.ttfb_ms) }} · TTFT {{ fmtDuration(item.ttft_ms) }}</small></td>
                   <td><strong>{{ item.usage?.input_tokens == null && item.usage?.output_tokens == null ? '未知' : fmtNumber((item.usage?.input_tokens || 0) + (item.usage?.output_tokens || 0)) }}</strong><small v-if="item.usage">入 {{ fmtMetric(item.usage.input_tokens) }} / 出 {{ fmtMetric(item.usage.output_tokens) }}</small></td>
                   <td><ChevronRight :size="16" :class="{ rotate: expandedLog === item.request_id }" /></td>
                 </tr>
-                <tr v-if="expandedLog === item.request_id" class="attempt-row"><td colspan="8"><div class="attempts">
+                <tr class="attempt-row" :aria-hidden="expandedLog !== item.request_id"><td colspan="8"><Collapse :open="expandedLog === item.request_id"><div class="attempts">
                   <div class="log-detail-grid">
                     <div><span>总耗时</span><strong>{{ fmtDuration(item.duration_ms) }}</strong></div>
                     <div><span>首包 TTFB</span><strong>{{ fmtDuration(item.ttfb_ms) }}</strong></div>
@@ -2411,13 +2402,13 @@ onBeforeUnmount(() => {
                     <div><span>Token 命中率</span><strong>{{ fmtPercent(logTokenHitRate(item)) }}</strong></div>
                   </div>
                   <div class="attempt-head"><div><strong>切换链</strong><span>{{ item.attempts?.length || 0 }} 次尝试</span></div><div class="log-detail-actions"><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogUpstream(item)"><Server :size="14" />查看上游</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'check')"><Activity :size="14" />检查连接</button><button v-if="item.upstream_id" class="text-button" @click.stop="inspectLogAction(item, 'balance')"><CircleDollarSign :size="14" />刷新余额</button></div></div>
-                  <div v-if="item.attempts?.length" class="attempt-timeline" aria-label="请求尝试时间轴"><div v-for="(attempt, index) in item.attempts" :key="index" class="attempt-timeline-row"><span>{{ index + 1 }}</span><div><strong>{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</strong><small>状态：{{ attempt.status_code || '无 HTTP 响应' }}</small><small v-if="attempt.error" style="overflow-wrap: anywhere">{{ attempt.error }}</small><div class="attempt-track"><i :class="attempt.status_code && attempt.status_code < 400 ? 'good' : 'bad'" :style="{ width: attemptWidth(item, attempt.duration_ms) }"></i></div></div><small>{{ fmtDuration(attempt.duration_ms) }}</small></div></div>
+                  <div v-if="item.attempts?.length" class="attempt-timeline" aria-label="请求尝试时间轴"><div v-for="(attempt, index) in item.attempts" :key="index" class="attempt-timeline-row"><span>{{ index + 1 }}</span><div><button class="text-button inline-link" :disabled="!attempt.upstream_id" @click="inspectUpstreamID(Number(attempt.upstream_id))">{{ attempt.upstream_name || `上游 #${attempt.upstream_id}` }}</button><small>状态：{{ attempt.status_code || '无 HTTP 响应' }}</small><small v-if="attempt.error" style="overflow-wrap: anywhere">{{ attempt.error }}</small><div class="attempt-track"><i :class="attempt.status_code && attempt.status_code < 400 ? 'good' : 'bad'" :style="{ width: attemptWidth(item, attempt.duration_ms) }"></i></div></div><small>{{ fmtDuration(attempt.duration_ms) }}</small></div></div>
                   <p v-else class="muted">未记录上游尝试。</p>
-                </div></td></tr>
+                </div></Collapse></td></tr>
               </template>
-              <tr v-if="!logs.length"><td colspan="8"><div class="empty"><Search :size="22" /><strong>暂无符合条件的日志</strong><span>调整状态或上游筛选条件后重试。</span></div></td></tr>
+              <tr v-if="!logs.length && logsLoaded && !logsError && !logsBusy"><td colspan="8"><div class="empty"><Search :size="22" /><strong>暂无符合条件的日志</strong><span>调整状态或上游筛选条件后重试。</span></div></td></tr>
             </tbody>
-          </table></div><div class="pagination"><span>每页 {{ logFilter.limit }} 条</span><div><button class="icon" title="上一页" :disabled="logFilter.offset === 0" @click="logFilter.offset = Math.max(0, logFilter.offset - logFilter.limit); loadLogs()"><ChevronLeft :size="17" /></button><button class="icon" title="下一页" :disabled="logs.length < logFilter.limit" @click="logFilter.offset += logFilter.limit; loadLogs()"><ChevronRight :size="17" /></button></div></div></section>
+          </table></div><div class="pagination"><span>第 {{ logPage + 1 }} 页 · 本页 {{ logs.length }} 条</span><div><button class="text-button" :disabled="logsBusy || logPage === 0" @click="loadLogs(undefined, 0)">返回首页</button><button class="icon" title="上一页" aria-label="上一页" :disabled="logsBusy || logPage === 0" @click="loadLogs(undefined, logPage - 1)"><ChevronLeft :size="17" /></button><button class="icon" title="下一页" aria-label="下一页" :disabled="logsBusy || !logNextCursor" @click="loadLogs(undefined, logPage + 1)"><ChevronRight :size="17" /></button></div></div></section>
         </section>
 
         <section v-else-if="view === 'usage'" class="view-stack">
@@ -2446,7 +2437,8 @@ onBeforeUnmount(() => {
 			<article class="cost-metric"><span class="metric-icon amber"><ChartNoAxesCombined :size="19" /></span><div><small>月度成本预测</small><strong>{{ fmtCurrency(usageCostForecast30d, 'USD') }}</strong><span class="metric-detail">按当前周期日均外推 30 天</span></div></article>
           </div>
           <section class="panel usage-panel"><div class="panel-head usage-chart-head"><div><h2>使用趋势</h2><p>{{ usageFilter.granularity === 'day' ? '按天' : usageFilter.granularity === 'week' ? '按周' : '按月' }} · {{ usageDimensionLabel({ label: usageFilter.dimension === 'upstream' ? '上游' : usageFilter.dimension === 'api_key' ? '客户端密钥' : usageFilter.dimension === 'group' ? '分组' : usageFilter.dimension === 'protocol' ? '协议' : '模型' }) }}</p></div><div class="segmented-control" role="group" aria-label="趋势指标"><button :aria-pressed="usageMetric === 'requests'" :class="{ active: usageMetric === 'requests' }" @click="usageMetric = 'requests'">请求</button><button :aria-pressed="usageMetric === 'tokens'" :class="{ active: usageMetric === 'tokens' }" @click="usageMetric = 'tokens'">Token</button><button :aria-pressed="usageMetric === 'cache'" :class="{ active: usageMetric === 'cache' }" @click="usageMetric = 'cache'">缓存</button><button :aria-pressed="usageMetric === 'latency'" :class="{ active: usageMetric === 'latency' }" @click="usageMetric = 'latency'">耗时</button></div></div>
-            <div v-if="usageRows.length" class="chart-frame"><UsageChart :rows="usageRows" :theme="resolvedTheme" :metric="usageMetric" :range-label="`近 ${usageFilter.days} 天`" /></div>
+            <div v-if="usageRows.length" class="chart-frame"><UsageChart :rows="usageRows" :theme="resolvedTheme" :metric="usageMetric" :selected="selectedUsageRow" @select="selectedUsageRow = $event" :range-label="`近 ${usageFilter.days} 天`" /></div>
+            <Collapse v-if="usageRows.length" :open="Boolean(selectedUsageRow)"><div v-if="selectedUsageRow" class="drilldown-bar"><div><strong>{{ usageDimensionLabel(selectedUsageRow) }}</strong><span>{{ chartWindowLabel(selectedUsageRow, 'usage') }} · {{ fmtNumber(selectedUsageRow.requests) }} 次请求</span><small v-if="!canDrillUsage(selectedUsageRow)">此项合并了其他或已删除维度，请选择具体维度查看日志。</small></div><button class="secondary" :disabled="!canDrillUsage(selectedUsageRow)" @click="inspectChartRow(selectedUsageRow, 'usage')">查看请求日志<ChevronRight :size="14" /></button></div></Collapse>
             <div v-else class="empty"><Gauge :size="22" /><strong>暂无用量数据</strong><span>产生请求后，这里会显示趋势与缓存命中情况。</span></div>
           </section>
           <section class="panel table-panel usage-table-panel"><div class="panel-head"><div><h2>明细汇总</h2><p>Top {{ usageFilter.topN }} · 其余项目聚合为“其他”</p></div><div class="panel-head-actions"><span class="muted usage-hit-summary">请求命中率 {{ fmtPercent(usageRequestHitRate) }}</span><button class="secondary usage-export-inline" type="button" @click="exportUsageCSV"><Download :size="15" />导出</button></div></div><div class="table-wrap"><table><thead><tr>
@@ -2460,6 +2452,7 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-else-if="view === 'channels'" class="view-stack">
+          <OperationsPanel />
           <div class="section-tabs" role="tablist" aria-label="通知设置">
             <button role="tab" :aria-selected="notificationSection === 'channels'" :class="{ active: notificationSection === 'channels' }" @click="notificationSection = 'channels'"><Bell :size="15" />通知渠道</button>
             <button role="tab" :aria-selected="notificationSection === 'alerts'" :class="{ active: notificationSection === 'alerts' }" @click="notificationSection = 'alerts'"><AlertCircle :size="15" />告警规则</button>
@@ -2524,10 +2517,10 @@ onBeforeUnmount(() => {
     </main>
   </div>
 
-  <div v-if="upstreamModal" class="drawer-backdrop" @mousedown.self="closeUpstream">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="upstreamModal" class="drawer-backdrop" @mousedown.self="closeUpstream">
     <section class="drawer" role="dialog" aria-modal="true" aria-labelledby="upstream-title">
       <header><div><h2 id="upstream-title">{{ editingUpstream ? '编辑上游' : '添加上游' }}</h2><p>配置路由能力、模型与故障恢复策略</p></div><button class="icon" title="关闭" @click="closeUpstream"><X :size="19" /></button></header>
-      <form ref="upstreamFormElement" @submit.prevent="saveUpstream">
+      <form ref="upstreamFormElement" @submit.prevent="saveUpstream"><p v-if="upstreamFormError" class="form-error" role="alert">{{ upstreamFormError }}</p>
         <div class="form-section"><h3>基本信息</h3><div class="form-grid">
           <label>名称<input v-model.trim="upstreamForm.name" required autofocus placeholder="生产主线路" /></label>
           <label>类型<select v-model="upstreamForm.kind"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></select></label>
@@ -2536,12 +2529,12 @@ onBeforeUnmount(() => {
           <label v-if="upstreamForm.user_agent_mode === 'custom'">自定义 User-Agent<input v-model="upstreamForm.user_agent" maxlength="256" placeholder="client/1.0.0" /></label>
           <label>API Key<input v-model="upstreamForm.api_key" type="password" :required="!editingUpstream" :placeholder="editingUpstream ? '留空表示不修改' : 'sk-…'" autocomplete="off" /></label>
           <label>优先级<input v-model.number="upstreamForm.priority" type="number" min="0" required /></label>
-          <label class="span-2">价格档案 <span>用于官方价格估算</span><select v-model.number="upstreamForm.pricing_profile_id"><option :value="0">未计价</option><option v-for="profile in listOf<Json>(pricing.profiles)" :key="profile.id" :value="profile.id">{{ profile.name }}（{{ profile.prices?.length || 0 }} 个模型）</option></select></label>
-          <template v-if="usesNewAPICredentials(upstreamForm.kind)">
+          <label class="span-2">价格档案 <span>用于官方价格估算</span><select v-model.number="upstreamForm.pricing_profile_id"><option :value="0">未计价</option><option v-for="profile in listOf<PricingProfile>(pricing.profiles)" :key="profile.id" :value="profile.id">{{ profile.name }}（{{ profile.model_count ?? profile.prices?.length ?? 0 }} 个模型）</option></select></label>
+          <Collapse class="span-2" :open="usesNewAPICredentials(upstreamForm.kind)"><div class="form-grid">
             <label>Access Token <span>可选</span><input v-model="upstreamForm.access_token" type="password" placeholder="用于余额查询" autocomplete="off" /></label>
             <label>User ID <span>可选</span><input v-model.trim="upstreamForm.user_id" placeholder="用于余额查询" /></label>
             <label v-if="editingUpstream" class="switch span-2"><input v-model="upstreamForm.clear_balance_credentials" type="checkbox" /><span></span>清除已保存的 Access Token 与 User ID</label>
-          </template>
+          </div></Collapse>
           <label class="switch span-2"><input v-model="upstreamForm.enabled" type="checkbox" /><span></span>启用该上游</label>
           <label class="switch span-2"><input v-model="upstreamForm.balance_protection_enabled" type="checkbox" /><span></span>余额耗尽时自动暂停路由</label>
         </div></div>
@@ -2603,30 +2596,30 @@ onBeforeUnmount(() => {
         <footer><button type="button" class="secondary" @click="closeUpstream">取消</button><button class="primary" :disabled="saving || fetchingModels || modelTestsBusy"><LoaderCircle v-if="saving" class="spin" :size="16" />保存上游</button></footer>
       </form>
     </section>
-  </div>
+  </div></Transition>
 
-  <div v-if="upstreamGroupDrawer" class="drawer-backdrop" @mousedown.self="upstreamGroupDrawer = null">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="upstreamGroupDrawer" class="drawer-backdrop" @mousedown.self="upstreamGroupDrawer = null">
     <section class="drawer upstream-group-drawer" role="dialog" aria-modal="true" aria-labelledby="upstream-group-title">
       <header><div><h2 id="upstream-group-title">{{ upstreamGroupDrawer.base_url }}</h2><p>{{ upstreamGroupDrawer.total }} 个 Key · 聚合展示，路由仍按各 Key 优先级</p></div><button class="icon" title="关闭" @click="upstreamGroupDrawer = null"><X :size="19" /></button></header>
       <div class="upstream-key-list">
-        <article v-for="item in upstreamGroupDrawer.items" :key="item.id" class="upstream-key-card">
+        <article v-for="item in upstreamGroupDrawer.items" :key="item.id" class="upstream-key-card" :class="{ 'saved-row': savedUpstreamID === item.id }">
           <div class="upstream-key-card-head"><div><strong :title="item.name">{{ item.name }}</strong><small>优先级 P{{ item.priority }} · {{ item.protocols?.join(' / ') }}</small></div><span class="status" :class="upstreamRouteTone(item)"><i></i>{{ upstreamRouteText(item) }}</span></div>
           <dl><div><dt>今日请求</dt><dd>{{ fmtNumber(item.today_requests) }}</dd></div><div><dt>今日 Token</dt><dd>{{ fmtNumber(item.today_tokens) }}</dd></div><div><dt>账号扣费总额</dt><dd>{{ fmtBalanceUsed(item) }}<small>{{ fmtDate(balanceUsedUpdatedAt(item)) }}</small></dd></div><div><dt>今日官方估算</dt><dd>{{ officialCostDetail(item, 'today') }}</dd></div><div><dt>历史官方估算</dt><dd>{{ officialCostDetail(item, 'lifetime') }}</dd></div><div><dt>余额</dt><dd>{{ fmtBalance(item) }}</dd></div><div><dt>余额保护</dt><dd>{{ balanceProtectionText(item) }}</dd></div><div><dt>价格档案</dt><dd>{{ pricingProfileName(item.pricing_profile_id) }}</dd></div><div><dt>熔断</dt><dd>{{ item.health_status === 'open' ? `开启 · ${item.consecutive_failures || 0} 次失败` : `未开启 · ${item.consecutive_failures || 0} 次失败` }}</dd></div></dl>
-          <div class="upstream-key-actions"><button class="secondary" @click="openUpstream(item)"><Pencil :size="15" />编辑 Key</button><button class="icon" title="检查连接" @click="upstreamAction(item, 'check')"><Activity :size="16" /></button><button class="icon" title="刷新余额" @click="upstreamAction(item, 'balance')"><CircleDollarSign :size="16" /></button><button class="icon" title="刷新模型" @click="upstreamAction(item, 'models')"><Download :size="16" /></button><button class="icon danger" title="删除上游" @click="removeUpstream(item)"><Trash2 :size="16" /></button></div>
+          <div class="upstream-key-actions"><button class="text-button" @click="upstreamGroupDrawer = null; drillLogs({ upstream_id: String(item.id) })">查看日志</button><button class="secondary" :data-edit-upstream="item.id" @click="openUpstream(item)"><Pencil :size="15" />编辑 Key</button><button class="icon" title="检查连接" @click="upstreamAction(item, 'check')"><Activity :size="16" /></button><button class="icon" title="刷新余额" @click="upstreamAction(item, 'balance')"><CircleDollarSign :size="16" /></button><button class="icon" title="刷新模型" @click="upstreamAction(item, 'models')"><Download :size="16" /></button><button class="icon danger" title="删除上游" @click="removeUpstream(item)"><Trash2 :size="16" /></button></div>
         </article>
       </div>
     </section>
-  </div>
+  </div></Transition>
 
-  <div v-if="groupModal" class="modal-backdrop" @mousedown.self="groupModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="group-title"><header><div><h2 id="group-title">{{ editingGroup ? '编辑分组' : '创建分组' }}</h2><p>选择该分组允许使用的上游</p></div><button class="icon" title="关闭" @click="groupModal = false"><X :size="19" /></button></header><form @submit.prevent="saveGroup"><div class="form-section"><div class="form-grid">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="groupModal" class="modal-backdrop" @mousedown.self="groupModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="group-title"><header><div><h2 id="group-title">{{ editingGroup ? '编辑分组' : '创建分组' }}</h2><p>选择该分组允许使用的上游</p></div><button class="icon" title="关闭" @click="groupModal = false"><X :size="19" /></button></header><form @submit.prevent="saveGroup"><div class="form-section"><div class="form-grid">
     <label class="span-2">名称<input v-model.trim="groupForm.name" required autofocus placeholder="生产线路" /></label>
     <fieldset class="span-2"><legend>上游成员</legend><div class="check-row"><label v-for="item in upstreams" :key="item.id"><input v-model="groupForm.upstream_ids" type="checkbox" :value="item.id" />{{ item.name }}</label><span v-if="!upstreams.length" class="muted">请先创建上游</span></div></fieldset>
     <label class="switch span-2"><input v-model="groupForm.enabled" type="checkbox" /><span></span>启用分组</label>
-  </div></div><footer><button type="button" class="secondary" @click="groupModal = false">取消</button><button class="primary" :disabled="saving || !groupForm.upstream_ids.length">{{ editingGroup ? '保存修改' : '创建分组' }}</button></footer></form></section></div>
+  </div></div><footer><button type="button" class="secondary" @click="groupModal = false">取消</button><button class="primary" :disabled="saving || !groupForm.upstream_ids.length">{{ editingGroup ? '保存修改' : '创建分组' }}</button></footer></form></section></div></Transition>
 
-  <div v-if="pricingModal" class="modal-backdrop" @mousedown.self="pricingModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="pricing-title"><header><div><h2 id="pricing-title">{{ editingPricing ? '编辑价格档案' : '新建价格档案' }}</h2><p>每行一个模型：模型名，输入，输出，缓存读，缓存写（USD / 百万 Token）</p></div><button class="icon" title="关闭" @click="pricingModal = false"><X :size="19" /></button></header><form @submit.prevent="savePricingProfile"><div class="form-section"><div class="form-grid"><label>名称<input v-model.trim="pricingForm.name" required maxlength="200" placeholder="内部模型价格" /></label><label>提供方<input v-model.trim="pricingForm.provider" maxlength="200" placeholder="内部" /></label><label class="span-2">来源 URL<input v-model.trim="pricingForm.source_url" type="url" maxlength="2048" placeholder="https://…" /></label><label class="span-2">版本<input v-model.trim="pricingForm.source_version" maxlength="100" placeholder="custom-2026-01" /></label><label class="span-2">模型价格<textarea v-model.trim="pricingForm.prices" rows="7" required placeholder="gpt-5.6, 2, 8, 1, 0"></textarea></label></div></div><footer><button type="button" class="secondary" @click="pricingModal = false">取消</button><button class="primary" :disabled="saving">保存档案</button></footer></form></section></div>
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="pricingModal" class="modal-backdrop" @mousedown.self="closePricingProfile()"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="pricing-title"><header><div><h2 id="pricing-title">{{ editingPricing ? '编辑价格档案' : '新建价格档案' }}</h2><p>每行一个模型：模型名，输入，输出，缓存读，缓存写（USD / 百万 Token）</p></div><button class="icon" title="关闭" @click="closePricingProfile()"><X :size="19" /></button></header><form @submit.prevent="savePricingProfile"><p v-if="pricingLoading" role="status">正在加载价格…</p><div v-else class="form-section"><div class="form-grid"><label>名称<input v-model.trim="pricingForm.name" required maxlength="200" placeholder="内部模型价格" /></label><label>提供方<input v-model.trim="pricingForm.provider" maxlength="200" placeholder="内部" /></label><label class="span-2">来源 URL<input v-model.trim="pricingForm.source_url" type="url" maxlength="2048" placeholder="https://…" /></label><label class="span-2">版本<input v-model.trim="pricingForm.source_version" maxlength="100" placeholder="custom-2026-01" /></label><label class="span-2">模型价格<textarea v-model.trim="pricingForm.prices" rows="7" required placeholder="gpt-5.6, 2, 8, 1, 0"></textarea></label></div></div><footer><button type="button" class="secondary" @click="closePricingProfile()">取消</button><button class="primary" :disabled="saving || pricingLoading">保存档案</button></footer></form></section></div></Transition>
 
-  <div v-if="keyModal" class="modal-backdrop" @mousedown.self="keyModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="key-title"><header><div><h2 id="key-title">{{ editingKey ? '编辑客户端密钥' : '创建客户端密钥' }}</h2><p>设置客户端访问范围</p></div><button class="icon" title="关闭" @click="keyModal = false"><X :size="19" /></button></header><form @submit.prevent="saveKey"><div class="form-section"><div class="form-grid">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="keyModal" class="modal-backdrop" @mousedown.self="keyModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="key-title"><header><div><h2 id="key-title">{{ editingKey ? '编辑客户端密钥' : '创建客户端密钥' }}</h2><p>设置客户端访问范围</p></div><button class="icon" title="关闭" @click="keyModal = false"><X :size="19" /></button></header><form @submit.prevent="saveKey"><div class="form-section"><div class="form-grid">
     <label class="span-2">名称<input v-model.trim="keyForm.name" required autofocus placeholder="Claude Code 工作站" /></label>
     <label class="span-2">分组<select v-model.number="keyForm.group_id" required><option :value="0" disabled>选择分组</option><option v-for="item in groups" :key="item.id" :value="item.id" :disabled="!item.enabled || !(item.upstream_ids || []).length">{{ item.name }}{{ !item.enabled ? '（停用）' : '' }}</option></select></label>
     <div class="route-preview span-2" aria-live="polite">
@@ -2639,34 +2632,34 @@ onBeforeUnmount(() => {
     <fieldset class="span-2"><legend>允许协议</legend><div class="check-row"><label v-for="protocol in UPSTREAM_PROTOCOLS" :key="protocol"><input v-model="keyForm.protocols" type="checkbox" :value="protocol" />{{ protocol }}</label></div></fieldset>
     <label class="span-2">允许模型 <span>逗号分隔；留空表示全部</span><textarea v-model="keyForm.models" rows="3" placeholder="gpt-5, claude-sonnet"></textarea></label>
     <label class="switch span-2"><input v-model="keyForm.enabled" type="checkbox" /><span></span>启用密钥</label>
-  </div></div><footer><button type="button" class="secondary" @click="keyModal = false">取消</button><button class="primary" :disabled="saving">{{ editingKey ? '保存修改' : '创建密钥' }}</button></footer></form></section></div>
+  </div></div><footer><button type="button" class="secondary" @click="keyModal = false">取消</button><button class="primary" :disabled="saving">{{ editingKey ? '保存修改' : '创建密钥' }}</button></footer></form></section></div></Transition>
 
-  <div v-if="keySimulationModal" class="modal-backdrop" @mousedown.self="closeKeySimulation"><section class="modal simulation-modal" role="dialog" aria-modal="true" aria-labelledby="simulation-title"><header><div><h2 id="simulation-title">模拟客户端请求</h2><p>{{ keySimulationTarget?.name }} · 实际走所属分组路由</p></div><button class="icon" title="关闭" @click="closeKeySimulation"><X :size="19" /></button></header><form @submit.prevent="runKeySimulation"><div class="form-section"><div class="form-grid"><label>协议<select v-model="keySimulationProtocol"><option v-for="protocol in keySimulationTarget?.protocols?.length ? keySimulationTarget.protocols : UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>模型<input v-model.trim="keySimulationModel" required list="simulation-models" placeholder="例如 gpt-5.6" /><datalist id="simulation-models"><option v-for="model in keySimulationTarget?.models || []" :key="model" :value="model" /></datalist></label><p class="form-hint span-2">将发送一个最小 ping 请求，可能产生少量 Token 消耗；结果会计入请求日志。</p><div v-if="keySimulationResult" class="simulation-result span-2" :class="keySimulationResult.ok ? 'good' : 'bad'"><div><strong>{{ keySimulationResult.ok ? '请求成功' : '请求失败' }}</strong><span>{{ keySimulationResult.status ? `HTTP ${keySimulationResult.status}` : '未建立连接' }} · {{ fmtDuration(keySimulationResult.duration_ms) }}</span></div><p v-if="keySimulationResult.detail">{{ keySimulationResult.detail }}</p></div></div></div><footer><button type="button" class="secondary" @click="closeKeySimulation">取消</button><button class="primary" :disabled="keySimulationBusy"><LoaderCircle v-if="keySimulationBusy" class="spin" :size="16" /><Play v-else :size="16" />发送测试请求</button></footer></form></section></div>
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="keySimulationModal" class="modal-backdrop" @mousedown.self="closeKeySimulation"><section class="modal simulation-modal" role="dialog" aria-modal="true" aria-labelledby="simulation-title"><header><div><h2 id="simulation-title">模拟客户端请求</h2><p>{{ keySimulationTarget?.name }} · 实际走所属分组路由</p></div><button class="icon" title="关闭" @click="closeKeySimulation"><X :size="19" /></button></header><form @submit.prevent="runKeySimulation"><div class="form-section"><div class="form-grid"><label>协议<select v-model="keySimulationProtocol"><option v-for="protocol in keySimulationTarget?.protocols?.length ? keySimulationTarget.protocols : UPSTREAM_PROTOCOLS" :key="protocol" :value="protocol">{{ protocol }}</option></select></label><label>模型<input v-model.trim="keySimulationModel" required list="simulation-models" placeholder="例如 gpt-5.6" /><datalist id="simulation-models"><option v-for="model in keySimulationTarget?.models || []" :key="model" :value="model" /></datalist></label><p class="form-hint span-2">将发送一个最小 ping 请求，可能产生少量 Token 消耗；结果会计入请求日志。</p><div v-if="keySimulationResult" class="simulation-result span-2" :class="keySimulationResult.ok ? 'good' : 'bad'"><div><strong>{{ keySimulationResult.ok ? '请求成功' : '请求失败' }}</strong><span>{{ keySimulationResult.status ? `HTTP ${keySimulationResult.status}` : '未建立连接' }} · {{ fmtDuration(keySimulationResult.duration_ms) }}</span></div><p v-if="keySimulationResult.detail">{{ keySimulationResult.detail }}</p></div></div></div><footer><button type="button" class="secondary" @click="closeKeySimulation">取消</button><button class="primary" :disabled="keySimulationBusy"><LoaderCircle v-if="keySimulationBusy" class="spin" :size="16" /><Play v-else :size="16" />发送测试请求</button></footer></form></section></div></Transition>
 
-  <div v-if="ccswitchModal" class="modal-backdrop ccswitch-backdrop" @mousedown.self="closeCCSwitch"><section class="modal ccswitch-modal" role="dialog" aria-modal="true" aria-labelledby="ccswitch-title"><header><div><h2 id="ccswitch-title">导入到 CCSwitch</h2><p>把当前客户端密钥配置到本机 CCSwitch</p></div><button class="icon" title="关闭" @click="closeCCSwitch"><X :size="19" /></button></header><form @submit.prevent="importToCCSwitch"><div class="form-section"><div class="form-stack">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="ccswitchModal" class="modal-backdrop ccswitch-backdrop" @mousedown.self="closeCCSwitch"><section class="modal ccswitch-modal" role="dialog" aria-modal="true" aria-labelledby="ccswitch-title"><header><div><h2 id="ccswitch-title">导入到 CCSwitch</h2><p>把当前客户端密钥配置到本机 CCSwitch</p></div><button class="icon" title="关闭" @click="closeCCSwitch"><X :size="19" /></button></header><form @submit.prevent="importToCCSwitch"><div class="form-section"><div class="form-stack">
     <label>客户端<select :value="ccswitchApp" @change="changeCCSwitchApp"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="gemini">Gemini CLI</option></select></label>
     <label>配置名称<input v-model.trim="ccswitchName" required placeholder="D-API Gateway" /></label>
     <label>模型 <span>可选，留空表示不限制</span><div class="inline-control"><select v-model="ccswitchModel"><option value="">不限制模型</option><option v-for="model in ccswitchModels" :key="model" :value="model">{{ model }}</option></select><button type="button" class="secondary" :disabled="fetchingCCSwitchModels" @click="fetchCCSwitchModels"><LoaderCircle v-if="fetchingCCSwitchModels" class="spin" :size="15" /><Download v-else :size="15" />获取模型</button></div></label>
     <label>完整客户端密钥 <span v-if="ccswitchSecret">已自动填充当前密钥</span><input v-model="ccswitchSecret" type="password" required autocomplete="off" placeholder="当前密钥不可用时可手动粘贴" /></label>
     <p class="form-hint ccswitch-warning">安全提示：当前 CCSwitch 协议需要将密钥交给本机导入器。请仅在受信任设备使用；导入完成后本页会立即清理密钥。网关地址：<code>{{ gatewayBaseURL }}</code></p>
-  </div></div><footer><button type="button" class="secondary" @click="closeCCSwitch">取消</button><button class="primary"><Upload :size="16" />打开 CCSwitch</button></footer></form></section></div>
+  </div></div><footer><button type="button" class="secondary" @click="closeCCSwitch">取消</button><button class="primary"><Upload :size="16" />打开 CCSwitch</button></footer></form></section></div></Transition>
 
-  <div v-if="revealedKey" class="modal-backdrop"><section class="modal secret-modal" role="dialog" aria-modal="true" aria-labelledby="secret-title"><header><div><h2 id="secret-title">客户端密钥已创建</h2><p>仅可在此时复制</p></div></header><div class="secret-body"><p>密钥已隐藏。点击下方区域或复制按钮后立即保存；关闭后无法再次获取。</p><div class="secret-value" title="点击复制密钥" @click="copySecret"><input class="secret-mask" type="password" :value="revealedKey" readonly autocomplete="off" aria-label="已隐藏的客户端密钥，点击复制" @keydown.enter.prevent="copySecret" /><button class="icon" title="复制密钥" @click.stop="copySecret"><Clipboard :size="17" /></button></div><button class="text-button config-copy-button" @click="copyClientConfig"><Copy :size="15" />复制 OpenAI / Anthropic 接入配置</button></div><footer><button v-if="createdKeyForImport" class="secondary" @click="openCCSwitchFromSecret"><Upload :size="16" />导入 CCSwitch</button><button class="primary" autofocus @click="closeSecret">我已保存</button></footer></section></div>
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="revealedKey" class="modal-backdrop"><section class="modal secret-modal" role="dialog" aria-modal="true" aria-labelledby="secret-title"><header><div><h2 id="secret-title">客户端密钥已创建</h2><p>仅可在此时复制</p></div></header><div class="secret-body"><p>密钥已隐藏。点击下方区域或复制按钮后立即保存；关闭后无法再次获取。</p><div class="secret-value" title="点击复制密钥" @click="copySecret"><input class="secret-mask" type="password" :value="revealedKey" readonly autocomplete="off" aria-label="已隐藏的客户端密钥，点击复制" @keydown.enter.prevent="copySecret" /><button class="icon" title="复制密钥" @click.stop="copySecret"><Clipboard :size="17" /></button></div><button class="text-button config-copy-button" @click="copyClientConfig"><Copy :size="15" />复制 OpenAI / Anthropic 接入配置</button></div><footer><button v-if="createdKeyForImport" class="secondary" @click="openCCSwitchFromSecret"><Upload :size="16" />导入 CCSwitch</button><button class="primary" autofocus @click="closeSecret">我已保存</button></footer></section></div></Transition>
 
-  <div v-if="channelModal" class="modal-backdrop" @mousedown.self="channelModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="channel-title"><header><div><h2 id="channel-title">添加通知渠道</h2><p>将运行状态发送到外部渠道</p></div><button class="icon" title="关闭" @click="channelModal = false"><X :size="19" /></button></header><form @submit.prevent="saveChannel"><div class="form-section"><div class="form-grid">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="channelModal" class="modal-backdrop" @mousedown.self="channelModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="channel-title"><header><div><h2 id="channel-title">添加通知渠道</h2><p>将运行状态发送到外部渠道</p></div><button class="icon" title="关闭" @click="channelModal = false"><X :size="19" /></button></header><form @submit.prevent="saveChannel"><div class="form-section"><div class="form-grid">
     <label>名称<input v-model.trim="channelForm.name" required autofocus placeholder="运维告警" /></label><label>类型<select v-model="channelForm.kind"><option value="email">邮件</option><option value="webhook">Webhook</option></select></label>
     <template v-if="channelForm.kind === 'webhook'"><label>平台<select v-model="channelForm.provider"><option value="">自动识别</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option><option value="wecom">企业微信</option><option value="slack">Slack</option><option value="discord">Discord</option><option value="generic">通用 JSON</option></select></label><label>Webhook URL<input v-model.trim="channelForm.target" type="url" required placeholder="https://hooks.example.com/…" /></label></template>
     <template v-else><label class="span-2">收件地址<input v-model.trim="channelForm.target" type="email" required /></label><label>SMTP 主机<input v-model.trim="channelForm.smtp_host" required placeholder="smtp.example.com" /></label><label>端口<input v-model.number="channelForm.smtp_port" type="number" min="1" max="65535" required /></label><label>用户名<input v-model="channelForm.username" autocomplete="off" /></label><label>密码<input v-model="channelForm.password" type="password" autocomplete="new-password" /></label></template>
     <label class="switch span-2"><input v-model="channelForm.enabled" type="checkbox" /><span></span>启用渠道</label>
-  </div></div><footer><button type="button" class="secondary" @click="channelModal = false">取消</button><button class="primary" :disabled="saving">添加渠道</button></footer></form></section></div>
+  </div></div><footer><button type="button" class="secondary" @click="channelModal = false">取消</button><button class="primary" :disabled="saving">添加渠道</button></footer></form></section></div></Transition>
 
-  <div v-if="passwordModal" class="modal-backdrop" @mousedown.self="passwordModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="password-title"><header><div><h2 id="password-title">修改管理员密码</h2><p>修改后需要重新登录</p></div><button class="icon" title="关闭" @click="passwordModal = false"><X :size="19" /></button></header><form @submit.prevent="changePassword"><div class="form-section"><div class="form-stack">
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="passwordModal" class="modal-backdrop" @mousedown.self="passwordModal = false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="password-title"><header><div><h2 id="password-title">修改管理员密码</h2><p>修改后需要重新登录</p></div><button class="icon" title="关闭" @click="passwordModal = false"><X :size="19" /></button></header><form @submit.prevent="changePassword"><div class="form-section"><div class="form-stack">
     <label>当前密码<input v-model="passwordForm.current_password" type="password" autocomplete="current-password" required autofocus /></label>
     <label>新密码 <span>至少 12 个字符</span><input v-model="passwordForm.new_password" type="password" minlength="12" autocomplete="new-password" required /></label>
     <label>确认新密码<input v-model="passwordForm.confirm_password" type="password" minlength="12" autocomplete="new-password" required /></label>
-  </div></div><footer><button type="button" class="secondary" @click="passwordModal = false">取消</button><button class="primary" :disabled="saving">修改并重新登录</button></footer></form></section></div>
+  </div></div><footer><button type="button" class="secondary" @click="passwordModal = false">取消</button><button class="primary" :disabled="saving">修改并重新登录</button></footer></form></section></div></Transition>
 
-  <div v-if="confirmDialog.show" class="modal-backdrop" @mousedown.self="settleConfirmation(false)"><section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message"><div class="confirm-body"><span class="confirm-icon"><AlertCircle :size="20" /></span><div><h2 id="confirm-title">{{ confirmDialog.title }}</h2><p id="confirm-message">{{ confirmDialog.message }}</p></div></div><footer><button class="secondary" @click="settleConfirmation(false)">取消</button><button class="danger-button" autofocus @click="settleConfirmation(true)">{{ confirmDialog.confirmLabel }}</button></footer></section></div>
+  <Transition name="overlay" @before-enter="activateOverlay" @before-leave="retireOverlay" @after-leave="restoreOverlayFocus"><div v-if="confirmDialog.show" class="modal-backdrop" @mousedown.self="settleConfirmation(false)"><section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message"><div class="confirm-body"><span class="confirm-icon"><AlertCircle :size="20" /></span><div><h2 id="confirm-title">{{ confirmDialog.title }}</h2><p id="confirm-message">{{ confirmDialog.message }}</p></div></div><footer><button class="secondary" @click="settleConfirmation(false)">取消</button><button class="danger-button" autofocus @click="settleConfirmation(true)">{{ confirmDialog.confirmLabel }}</button></footer></section></div></Transition>
 
   <Transition name="toast"><div v-if="toast.show" class="toast" :class="{ error: toast.error }" role="status"><AlertCircle v-if="toast.error" :size="17" /><Check v-else :size="17" />{{ toast.message }}</div></Transition>
 </template>

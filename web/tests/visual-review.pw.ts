@@ -29,7 +29,7 @@ for (const width of [1440, 390]) {
     expect(maximum).toBeLessThanOrEqual(4)
     await page.locator('.upstream-table tbody tr.clickable').filter({ hasText: 'upstream-1.example.com' }).click()
     await page.locator('.upstream-group-drawer').getByTitle('刷新余额').first().click()
-    await expect(page.getByText('balance probe failed')).toBeVisible()
+    await expect(page.locator('.toast')).toContainText('balance probe failed')
   })
 }
 
@@ -155,6 +155,8 @@ test('capture the operational surface across themes and viewports', async ({ pag
   await expect(page.getByRole('dialog', { name: '编辑上游' })).toBeVisible()
   await page.screenshot({ path: path.join(reviewDir, 'desktop-light-drawer.png'), fullPage: true })
   await page.getByRole('dialog', { name: '编辑上游' }).getByTitle('关闭').click()
+  await expect(page.locator('.upstream-group-drawer')).toBeVisible()
+  await page.locator('.upstream-group-drawer').getByTitle('关闭').click()
   await page.locator('.upstream-table tbody tr.clickable').first().click()
   await page.locator('.upstream-group-drawer').getByTitle('删除上游').first().click()
   await expect(page.getByRole('alertdialog', { name: '删除上游' })).toBeVisible()
@@ -233,6 +235,8 @@ test('dialogs preserve keyboard focus and close predictably', async ({ page }) =
   await expect(drawer.locator('input').first()).toBeFocused()
   await page.keyboard.press('Escape')
   await expect(drawer).toBeHidden()
+  await expect(page.locator('.upstream-group-drawer')).toBeVisible()
+  await page.locator('.upstream-group-drawer').getByTitle('关闭').click()
 
   await page.locator('.upstream-table tbody tr.clickable').first().click()
   await page.locator('.upstream-group-drawer').getByTitle('刷新余额').first().focus()
@@ -251,7 +255,7 @@ test('dialogs preserve keyboard focus and close predictably', async ({ page }) =
 test('direct routes, chained dialogs, dates, and edge menus remain operable', async ({ page }) => {
   await mockApi(page)
   await page.goto('/#logs')
-  await expect(page.locator('.filterbar select').nth(1).locator('option')).toHaveCount(upstreams.length + 1)
+  await expect(page.getByRole('combobox', { name: '上游', exact: true }).locator('option')).toHaveCount(upstreams.length + 1)
 
   await openView(page, '用量')
   await expect(page.locator('.usage-table-panel tbody td').first()).toHaveText('2026-08-30')
@@ -440,8 +444,8 @@ test('新增总览、通知、路由预览和移动端筛选交互可用', async
   await openView(page, '通知')
   await page.getByRole('tab', { name: '告警规则' }).click()
   await expect(page.getByRole('heading', { name: '告警规则' })).toBeVisible()
-  await page.getByRole('tab', { name: '路由设置' }).click()
-  await expect(page.getByRole('heading', { name: '路由设置' })).toBeVisible()
+  await openView(page, '系统设置')
+  await expect(page.getByRole('heading', { name: '路由与请求' })).toBeVisible()
 
   await openView(page, '客户端密钥')
   await page.getByRole('button', { name: '创建密钥' }).first().click()

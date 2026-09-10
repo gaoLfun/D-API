@@ -6,8 +6,19 @@ export class ApiError extends Error {
 }
 
 const REQUEST_TIMEOUT_MS = 15_000
+export interface RequestOptions extends RequestInit { timeoutMs?: number }
 
-export async function request<T>(path: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+export function operationTimeout(path: string): number {
+  if (path.endsWith('/test-model')) return 210_000
+  if (path.endsWith('/pricing/backfill')) return 300_000
+  if (path.endsWith('/pricing/refresh')) return 45_000
+  if (/\/(balance|check|models|test)$/.test(path)) return 120_000
+  if (path.startsWith('/api/admin/usage')) return 60_000
+  return REQUEST_TIMEOUT_MS
+}
+
+export async function request<T>(path: string, options: RequestOptions = {}, timeoutMs = options.timeoutMs ?? operationTimeout(path)): Promise<T> {
+  const { timeoutMs: _timeout, ...fetchOptions } = options
   const headers = new Headers(options.headers)
   if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const controller = new AbortController()
@@ -16,7 +27,7 @@ export async function request<T>(path: string, options: RequestInit = {}, timeou
   if (options.signal?.aborted) abortFromCaller()
   else options.signal?.addEventListener('abort', abortFromCaller, { once: true })
   try {
-    const response = await fetch(path, { ...options, headers, credentials: 'include', signal: controller.signal })
+    const response = await fetch(path, { ...fetchOptions, headers, credentials: 'include', signal: controller.signal })
     if (response.status === 204) return undefined as T
 
     const contentType = response.headers.get('content-type') || ''
@@ -38,10 +49,10 @@ export async function request<T>(path: string, options: RequestInit = {}, timeou
 }
 
 export const api = {
-  get: <T>(path: string, options: RequestInit = {}) => request<T>(path, options),
-  post: <T>(path: string, data?: unknown, options: RequestInit = {}) => request<T>(path, { ...options, method: 'POST', body: data === undefined ? undefined : JSON.stringify(data) }),
-  put: <T>(path: string, data: unknown, options: RequestInit = {}) => request<T>(path, { ...options, method: 'PUT', body: JSON.stringify(data) }),
-  delete: <T>(path: string, options: RequestInit = {}) => request<T>(path, { ...options, method: 'DELETE' }),
+  get: <T>(path: string, options: RequestOptions = {}) => request<T>(path, options),
+  post: <T>(path: string, data?: unknown, options: RequestOptions = {}) => request<T>(path, { ...options, method: 'POST', body: data === undefined ? undefined : JSON.stringify(data) }),
+  put: <T>(path: string, data: unknown, options: RequestOptions = {}) => request<T>(path, { ...options, method: 'PUT', body: JSON.stringify(data) }),
+  delete: <T>(path: string, options: RequestOptions = {}) => request<T>(path, { ...options, method: 'DELETE' }),
 }
 
 export function listOf<T>(value: unknown): T[] {
